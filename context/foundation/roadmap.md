@@ -34,7 +34,7 @@ Produkt rozstrzyga na podstawie wzorców ścieżek, które pliki opuszczają mas
 | ----- | ---------------------------- | ----------------------------------------------------------------------- | ------------- | ---------------------- | -------- |
 | F-01  | git-integration-test-harness | (foundation) weryfikować zachowanie na prawdziwym repozytorium git      | —             | §Guardrails            | done     |
 | S-01  | transparent-encrypt-decrypt  | commitować plik i dostać ciphertext w repo, plaintext w katalogu roboczym | F-01          | FR-001, FR-004, FR-005 | proposed |
-| S-02  | gitignore-style-config       | wskazać pliki do szyfrowania w składni `.gitignore`                      | S-01          | FR-002, FR-003         | blocked  |
+| S-02  | gitignore-style-config       | wskazać pliki do szyfrowania w składni `.gitignore`                      | S-01          | FR-002, FR-003         | proposed |
 | S-03  | key-export-and-unlock        | odzyskać sekrety po klonie na drugiej maszynie                           | S-01          | US-01, FR-007, FR-008  | proposed |
 | S-04  | lock-repository              | zamknąć odblokowane repozytorium z powrotem                              | S-03          | FR-009                 | blocked  |
 | S-05  | decrypted-diff               | oglądać różnice na treści jawnej                                         | S-01          | FR-006                 | proposed |
@@ -48,7 +48,7 @@ Pomoc nawigacyjna — grupuje elementy dzielące łańcuch wymagań wstępnych. 
 | Stream | Temat                    | Łańcuch                              | Uwaga                                                                        |
 | ------ | ------------------------ | ------------------------------------ | ---------------------------------------------------------------------------- |
 | A      | Rdzeń szyfrowania        | `F-01` → `S-01` → `S-03` → `S-04`    | Ścieżka gwiazdy przewodniej; niesie całe ryzyko techniczne celu `learn`.      |
-| B      | Konfiguracja i widoczność | `S-02` → `S-06`                      | Dołącza do Strumienia A w `S-01`. Oba elementy zablokowane decyzjami.         |
+| B      | Konfiguracja i widoczność | `S-02` → `S-06`                      | Dołącza do Strumienia A w `S-01`. `S-02` odblokowany 2026-08-04; `S-06` czeka na własną decyzję o głębokości sprawdzania. |
 | C      | Narzędzia pracy          | `S-05`                               | Dołącza do A w `S-01`. Jedyny element bez własnej niewiadomej.                |
 | D      | Dystrybucja              | `S-07`                               | Dołącza do A w `S-01`. Decyzje o nazwie i licencji zapadły 2026-08-04; czeka już tylko na `S-01`. |
 
@@ -88,6 +88,7 @@ Fundament poniżej zakłada ten stan i nie tworzy ponownie niczego, co jest zgł
 
 - **Outcome:** użytkownik inicjuje repozytorium jedną komendą, oznacza plik jako tajny i po commicie widzi w obiektach gita wyłącznie ciphertext, w katalogu roboczym plaintext, a `git status` po checkoucie jest czysty.
 - **Change ID:** transparent-encrypt-decrypt
+- **Zakres poszerzony 2026-08-04:** konstrukcja catch-all wymaga, żeby filtr był **długożyjący** (`filter.git-xcrypt.process`, protokół pkt-line) — proces na plik daje zmierzone 22× spowolnienie. Dochodzi też obowiązkowy test właściwości `passthrough(x) == x`, bo filtr działa odtąd na każdym pliku repozytorium.
 - **PRD refs:** FR-001, FR-004, FR-005, §Business Logic, §Non-Functional Requirements (metadane)
 - **Prerequisites:** F-01
 - **Parallel with:** —
@@ -107,11 +108,11 @@ Fundament poniżej zakłada ten stan i nie tworzy ponownie niczego, co jest zgł
 - **Parallel with:** S-03, S-05, S-07
 - **Blockers:** —
 - **Unknowns:**
-  - Jak nie dopuścić do rozjazdu pliku konfiguracyjnego i konfiguracji czytanej przez gita? — Właściciel: użytkownik. Blokuje: tak.
-  - Jak przetłumaczyć wzorzec katalogowy `katalog/` i negacje na semantykę, którą git faktycznie honoruje? — Właściciel: użytkownik. Blokuje: nie.
-  - Jakie zachowanie domyślne przy braku deklaracji EOL — binarny czy `text=auto`? Rozstrzygnięte, że `.git-xcrypt` przejmuje semantykę `text`/`-text`/`eol=lf`/`eol=crlf`, bo `-text` odbiera te atrybuty na plikach szyfrowanych; otwarte zostaje samo domyślne. Patrz `zalozenia.md` §Końce linii. — Właściciel: użytkownik. Blokuje: nie.
-- **Risk:** rozjazd konfiguracji daje ciche nieszyfrowanie — sekret wygląda na chroniony, a trafia do repozytorium jawnie. To najgroźniejszy tryb awarii w całym produkcie i dlatego element nie nadaje się do planowania przed zapadnięciem decyzji.
-- **Status:** blocked
+  - ~~Jak nie dopuścić do rozjazdu pliku konfiguracyjnego i konfiguracji czytanej przez gita?~~ Rozstrzygnięte 2026-08-04: konstrukcja catch-all — `.gitattributes` dostaje jedną statyczną linię `* filter=git-xcrypt`, a `.git-xcrypt` jest jedynym źródłem prawdy czytanym przez filtr. Rozjazd przestaje istnieć zamiast być pilnowany. — Właściciel: użytkownik. Blokuje: nie.
+  - ~~Jak przetłumaczyć wzorzec katalogowy `katalog/` i negacje?~~ Rozstrzygnięte 2026-08-04: dopasowaniem zajmuje się `gix-ignore` / `gix-glob`, więc semantyka jest dosłownie taka jak w `.gitignore`; negacje obsługiwane, ostatnie dopasowanie wygrywa, a `status` wypisuje je osobno. Tłumaczenie na `katalog/**` zostaje potrzebne wyłącznie dla kosmetycznych linii `-text` / `diff`. — Właściciel: użytkownik. Blokuje: nie.
+  - ~~Jakie zachowanie domyślne przy braku deklaracji EOL?~~ Rozstrzygnięte 2026-08-04: **`text=auto`**, czyli autorozpoznanie po treści jak w gicie. `.git-xcrypt` przejmuje **cały** słownik konwersji (`text`, `-text`, `binary`, `text=auto`, `eol=lf|crlf|native`), a atrybuty rozstrzygają się na osobnej osi niż selekcja ścieżek. — Właściciel: użytkownik. Blokuje: nie.
+- **Risk:** rozjazd konfiguracji dawał ciche nieszyfrowanie — najgroźniejszy tryb awarii w produkcie. Usunięty konstrukcyjnie, ale przeniósł ryzyko gdzie indziej: filtr działa teraz na **każdym** pliku repozytorium, więc błąd w przepuszczaniu treści uszkadza cały projekt, nie tylko sekrety. Stąd wymóg testu właściwości `passthrough(x) == x` już w `S-01`.
+- **Status:** proposed
 
 ### S-03: Przeniesienie repozytorium na drugą maszynę
 
@@ -184,7 +185,7 @@ Fundament poniżej zakłada ten stan i nie tworzy ponownie niczego, co jest zgł
 | ---------- | ---------------------------- | --------------------------------------------------- | --------------------- | ------------------------------------------- |
 | F-01       | git-integration-test-harness | Harness testów na prawdziwym repozytorium git       | tak                   | Uruchom `/10x-plan git-integration-test-harness` |
 | S-01       | transparent-encrypt-decrypt  | Przezroczyste szyfrowanie w jednym repozytorium     | tak                   | F-01 zamknięty, obie niewiadome rozstrzygnięte 2026-08-04. Uruchom `/10x-plan transparent-encrypt-decrypt` |
-| S-02       | gitignore-style-config       | Konfiguracja w składni .gitignore                   | nie                   | Zablokowane: rozjazd konfiguracji           |
+| S-02       | gitignore-style-config       | Konfiguracja w składni .gitignore                   | nie                   | Czeka na S-01; wszystkie trzy niewiadome rozstrzygnięte 2026-08-04 |
 | S-03       | key-export-and-unlock        | Eksport klucza i odblokowanie po klonie             | nie                   | Czeka na S-01                               |
 | S-04       | lock-repository              | Zamknięcie repozytorium                             | nie                   | Zablokowane: zabezpieczenie przed utratą klucza |
 | S-05       | decrypted-diff               | Różnice na treści odszyfrowanej                     | nie                   | Czeka na S-01                               |
@@ -193,7 +194,7 @@ Fundament poniżej zakłada ten stan i nie tworzy ponownie niczego, co jest zgł
 
 ## Open Roadmap Questions
 
-1. **Jak nie dopuścić do rozjazdu pliku konfiguracyjnego i konfiguracji czytanej przez gita?** — Właściciel: użytkownik. Blokuje: `S-02` (a przez zależność również `S-06`).
+1. ~~**Jak nie dopuścić do rozjazdu pliku konfiguracyjnego i konfiguracji czytanej przez gita?**~~ Rozstrzygnięte 2026-08-04: konstrukcja catch-all, `.git-xcrypt` jedynym źródłem prawdy, filtr długożyjący jako warunek wykonalności. Patrz `prd.md` §Open Questions poz. 1 i `zalozenia.md` §Integracja z git. — Właściciel: użytkownik. Blokuje: nic.
 2. **Co chroni przed zamknięciem repozytorium bez wcześniejszego wyeksportowania klucza?** — Właściciel: użytkownik. Blokuje: `S-04`.
 3. **Jak głęboko `status` sprawdza repozytorium — bieżący stan czy cała historia?** — Właściciel: użytkownik. Blokuje: `S-06`.
 4. ~~**Jaka nazwa crate'a i binarki wobec kolizji z oryginalnym `git-crypt`?**~~ Rozstrzygnięte 2026-08-04: `git-xcrypt` dla crate'a i binarki. — Właściciel: użytkownik. Blokuje: nic.
