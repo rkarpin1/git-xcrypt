@@ -2,7 +2,7 @@
 id: encryption-status-check
 title: Widoczność stanu szyfrowania
 roadmap_id: S-06
-status: implemented
+status: impl_reviewed
 created: 2026-08-04
 updated: 2026-08-04
 ---
