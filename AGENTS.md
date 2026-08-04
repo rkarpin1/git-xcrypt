@@ -37,4 +37,6 @@ Clippy runs with `-D warnings`. Errors via `thiserror`; no `unwrap()` on user-in
 
 ## Commits and PRs
 
-No commits yet, no CI yet. @context/foundation/zalozenia.md describes the intended CI gate.
+**Never create a git branch.** Commit on whatever branch is checked out, including `master`. Switching or branching is the user's call, not yours — this overrides any default that says to branch off the main branch first.
+
+No CI yet. @context/foundation/zalozenia.md describes the intended CI gate.
