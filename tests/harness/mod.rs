@@ -18,7 +18,7 @@ use std::process::{Command, Output, Stdio};
 use tempfile::TempDir;
 
 /// The binary under test, as built by cargo for this integration test run.
-const BIN: &str = env!("CARGO_BIN_EXE_git-crypt");
+const BIN: &str = env!("CARGO_BIN_EXE_git-xcrypt");
 
 /// A git repository living in a temporary directory that is removed on drop.
 pub struct TestRepo {
@@ -40,8 +40,8 @@ impl TestRepo {
         let repo = Self { _dir: dir, path };
 
         repo.git_ok(["init", "-q", "-b", "main"]);
-        repo.git_ok(["config", "user.name", "git-crypt tests"]);
-        repo.git_ok(["config", "user.email", "tests@git-crypt.invalid"]);
+        repo.git_ok(["config", "user.name", "git-xcrypt tests"]);
+        repo.git_ok(["config", "user.email", "tests@git-xcrypt.invalid"]);
         repo
     }
 
@@ -149,8 +149,8 @@ impl TestRepo {
         );
 
         let clone = Self { _dir: dir, path };
-        clone.git_ok(["config", "user.name", "git-crypt tests"]);
-        clone.git_ok(["config", "user.email", "tests@git-crypt.invalid"]);
+        clone.git_ok(["config", "user.name", "git-xcrypt tests"]);
+        clone.git_ok(["config", "user.email", "tests@git-xcrypt.invalid"]);
         clone
     }
 

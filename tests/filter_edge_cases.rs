@@ -6,12 +6,12 @@ mod harness;
 use harness::TestRepo;
 
 const SECRET: &[u8] = b"api_key = do-not-commit-me\n";
-const ATTRIBUTES: &str = "secrets.env filter=git-crypt -text\nempty.env filter=git-crypt -text\nbinary.env filter=git-crypt -text\n";
+const ATTRIBUTES: &str = "secrets.env filter=git-xcrypt -text\nempty.env filter=git-xcrypt -text\nbinary.env filter=git-xcrypt -text\n";
 
 /// Sets up a repository holding one committed secret.
 fn repo_with_secret() -> TestRepo {
     let repo = TestRepo::init();
-    repo.register_filter("git-crypt");
+    repo.register_filter("git-xcrypt");
     repo.write_attributes(ATTRIBUTES);
     repo.write_file("secrets.env", SECRET);
     repo.commit_all("add a secret");
@@ -43,7 +43,7 @@ fn a_clone_without_the_filter_shows_the_stored_bytes() {
 #[test]
 fn an_empty_file_survives_the_round_trip() {
     let repo = TestRepo::init();
-    repo.register_filter("git-crypt");
+    repo.register_filter("git-xcrypt");
     repo.write_attributes(ATTRIBUTES);
     repo.write_file("empty.env", b"");
     repo.commit_all("add an empty file");
@@ -64,7 +64,7 @@ fn a_binary_file_survives_the_round_trip() {
     let content: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
 
     let repo = TestRepo::init();
-    repo.register_filter("git-crypt");
+    repo.register_filter("git-xcrypt");
     repo.write_attributes(ATTRIBUTES);
     repo.write_file("binary.env", &content);
     repo.commit_all("add a binary file");
@@ -81,7 +81,7 @@ fn a_binary_file_survives_the_round_trip() {
 #[test]
 fn a_failing_filter_aborts_the_add() {
     let repo = TestRepo::init();
-    repo.register_failing_filter("git-crypt");
+    repo.register_failing_filter("git-xcrypt");
     repo.write_attributes(ATTRIBUTES);
     repo.write_file("secrets.env", SECRET);
 
@@ -98,7 +98,7 @@ fn a_failing_filter_aborts_the_add() {
 #[test]
 fn a_failing_filter_leaves_no_plaintext_object_behind() {
     let repo = TestRepo::init();
-    repo.register_failing_filter("git-crypt");
+    repo.register_failing_filter("git-xcrypt");
     repo.write_attributes(ATTRIBUTES);
     repo.write_file("secrets.env", SECRET);
 

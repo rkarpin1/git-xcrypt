@@ -20,7 +20,7 @@ fn main() -> ExitCode {
         [Some("__test-filter")] => run_test_filter(),
         [Some("__test-filter"), Some("--fail")] => fail_on_purpose(),
         _ => {
-            eprintln!("git-crypt: no usable command given");
+            eprintln!("git-xcrypt: no usable command given");
             ExitCode::from(EXIT_USAGE)
         }
     }
@@ -35,10 +35,10 @@ fn run_test_filter() -> ExitCode {
     let mut input = io::stdin().lock();
     let mut output = io::stdout().lock();
 
-    match git_crypt::run_filter(&mut input, &mut output) {
+    match git_xcrypt::run_filter(&mut input, &mut output) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("git-crypt: {err}");
+            eprintln!("git-xcrypt: {err}");
             ExitCode::from(EXIT_FILTER_FAILED)
         }
     }
@@ -47,6 +47,6 @@ fn run_test_filter() -> ExitCode {
 /// Fails without writing anything, so tests can prove git aborts the operation
 /// instead of letting unfiltered content through.
 fn fail_on_purpose() -> ExitCode {
-    eprintln!("git-crypt: __test-filter was asked to fail");
+    eprintln!("git-xcrypt: __test-filter was asked to fail");
     ExitCode::from(EXIT_FILTER_FAILED)
 }

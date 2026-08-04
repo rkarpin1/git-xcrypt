@@ -19,26 +19,26 @@ Tworzony jest nowy projekt ze względów edukacyjnych oraz dlatego, że projekty
 # Założenia funkcjonalne
 
 - W katalogu roboczym użytkownika pliki są **odszyfrowane**; w repozytorium zdalnym (GitHub) te same pliki są **zaszyfrowane**.
-- Inicjacja projektu ma być prosta — wystarcza `git-crypt init`. Nie powstają żadne dodatkowe skrypty pomocnicze ani pliki, których użytkownik musi pilnować ręcznie.
+- Inicjacja projektu ma być prosta — wystarcza `git-xcrypt init`. Nie powstają żadne dodatkowe skrypty pomocnicze ani pliki, których użytkownik musi pilnować ręcznie.
 - Wymagany klucz repozytorium jest generowany automatycznie przy inicjacji.
 - Konfiguracja plików i katalogów do szyfrowania opiera się na **własnym pliku konfiguracyjnym o składni podobnej do `.gitignore`** (roboczo `.git-crypt`). Jest to świadome odejście od oryginału, który wymaga ręcznej edycji `.gitattributes`.
   - Plik `.git-crypt` jest wersjonowany w repozytorium.
   - Aplikacja generuje z niego wpisy w `.gitattributes` (git nie potrafi czytać naszego formatu bezpośrednio) — wygenerowana sekcja jest oznaczona markerami i **zarządzana wyłącznie przez narzędzie**.
   - Wzorzec katalogowy `sekrety/` musi zostać przetłumaczony na działający w git wzorzec `sekrety/**` — obsługa tego przypadku jest wymogiem, nie detalem.
   - Negacje (`!plik`) muszą być obsłużone lub jawnie odrzucone z czytelnym błędem.
-- Pozostałe komendy `git-crypt` mają odpowiadać projektom źródłowym co do nazwy i zachowania, ale każda wymaga oddzielnej dyskusji i potwierdzenia przed implementacją.
+- Pozostałe komendy `git-xcrypt` mają odpowiadać projektom źródłowym co do nazwy i zachowania, ale każda wymaga oddzielnej dyskusji i potwierdzenia przed implementacją.
 
 # Zakres MVP / poza zakresem
 
 **W zakresie v0.1:**
 
-- `git-crypt init` — generuje klucz repozytorium, rejestruje filtry w `.git/config`, tworzy `.git-crypt` (jeśli brak) i synchronizuje `.gitattributes`.
-- `git-crypt status` — wypisuje, które pliki są szyfrowane, a które **powinny być, a nie są** (np. zacommitowane przed konfiguracją).
-- `git-crypt lock` — usuwa klucz z repo i zaszyfrowuje pliki w katalogu roboczym.
-- `git-crypt unlock` — wczytuje klucz i odszyfrowuje pliki w katalogu roboczym.
-- `git-crypt export-key` / `import-key` — eksport i import klucza symetrycznego do przenoszenia między maszynami.
-- `git-crypt sync` — regeneruje sekcję w `.gitattributes` na podstawie `.git-crypt`.
-- `git-crypt add-user` / `list-users` — zarządzanie odbiorcami (patrz „Zarządzanie kluczami i użytkownikami").
+- `git-xcrypt init` — generuje klucz repozytorium, rejestruje filtry w `.git/config`, tworzy `.git-crypt` (jeśli brak) i synchronizuje `.gitattributes`.
+- `git-xcrypt status` — wypisuje, które pliki są szyfrowane, a które **powinny być, a nie są** (np. zacommitowane przed konfiguracją).
+- `git-xcrypt lock` — usuwa klucz z repo i zaszyfrowuje pliki w katalogu roboczym.
+- `git-xcrypt unlock` — wczytuje klucz i odszyfrowuje pliki w katalogu roboczym.
+- `git-xcrypt export-key` / `import-key` — eksport i import klucza symetrycznego do przenoszenia między maszynami.
+- `git-xcrypt sync` — regeneruje sekcję w `.gitattributes` na podstawie `.git-crypt`.
+- `git-xcrypt add-user` / `list-users` — zarządzanie odbiorcami (patrz „Zarządzanie kluczami i użytkownikami").
 
 **Poza zakresem v0.1** (do świadomego odłożenia, nie do cichego pominięcia):
 
@@ -74,7 +74,7 @@ Przyjęte rozwiązanie:
 
 # Zarządzanie kluczami i użytkownikami
 
-- Klucz repozytorium leży w `.git/git-crypt/keys/` — **nigdy** nie jest commitowany. Katalog `.git/` nie podlega wersjonowaniu, ale aplikacja dodatkowo pilnuje, by klucz nie trafił do drzewa roboczego.
+- Klucz repozytorium leży w `.git/git-xcrypt/keys/` — **nigdy** nie jest commitowany. Katalog `.git/` nie podlega wersjonowaniu, ale aplikacja dodatkowo pilnuje, by klucz nie trafił do drzewa roboczego.
 - Uprawnienia pliku klucza: `0600` na systemach uniksowych; na Windows odpowiednie ACL ograniczone do właściciela.
 - Klucz nigdy nie jest wypisywany na `stdout` poza jawną komendą `export-key`.
 - **Odbiorcy natywnie w Rust, bez zewnętrznego `gpg`.** Rekomendacja: format **age** (crate `age`, odbiorcy X25519, opcjonalnie passphrase przez scrypt) — mały, nowoczesny, w pełni rustowy, nie ciągnie zależności systemowych. Sequoia (OpenPGP) daje zgodność z istniejącymi kluczami GPG kosztem znacznie większego nakładu i rozmiaru binarki. **Wybór do potwierdzenia** — patrz „Otwarte decyzje".
@@ -83,11 +83,11 @@ Przyjęte rozwiązanie:
 
 # Integracja z git
 
-- Mechanizm: filtry `clean` / `smudge` / `diff` zarejestrowane w `.git/config`, aktywowane wpisami `filter=git-crypt diff=git-crypt` w `.gitattributes`.
+- Mechanizm: filtry `clean` / `smudge` / `diff` zarejestrowane w `.git/config`, aktywowane wpisami `filter=git-xcrypt diff=git-xcrypt` w `.gitattributes`.
 - **Twarda reguła: na ścieżce clean/smudge nic poza danymi nie może trafić na `stdout`.** Żadnych `println!`, logów, pasków postępu. Diagnostyka wyłącznie na `stderr`. Naruszenie tej reguły cicho uszkadza pliki użytkownika.
 - Filtr musi być odporny na wielokrotne uruchomienie: szyfrowanie już zaszyfrowanej treści i deszyfrowanie plaintextu to przypadki do wykrycia i obsłużenia (idempotencja po nagłówku).
 - Kody wyjścia: `0` sukces, niezerowe kody rozróżniające „brak klucza", „zły format", „błąd konfiguracji".
-- **Twarda reguła: filtr rejestrujemy z `filter.git-crypt.required = true`.** Wbrew intuicji sam niezerowy kod filtra **nie** przerywa operacji gita. Zmierzone na git 2.55 (repozytorium tymczasowe, nie na tym projekcie): bez tej flagi filtr `clean` kończący się kodem `3` daje `git add` **kod wyjścia 0**, git traktuje awarię jako nieszkodliwą i przepuszcza treść bez zmian — do indeksu i do bazy obiektów trafia **plaintext**, a użytkownik widzi tylko `error:` w szumie i udany commit. Z flagą: `fatal: <plik>: clean filter 'git-crypt' failed`, plik nie wchodzi do indeksu, żaden obiekt nie powstaje. Zabezpieczenie „błąd przerywa operację" jest więc własnością tej flagi, a nie samego gita — jej ustawienie należy do `init` i jest warunkiem gwarantki z PRD §Guardrails, nie detalem konfiguracji. Regresji pilnują dwa testy w `tests/filter_edge_cases.rs`; usunięcie flagi z harnessu wywala oba.
+- **Twarda reguła: filtr rejestrujemy z `filter.git-xcrypt.required = true`.** Wbrew intuicji sam niezerowy kod filtra **nie** przerywa operacji gita. Zmierzone na git 2.55 (repozytorium tymczasowe, nie na tym projekcie): bez tej flagi filtr `clean` kończący się kodem `3` daje `git add` **kod wyjścia 0**, git traktuje awarię jako nieszkodliwą i przepuszcza treść bez zmian — do indeksu i do bazy obiektów trafia **plaintext**, a użytkownik widzi tylko `error:` w szumie i udany commit. Z flagą: `fatal: <plik>: clean filter 'git-xcrypt' failed`, plik nie wchodzi do indeksu, żaden obiekt nie powstaje. Zabezpieczenie „błąd przerywa operację" jest więc własnością tej flagi, a nie samego gita — jej ustawienie należy do `init` i jest warunkiem gwarantki z PRD §Guardrails, nie detalem konfiguracji. Regresji pilnują dwa testy w `tests/filter_edge_cases.rs`; usunięcie flagi z harnessu wywala oba.
 - `.gitattributes` dla plików szyfrowanych musi zawierać `-text`, żeby `core.autocrlf` na Windows nie modyfikował ciphertextu — patrz „Końce linii (LF/CRLF)", gdzie opisany jest zmierzony mechanizm i jego konsekwencje.
 - Znane ograniczenia do udokumentowania: `git archive` eksportuje treść zaszyfrowaną (filtry nie są stosowane); submoduły mają własną konfigurację i wymagają osobnej inicjacji.
 
@@ -104,7 +104,7 @@ Filtr zawsze widzi bajty od strony katalogu roboczego, a git swoją konwersję w
 
 **`-text` wygrywa z `eol`.** Zmierzone: blob trzymający CRLF, `core.autocrlf=true`, atrybut `-text eol=lf` → w katalogu roboczym nadal CRLF, git nie zmienia ani bajta. Skoro na naszych ścieżkach wymuszamy `-text`, użytkownik **nie ma sposobu**, żeby środkami gita oznaczyć plik szyfrowany jako „tylko LF" — atrybut `eol=lf`, którym repozytoria trzymają np. skrypty powłoki, jest niedostępny dokładnie na tych plikach, na których byłby potrzebny.
 
-**Konwersję przejmuje git-crypt, ale asymetrycznie:**
+**Konwersję przejmuje git-xcrypt, ale asymetrycznie:**
 
 - **clean (przed szyfrowaniem) nie czyta konfiguracji gita.** Zawsze `CRLF→LF` dla plików zadeklarowanych jako tekst, identycznie na każdej maszynie. Gdyby czytał `core.autocrlf`, ten sam plik dałby na Windows inny plaintext niż na Linuksie, więc inny ciphertext, więc inny blob — i determinizm pada.
 - **smudge (po odszyfrowaniu) czyta konfigurację gita.** To jedyny moment, w którym różnice między maszynami są dozwolone i pożądane. Potrzebne klucze: `core.autocrlf`, `core.eol`, plus platforma dla wartości `native`.
@@ -123,7 +123,7 @@ Niezmiennik, który spina asymetrię: na Windows z `autocrlf=true` smudge zapisu
 
 **Deklaracja trybu należy do `.git-crypt`, nie do gita.** Skoro `-text` odbiera użytkownikowi atrybuty `text`/`eol` na plikach szyfrowanych, `.git-crypt` musi przejąć tę samą semantykę per wzorzec: `text`, `-text`, `eol=lf`, `eol=crlf` oraz zachowanie domyślne przy braku deklaracji. Nie wymyślamy własnego modelu — odtwarzamy ten, który użytkownik zna z `.gitattributes`, z tą różnicą, że `eol=*` działa u nas na wyjściu smudge, a nie w gicie. Deklaracja jest wersjonowana, więc jest jednakowa na wszystkich maszynach — i to jest warunek, pod którym powyższy niezmiennik trzyma.
 
-**Konfigurację czytamy biblioteką, nie procesem potomnym.** `gix-config` (gitoxide) daje pełną precedencję system/global/repo/worktree wraz z `include`/`includeIf`, kompiluje się do środka binarki i nie łamie wymogu samowystarczalności z „Założeń technicznych". Wywoływanie `git config` odpada: git uruchamia nowy proces filtra na każdy plik, więc byłoby to N spawnów na ścieżce gorącej, najdroższych akurat na Windows. Pozostaje jedna binarka `git-crypt` w kilku trybach (`clean`, `smudge`, `diff` rejestrowane przez `init`; reszta wywoływana przez użytkownika); żadnego osobnego programu pomocniczego ani demona.
+**Konfigurację czytamy biblioteką, nie procesem potomnym.** `gix-config` (gitoxide) daje pełną precedencję system/global/repo/worktree wraz z `include`/`includeIf`, kompiluje się do środka binarki i nie łamie wymogu samowystarczalności z „Założeń technicznych". Wywoływanie `git config` odpada: git uruchamia nowy proces filtra na każdy plik, więc byłoby to N spawnów na ścieżce gorącej, najdroższych akurat na Windows. Pozostaje jedna binarka `git-xcrypt` w kilku trybach (`clean`, `smudge`, `diff` rejestrowane przez `init`; reszta wywoływana przez użytkownika); żadnego osobnego programu pomocniczego ani demona.
 
 **Świadomie przyjęte ograniczenie:** plik o mieszanych końcach linii nie przetrwa round-tripu — normalizacja jest stratna, więc po `unlock` taki plik wróci inny niż był i `git status` pokaże zmianę. Git broni się przed tym przez `core.safecrlf`; czy odtwarzamy to ostrzeżenie, jest otwarte.
 
@@ -133,7 +133,7 @@ Wszystkie poniższe są **akceptowanymi kompromisami** konstrukcji, nie błędam
 
 - Wyciekają **metadane**: nazwy plików, ścieżki, rozmiary (z dokładnością do narzutu formatu), daty commitów i fakt, że plik się zmienił.
 - Szyfrowanie deterministyczne ujawnia, że dwa pliki mają identyczną treść, oraz że plik wrócił do poprzedniej wersji.
-- **Największe realne ryzyko: sekret zacommitowany zanim wzorzec trafił do konfiguracji.** Zostaje w historii w postaci jawnej na zawsze. Przeciwdziałanie: `git-crypt status` wskazuje takie pliki, a dokumentacja opisuje procedurę czyszczenia historii i rotacji sekretu.
+- **Największe realne ryzyko: sekret zacommitowany zanim wzorzec trafił do konfiguracji.** Zostaje w historii w postaci jawnej na zawsze. Przeciwdziałanie: `git-xcrypt status` wskazuje takie pliki, a dokumentacja opisuje procedurę czyszczenia historii i rotacji sekretu.
 - Klucz w `.git/` jest tak bezpieczny jak dysk i konto użytkownika — narzędzie nie chroni przed skompromitowaną maszyną.
 - Poza modelem zagrożeń: atakujący z dostępem do odszyfrowanego katalogu roboczego, ataki side-channel, ochrona przed samym hostingiem po `unlock` na CI.
 - Sekrety nigdy nie trafiają do repozytorium projektu — również w testach i przykładach.
@@ -142,7 +142,7 @@ Wszystkie poniższe są **akceptowanymi kompromisami** konstrukcji, nie błędam
 
 - **Licencja do rozstrzygnięcia przed pierwszym publicznym wydaniem.** AGWA/git-crypt jest na GPL-3.0. Skoro nie kopiujemy kodu ani formatu, praca pochodna prawdopodobnie nie zachodzi, ale należy to potwierdzić — również dla `git-crypt-rs`, którego licencję trzeba sprawdzić. Do czasu rozstrzygnięcia repozytorium pozostaje prywatne albo oznaczone jako GPL-3.0.
 - Atrybucja projektów inspirujących w README niezależnie od wyniku analizy licencyjnej.
-- **Kolizja nazw:** nazwa `git-crypt` na crates.io może być zajęta, a binarka `git-crypt` konfliktuje z oryginałem zainstalowanym przez brew/apt. Wymaga decyzji: inna nazwa crate'a i/lub inna nazwa binarki.
+- **Kolizja nazw — rozstrzygnięte 2026-08-04: crate i binarka nazywają się `git-xcrypt`.** Sprawdzone przed decyzją: `git-crypt` na crates.io jest **zajęte** przez `AprilNEA/git-crypt-rs` (0.1.4, ostatnia aktualizacja 2025-11-15), a binarki `git-crypt` i `git-secret` mają formuły w Homebrew — plik wykonywalny o którejkolwiek z tych nazw byłby po cichu przesłaniany na `PATH` przez wcześniejszy wpis. `git-xcrypt` jest wolne na crates.io, nie ma formuły w Homebrew i nie znaleziono kolidującego projektu. Nazwa zachowuje mechanizm podkomendy: binarka `git-xcrypt` na `PATH` daje `git xcrypt <komenda>`.
 - Homebrew wymaga własnego tapa (do core trafiają tylko projekty z ustaloną popularnością).
 - Wydania z GitHub Actions: podpisane artefakty, sumy kontrolne SHA-256, spójne wersjonowanie tagu i `Cargo.toml`.
 
@@ -158,17 +158,17 @@ Wszystkie poniższe są **akceptowanymi kompromisami** konstrukcji, nie błędam
 
 Projekt uznajemy za działający, gdy poniższy scenariusz przechodzi automatycznie na trzech platformach:
 
-1. `git init` + `git-crypt init` w nowym repo.
+1. `git init` + `git-xcrypt init` w nowym repo.
 2. Dodanie do `.git-crypt` wpisów `sekrety/` i `*.env`.
 3. Commit pliku `sekrety/haslo.txt` i `.env`, push do zdalnego repo.
 4. Zawartość blobów w zdalnym repo jest zaszyfrowana; `.git-crypt` i `.gitattributes` pozostają jawne.
-5. `git clone` na drugiej maszynie pokazuje pliki zaszyfrowane; po `git-crypt unlock` treść jest identyczna z oryginałem.
+5. `git clone` na drugiej maszynie pokazuje pliki zaszyfrowane; po `git-xcrypt unlock` treść jest identyczna z oryginałem.
 6. Powtórny `git status` po unlock jest czysty (dowód determinizmu).
 
 # Otwarte decyzje
 
 1. **Format odbiorców: age czy OpenPGP (sequoia)?** Rekomendacja: age dla v0.1.
-2. **Nazwa crate'a i binarki** wobec kolizji z oryginalnym `git-crypt`.
+2. ~~**Nazwa crate'a i binarki** wobec kolizji z oryginalnym `git-crypt`.~~ Rozstrzygnięte 2026-08-04: `git-xcrypt` dla obu — patrz „Dystrybucja, licencja i nazewnictwo".
 3. **Licencja projektu** po weryfikacji licencji projektów inspirujących.
 4. Nazwa pliku konfiguracyjnego: `.git-crypt` (kolizja z ewentualnym katalogiem na koperty kluczy) czy `.gitcrypt` / `.git-crypt-attributes`.
 5. Próg rozmiaru pliku, powyżej którego przechodzimy na buforowanie dyskowe zamiast RAM.

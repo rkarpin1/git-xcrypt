@@ -1,4 +1,4 @@
-//! Logic behind the `git-crypt` binary.
+//! Logic behind the `git-xcrypt` binary.
 //!
 //! The crate is split into a library and a thin binary so integration tests can
 //! drive the logic directly instead of only through a subprocess.

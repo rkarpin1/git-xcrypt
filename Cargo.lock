@@ -42,7 +42,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "git-crypt"
+name = "git-xcrypt"
 version = "0.1.0"
 dependencies = [
  "tempfile",

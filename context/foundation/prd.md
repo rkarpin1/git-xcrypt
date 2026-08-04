@@ -1,5 +1,5 @@
 ---
-project: "git-crypt"
+project: "git-xcrypt"
 version: 1
 status: draft
 created: 2026-08-03
@@ -34,7 +34,7 @@ Główna persona: **pojedynczy deweloper — autor projektu**, zarządzający se
 
 Pełny przepływ przechodzi od początku do końca:
 
-1. `git init` + `git-crypt init` w nowym repozytorium.
+1. `git init` + `git-xcrypt init` w nowym repozytorium.
 2. Wpisanie wzorców (`sekrety/`, `*.env`) do `.git-crypt`.
 3. Commit i push pliku zawierającego sekret.
 4. Bloby w zdalnym repozytorium są zaszyfrowane; `.git-crypt` pozostaje jawny.

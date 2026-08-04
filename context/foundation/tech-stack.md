@@ -1,7 +1,7 @@
 ---
 starter_id: rust
 package_manager: cargo
-project_name: git-crypt
+project_name: git-xcrypt
 hints:
   language_family: rust
   team_size: solo

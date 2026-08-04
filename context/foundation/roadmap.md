@@ -1,5 +1,5 @@
 ---
-project: "git-crypt"
+project: "git-xcrypt"
 version: 1
 status: draft
 created: 2026-08-03
@@ -9,7 +9,7 @@ main_goal: learn
 top_blocker: decisions
 ---
 
-# Roadmap: git-crypt
+# Roadmap: git-xcrypt
 
 > Wywiedzione z `context/foundation/prd.md` (v1) + sonda bazy kodu z 2026-08-03.
 > Edytuj na miejscu; archiwizuj po zastąpieniu.
@@ -173,7 +173,7 @@ Fundament poniżej zakłada ten stan i nie tworzy ponownie niczego, co jest zgł
 - **Parallel with:** S-02, S-03, S-05
 - **Blockers:** —
 - **Unknowns:**
-  - Jaka nazwa crate'a i binarki wobec kolizji z oryginalnym `git-crypt` w menedżerach pakietów? — Właściciel: użytkownik. Blokuje: tak.
+  - ~~Jaka nazwa crate'a i binarki wobec kolizji z oryginalnym `git-crypt` w menedżerach pakietów?~~ Rozstrzygnięte 2026-08-04: `git-xcrypt`. — Właściciel: użytkownik. Blokuje: nie.
   - Jaka licencja projektu wobec GPL-3.0 projektów inspirujących? — Właściciel: użytkownik. Blokuje: tak.
 - **Risk:** publikacja pod kolidującą nazwą albo bez rozstrzygniętej licencji jest trudna do wycofania — obie decyzje muszą zapaść przed pierwszym publicznym wydaniem, nie po nim. Sama technika jest tu najprostsza w całej roadmapie; blokują decyzje, nie kod.
 - **Status:** blocked
@@ -196,7 +196,7 @@ Fundament poniżej zakłada ten stan i nie tworzy ponownie niczego, co jest zgł
 1. **Jak nie dopuścić do rozjazdu pliku konfiguracyjnego i konfiguracji czytanej przez gita?** — Właściciel: użytkownik. Blokuje: `S-02` (a przez zależność również `S-06`).
 2. **Co chroni przed zamknięciem repozytorium bez wcześniejszego wyeksportowania klucza?** — Właściciel: użytkownik. Blokuje: `S-04`.
 3. **Jak głęboko `status` sprawdza repozytorium — bieżący stan czy cała historia?** — Właściciel: użytkownik. Blokuje: `S-06`.
-4. **Jaka nazwa crate'a i binarki wobec kolizji z oryginalnym `git-crypt`?** — Właściciel: użytkownik. Blokuje: `S-07`.
+4. ~~**Jaka nazwa crate'a i binarki wobec kolizji z oryginalnym `git-crypt`?**~~ Rozstrzygnięte 2026-08-04: `git-xcrypt` dla crate'a i binarki. — Właściciel: użytkownik. Blokuje: nic.
 5. **Jaka licencja projektu wobec GPL-3.0 projektów inspirujących?** — Właściciel: użytkownik. Blokuje: `S-07`.
 6. **Co chroni użytkownika przed utratą jedynego pliku klucza?** — Właściciel: użytkownik. Blokuje: nic; wpływa na zakres `S-03`.
 7. **Jaki jest liczbowy próg dla wymagania wydajnościowego?** — Właściciel: użytkownik. Blokuje: roadmap-wide; bez liczby nie da się stwierdzić, czy wymaganie zostało spełnione.
