@@ -156,13 +156,13 @@ kodem co `sync`, zamiast wypisywać samą linię catch-all.
 
 #### Automatyczne
 
-- [ ] 1.1 `sekrety/` renderuje się jako `sekrety/**`
-- [ ] 1.2 `binary` daje linię bez `diff=git-xcrypt`
-- [ ] 1.3 Negacje nie trafiają do sekcji
-- [ ] 1.4 Treść poza markerami nietknięta
-- [ ] 1.5 Renderowanie jest idempotentne
-- [ ] 1.6 Uszkodzone markery kończą się kodem `2`
-- [ ] 1.7 `cargo clippy --all-targets -- -D warnings`
+- [x] 1.1 `sekrety/` renderuje się jako `sekrety/**`
+- [x] 1.2 `binary` daje linię bez `diff=git-xcrypt`
+- [x] 1.3 Negacje nie trafiają do sekcji
+- [x] 1.4 Treść poza markerami nietknięta
+- [x] 1.5 Renderowanie jest idempotentne
+- [x] 1.6 Uszkodzone markery kończą się kodem `2`
+- [x] 1.7 `cargo clippy --all-targets -- -D warnings`
 
 ### Faza 2: Komenda `sync`
 
