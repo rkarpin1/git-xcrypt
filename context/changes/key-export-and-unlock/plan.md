@@ -180,15 +180,15 @@ Po odszyfrowaniu stosuje końcówki linii zgodnie z bitem `flags` i konfiguracj�
 
 #### Automatyczne
 
-- [x] 2.1 Pełny przepływ US-01 daje treść bajt w bajt równą oryginałowi
-- [x] 2.2 `git status` po `unlock` jest czysty
-- [x] 2.3 `unlock` z niewłaściwym kluczem daje kod `4` i nie zmienia plików
-- [x] 2.4 Powtórzony `unlock` jest bezpieczny
-- [x] 2.5 `unlock` uzupełnia `filter.git-xcrypt.*` w klonie
-- [x] 2.6 `import-key` z identycznym kluczem to pusty sukces, z innym kod `2`
-- [x] 2.7 Klon bez `unlock` pokazuje ciphertext
-- [x] 2.8 `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`
+- [x] 2.1 Pełny przepływ US-01 daje treść bajt w bajt równą oryginałowi — 8d1d461
+- [x] 2.2 `git status` po `unlock` jest czysty — 8d1d461
+- [x] 2.3 `unlock` z niewłaściwym kluczem daje kod `4` i nie zmienia plików — 8d1d461
+- [x] 2.4 Powtórzony `unlock` jest bezpieczny — 8d1d461
+- [x] 2.5 `unlock` uzupełnia `filter.git-xcrypt.*` w klonie — 8d1d461
+- [x] 2.6 `import-key` z identycznym kluczem to pusty sukces, z innym kod `2` — 8d1d461
+- [x] 2.7 Klon bez `unlock` pokazuje ciphertext — 8d1d461
+- [x] 2.8 `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` — 8d1d461
 
 #### Ręczne
 
-- [x] 2.9 Komunikat przy niezgodnym `key_id` jest zrozumiały
+- [x] 2.9 Komunikat przy niezgodnym `key_id` jest zrozumiały — 8d1d461
