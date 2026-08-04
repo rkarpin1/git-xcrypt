@@ -34,7 +34,7 @@ w planie oznaczone jako nieblokujące.
 - **Dimension**: Safety & Quality
 - **Location**: `tests/harness/mod.rs:110-120` (przed poprawką)
 - **Detail**: `object_exists_for` zapisywało badaną treść do pliku
-  `.git-crypt-plaintext-probe` wewnątrz drzewa roboczego repozytorium testowego, tylko po
+  `.git-xcrypt-plaintext-probe` wewnątrz drzewa roboczego repozytorium testowego, tylko po
   to, żeby policzyć jej hash. Sprzątanie następowało po `git_ok`, który panikuje przy
   niepowodzeniu, więc panika zostawiłaby plik z plaintextem w drzewie roboczym — a
   `commit_all` używa `git add -A`, więc kolejny commit w tym samym teście by go

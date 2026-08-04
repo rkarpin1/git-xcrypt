@@ -2,7 +2,7 @@
 bootstrapped_at: 2026-08-03T19:54:22Z
 starter_id: rust
 starter_name: "Rust (binary crate)"
-project_name: git-crypt
+project_name: git-xcrypt
 language_family: rust
 package_manager: cargo
 cwd_strategy: subdir-then-move
@@ -18,7 +18,7 @@ Skopiowane dosłownie z `context/foundation/tech-stack.md`.
 ```yaml
 starter_id: rust
 package_manager: cargo
-project_name: git-crypt
+project_name: git-xcrypt
 hints:
   language_family: rust
   team_size: solo
@@ -76,16 +76,16 @@ Dwa niezależne ustalenia, oba zweryfikowane przed podjęciem decyzji:
 
 2. **Katalog roboczy już odpowiada wynikowi startera.** Stan sprzed uruchomienia:
 
-   | element | stan w katalogu | wynik `cargo new git-crypt --bin --edition 2024` |
+   | element | stan w katalogu | wynik `cargo new git-xcrypt --bin --edition 2024` |
    | --- | --- | --- |
-   | `Cargo.toml` | `name = "git-crypt"`, `version = "0.1.0"`, `edition = "2024"`, brak zależności | identyczny |
+   | `Cargo.toml` | `name = "git-xcrypt"`, `version = "0.1.0"`, `edition = "2024"`, brak zależności | identyczny |
    | `src/main.rs` | `fn main() { println!("Hello, world!"); }` | identyczny |
    | `.gitignore` | `/target` oraz dopisane przez użytkownika `/.idea`, `/.idea/` | `/target` |
    | `Cargo.lock` | obecny | obecny |
 
    Scaffolding wyprodukowałby wyłącznie pliki `Cargo.toml.scaffold` i `src/main.rs.scaffold` o treści identycznej z istniejącymi.
 
-Użytkownikowi przedstawiono trzy opcje (pominięcie, obejście przez `--name git-crypt`, wykonanie dosłowne z udokumentowaną porażką). Wybrał pominięcie.
+Użytkownikowi przedstawiono trzy opcje (pominięcie, obejście przez `--name git-xcrypt`, wykonanie dosłowne z udokumentowaną porażką). Wybrał pominięcie.
 
 ## Post-scaffold audit
 
@@ -103,7 +103,7 @@ Surowe wyjście:
 EXIT=0
 ```
 
-Skanowana była jedna pozycja — sam crate `git-crypt`. Wynik jest prawdziwy, ale bez wartości informacyjnej: `Cargo.toml` nie deklaruje jeszcze żadnej zależności. Audyt nabierze znaczenia po dodaniu bibliotek kryptograficznych i warto go wtedy powtórzyć.
+Skanowana była jedna pozycja — sam crate `git-xcrypt`. Wynik jest prawdziwy, ale bez wartości informacyjnej: `Cargo.toml` nie deklaruje jeszcze żadnej zależności. Audyt nabierze znaczenia po dodaniu bibliotek kryptograficznych i warto go wtedy powtórzyć.
 
 ## Hints recorded but not acted on
 
