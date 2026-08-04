@@ -84,6 +84,32 @@ pub enum SetupGap {
         /// What git resolves instead, spelled as `git check-attr` spells it.
         resolved: String,
     },
+    /// Git converts the line endings of declared paths itself.
+    ///
+    /// The twin of [`SetupGap::FilterUnresolved`], on the second attribute the
+    /// managed section sets, and it costs more rather than less. The section
+    /// writes `-text` on every encrypted path precisely so that git's own CRLF
+    /// conversion never touches the ciphertext; an attribute line that outranks
+    /// it puts the conversion back.
+    ///
+    /// Measured on git 2.55, with `sync` freshly run so nothing else in this
+    /// command had anything to say: a 2 MB file under `secrets/** text` lost 34
+    /// `CR` bytes out of its **ciphertext**, `git add` exited 0, `git commit`
+    /// exited 0, and the checkout failed the authentication tag and left no file
+    /// at all. Nobody can decrypt what was committed — not the author, not with
+    /// the key, not ever. `status` printed `VERDICT: no findings.` and exited 0.
+    ///
+    /// A gap rather than a note for the reason the unresolved filter is one:
+    /// both mean the declaration is not enforced, and a note does not fail a CI
+    /// gate.
+    CiphertextConverted {
+        /// The declared paths git would convert, capped for the message.
+        paths: Vec<String>,
+        /// How many there are altogether.
+        total: usize,
+        /// The attribute line that decides it, with the file and line it sits in.
+        culprit: String,
+    },
     /// A file the whole mechanism bootstraps from is not tracked.
     ///
     /// `.gitattributes` is what makes git call the filter and `.git-xcrypt` is
@@ -127,6 +153,30 @@ impl fmt::Display for SetupGap {
                      line is the fix — `git-xcrypt init` will not remove it. Reached: {}",
                     paths.join(", "),
                     catch_all = gitattributes::CATCH_ALL
+                )?;
+                if *total > paths.len() {
+                    write!(f, ", … and {} more", total - paths.len())?;
+                }
+                Ok(())
+            }
+            Self::CiphertextConverted {
+                paths,
+                total,
+                culprit,
+            } => {
+                write!(
+                    f,
+                    "git converts the line endings of {total} declared path(s) itself, \
+                     because this line outranks the managed `-text`:\n      {culprit}\n    \
+                     That conversion runs over the **ciphertext**: `git add` and \
+                     `git commit` both exit 0, the damaged blob is committed, and the \
+                     next checkout fails the authentication tag and leaves no file at \
+                     all — measured on git 2.55, 34 `CR` bytes eaten out of a 2 MB blob. \
+                     What is committed cannot be decrypted again by anyone, with any \
+                     key. Delete or narrow that line so the managed `-text` wins, then \
+                     run `git-xcrypt sync`; anything already committed under it has to \
+                     be re-added from a copy of the plain text. Reached: {}",
+                    paths.join(", ")
                 )?;
                 if *total > paths.len() {
                     write!(f, ", … and {} more", total - paths.len())?;
@@ -246,6 +296,17 @@ impl Report {
     pub fn exposed(&self) -> bool {
         self.verdict() == Verdict::Exposed
     }
+
+    /// Whether any setup gap means git stores declared content unfiltered.
+    ///
+    /// [`SetupGap::CiphertextConverted`] is the one that does not: git runs the
+    /// filter, and then damages what it produced. Same exit code, opposite
+    /// remedy — and the opposite advice about rotating the secret.
+    fn stores_in_the_clear(&self) -> bool {
+        self.setup
+            .iter()
+            .any(|gap| !matches!(gap, SetupGap::CiphertextConverted { .. }))
+    }
 }
 
 /// A repository-relative path as a message shows it.
@@ -289,21 +350,42 @@ impl fmt::Display for Report {
                 "setup: git is configured to run the filter in this repository."
             )?;
         } else {
-            writeln!(
-                f,
-                "setup: git is NOT filtering this repository. Until this is fixed, \
-                 committing a declared file stores it in the clear, with exit code 0 \
-                 and no warning."
-            )?;
+            // Two different sentences, because the gaps have two different
+            // outcomes and one wording cannot be true of both. A registration
+            // gap stores the plain text; a conversion gap destroys the
+            // ciphertext instead — and telling a user their secrets are in the
+            // clear when they are not sends them to rotate credentials that were
+            // never exposed, while telling them to run `init` fixes nothing.
+            if self.stores_in_the_clear() {
+                writeln!(
+                    f,
+                    "setup: git is NOT filtering this repository. Until this is fixed, \
+                     committing a declared file stores it in the clear, with exit code 0 \
+                     and no warning."
+                )?;
+            } else {
+                writeln!(
+                    f,
+                    "setup: git runs the filter here, but does not leave its output \
+                     alone. Nothing is stored in the clear over this; what it costs is \
+                     the ciphertext, and with it the file."
+                )?;
+            }
             for gap in &self.setup {
                 writeln!(f, "  - {gap}")?;
             }
-            writeln!(f, "\n  Fix it with one of:")?;
-            if self.has_key {
-                writeln!(f, "    git-xcrypt init      # the key here is kept")?;
-            } else {
-                writeln!(f, "    git-xcrypt unlock <key-file>")?;
-                writeln!(f, "    git-xcrypt import-key <key-file>")?;
+            // Only where it is the remedy. Neither command touches
+            // `.gitattributes` lines a user wrote, so offering them against a
+            // conversion gap would send a reader round a loop that changes
+            // nothing; that gap carries its own instruction instead.
+            if self.stores_in_the_clear() {
+                writeln!(f, "\n  Fix it with one of:")?;
+                if self.has_key {
+                    writeln!(f, "    git-xcrypt init      # the key here is kept")?;
+                } else {
+                    writeln!(f, "    git-xcrypt unlock <key-file>")?;
+                    writeln!(f, "    git-xcrypt import-key <key-file>")?;
+                }
             }
         }
 
@@ -708,7 +790,7 @@ pub fn run(repo: &Repo, fix: bool) -> Result<Report> {
     // resolution answers it. Built once for the whole run — it reads every
     // `.gitattributes` in the working tree, and doing that per path would turn a
     // diagnostic into a walk of the tree squared.
-    let mut filters = gitattributes::FilterResolver::new(
+    let mut filters = gitattributes::AttributeResolver::new(
         repo.work_tree(),
         repo.git_dir(),
         gitconfig::get(&config, "core.attributesFile")
@@ -842,7 +924,7 @@ fn inspect_index(
     declarations: &Config,
     objects: &gix_odb::Handle,
     hash: gix_hash::Kind,
-    filters: &mut gitattributes::FilterResolver,
+    filters: &mut gitattributes::AttributeResolver,
     report: &mut Report,
 ) -> Result<()> {
     let index_path = repo.git_dir().join("index");
@@ -906,6 +988,9 @@ fn inspect_index(
     // subdirectory `.gitattributes` reaches every file under it, and three
     // hundred identical gaps would bury every other finding.
     let mut unfiltered: Vec<(String, String)> = Vec::new();
+    // Declared paths whose stored bytes git converts itself, with the line that
+    // decides it. Grouped the same way and for the same reason.
+    let mut converted: Vec<(String, String)> = Vec::new();
 
     for entry in entries {
         // A symbolic link and a submodule gitlink are not file content, so git
@@ -936,8 +1021,14 @@ fn inspect_index(
         // clear on the next `git add`, with exit code 0 and no warning — and
         // every other check in this command passes while it happens.
         let resolved = filters.resolve(&name);
-        if !resolved.is_ours() {
-            unfiltered.push((show(&name), resolved.to_string()));
+        if !resolved.filter.is_ours() {
+            unfiltered.push((show(&name), resolved.filter.to_string()));
+        }
+        // The second question of the same stack. A path git filters correctly
+        // and then converts is not half-protected: the ciphertext is destroyed,
+        // which costs more than storing the plain text would have.
+        if let gitattributes::EolConversion::On(culprit) = resolved.conversion {
+            converted.push((show(&name), display_culprit(repo, &culprit)));
         }
 
         let Ok(id) = gix_hash::oid::try_from_bytes(&id) else {
@@ -978,7 +1069,41 @@ fn inspect_index(
             resolved,
         });
     }
+
+    if !converted.is_empty() {
+        converted.sort();
+        let culprit = converted
+            .first()
+            .map(|(_, culprit)| culprit.clone())
+            .unwrap_or_default();
+        report.setup.push(SetupGap::CiphertextConverted {
+            paths: converted
+                .iter()
+                .take(MAX_LISTED)
+                .map(|(path, _)| path.clone())
+                .collect(),
+            total: converted.len(),
+            culprit,
+        });
+    }
     Ok(())
+}
+
+/// The attribute line behind a verdict, with its path made repository-relative.
+///
+/// An absolute path out of a temporary directory tells a reader nothing they can
+/// act on, and `$GIT_DIR/info/attributes` has to keep enough of its path to be
+/// recognisable as the unversioned source it is.
+fn display_culprit(repo: &Repo, culprit: &gitattributes::Culprit) -> String {
+    let Some(source) = &culprit.source else {
+        return culprit.to_string();
+    };
+    let shown = repo.relative(source).unwrap_or(source);
+    gitattributes::Culprit {
+        source: Some(shown.to_path_buf()),
+        ..culprit.clone()
+    }
+    .to_string()
 }
 
 /// Names the attribute files carrying `filter` lines, once resolution has run.
@@ -994,7 +1119,7 @@ fn inspect_index(
 /// the honest boundary of a check that resolves only the paths git is tracking.
 fn foreign_source_note(
     repo: &Repo,
-    filters: &gitattributes::FilterResolver,
+    filters: &gitattributes::AttributeResolver,
     reached_a_declared_path: bool,
 ) -> Vec<String> {
     let mut notes = Vec::new();

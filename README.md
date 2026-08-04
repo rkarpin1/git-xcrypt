@@ -132,7 +132,7 @@ What the exit code means to the job:
 | Code | Meaning | What to do |
 | --- | --- | --- |
 | `0` | Everything was checked and nothing was found. | Nothing. |
-| `5` | Something was found: a setup gap, a declared file staged in the clear, a plaintext version in history, or a declared path git does not resolve `filter=git-xcrypt` for. | Read the report. If a secret leaked, **rotate it first**. |
+| `5` | Something was found: a setup gap, a declared file staged in the clear, a plaintext version in history, a declared path git does not resolve `filter=git-xcrypt` for, or one whose ciphertext git converts because some attribute line outranks the managed `-text`. | Read the report. If a secret leaked, **rotate it first**. |
 | `6` | The run could not answer. A shallow or partial clone, an index that will not parse, a reference store that will not enumerate, a missing `.git-xcrypt`. | Fix the checkout and run it again. Nothing was found, and nothing is ruled out. |
 | `1`–`4` | The tool itself failed — bad arguments, not a repository, no key, bad format. | Fix the invocation or the environment. |
 
@@ -171,19 +171,35 @@ CI logs and every clone that exists.
 `status` answers "are my declarations enforced", not "does this repository hold
 secrets". A file no pattern ever matched is invisible to it.
 
-### Attributes that turn the filter off
+### Attributes that turn the filter off, or turn conversion back on
 
-The `* filter=git-xcrypt` line is one attribute line among many, and git takes
-the **last** match. A line below the managed section, a `.gitattributes` in a
-subdirectory, or `.git/info/attributes` — which is not versioned, so nobody
-reviewing a pull request can see it — can set `-filter` on a declared path.
-`git add` then stores the plain text with exit code 0.
+The managed section is a few attribute lines among many, and git takes the
+**last** match. A line below the section, a `.gitattributes` in a subdirectory,
+or `.git/info/attributes` — which is not versioned, so nobody reviewing a pull
+request can see it — outranks it. There are two ways that hurts, and they hurt
+differently:
 
-`git-xcrypt status` resolves the `filter` attribute for every declared path the
-index holds, using git's own precedence rules, macros included, and fails with
-exit `5` when git would not run this tool. It resolves rather than guesses, so
-an ordinary `*.psd filter=lfs` line does not trigger it. `git check-attr filter
--- <path>` gives the same answer by hand.
+- **`-filter` on a declared path.** Git runs no filter, `git add` stores the
+  plain text with exit code 0, and the secret is in the repository.
+- **`text`, or a bare `eol=`, on a declared path.** Git *does* run the filter and
+  then converts the line endings of what it produced — the **ciphertext**.
+  Measured on git 2.55: 34 `CR` bytes eaten out of a 2 MB blob, `git add` and
+  `git commit` both exit 0, and the next checkout fails the authentication tag
+  and leaves no file at all. Nothing is exposed; the file is simply gone, and no
+  key will ever bring it back. This is what the managed `-text` prevents, and
+  why `sync` belongs in your workflow rather than being cosmetic.
+
+`git-xcrypt status` resolves both attributes for every declared path the index
+holds, using git's own precedence rules, macros included, and fails with exit `5`
+either way — the report names the winning line and the file and line number it
+sits in. It resolves rather than guesses, so none of these trigger it: an
+ordinary `*.psd filter=lfs`, `text=auto`, `binary`, `-text` with any `eol=`, or
+`core.autocrlf` at any value. Our magic starts with a NUL byte, so every code
+path in git that consults binary detection leaves the ciphertext alone.
+`git check-attr filter text eol -- <path>` gives the same answers by hand.
+
+A foreign `diff=` line on a declared path is measured harmless: it costs you a
+readable `git diff` and touches no stored byte. `status` does not fail over it.
 
 The boundary: only paths the index already tracks are resolved. A line that
 would disable the filter for a file nobody has committed yet is reported as a

@@ -1443,3 +1443,229 @@ fn a_stale_section_is_reported_as_the_corruption_it_risks_not_as_a_tidiness_nag(
         "the note must say what settles it:\n{text}"
     );
 }
+
+/// 2 MB whose bytes cover the whole range, NUL included.
+///
+/// The plaintext shape barely matters — what git converts is the *ciphertext*,
+/// which is pseudorandom and so carries a `CRLF` pair every 64 KiB or so. The
+/// size is what makes the damage certain rather than probable.
+fn two_megabytes() -> Vec<u8> {
+    (0..2 * 1024 * 1024u32)
+        .map(|index| u8::try_from(index % 251).expect("a byte"))
+        .collect()
+}
+
+/// Asserts the stored blob is the ciphertext git-xcrypt wrote, byte for byte.
+///
+/// `38 + n` is the frozen overhead: SIV encrypts in CTR mode, so anything else
+/// means something ran a conversion over the ciphertext.
+fn assert_ciphertext_intact(repo: &TestRepo, path: &str, plaintext: &[u8]) {
+    assert_eq!(
+        repo.blob_bytes(path).len(),
+        38 + plaintext.len(),
+        "{path}: the stored ciphertext was altered"
+    );
+}
+
+/// Removes and checks out `path`, returning whether it came back.
+fn survives_checkout(repo: &TestRepo, path: &str) -> bool {
+    std::fs::remove_file(repo.path().join(path)).expect("could not remove");
+    repo.git(["checkout", "--", path]);
+    repo.path().join(path).is_file()
+}
+
+#[test]
+fn a_foreign_text_line_over_a_declared_path_fails_the_gate() {
+    // The managed section is *current* here — `sync` has run and the `-text`
+    // line is exactly right — so the stale-section note has nothing to say. A
+    // single line below it puts `text` back on, and git takes the LAST match.
+    //
+    // Measured on git 2.55: `git check-attr text -- secrets/klucz.p12` answers
+    // `set`, git runs its own CRLF conversion over the **ciphertext**, 34 `CR`
+    // bytes are eaten out of a 2 MB blob, `git add` and `git commit` both exit
+    // 0, and the checkout fails the authentication tag and leaves no file at
+    // all. Nobody can ever decrypt what was committed. `status` said
+    // `VERDICT: no findings.` and exited 0 over exactly that.
+    let secret = two_megabytes();
+
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.xcrypt_ok(["sync"]);
+
+    let attributes = repo.worktree_bytes(".gitattributes");
+    let mut with_user_line = attributes.clone();
+    with_user_line.extend_from_slice(b"secrets/** text\n");
+    repo.write_file(".gitattributes", &with_user_line);
+
+    repo.write_file("secrets/klucz.p12", &secret);
+    repo.commit_all("a secret under a foreign text line");
+
+    // First: the fixture really is the failure mode, not a story about one.
+    assert_eq!(
+        repo.check_attr("text", "secrets/klucz.p12"),
+        "set",
+        "the fixture must really put `text` back on the declared path"
+    );
+    assert_ne!(
+        repo.blob_bytes("secrets/klucz.p12").len(),
+        38 + secret.len(),
+        "this test no longer reproduces the corruption it exists to catch"
+    );
+    assert!(
+        !survives_checkout(&repo, "secrets/klucz.p12"),
+        "the damaged blob must fail to check out"
+    );
+
+    // Second: `status` has to say so, and fail the gate over it.
+    let output = repo.xcrypt(["status"]);
+    let text = report(&output);
+
+    assert_eq!(
+        output.status.code(),
+        Some(EXPOSED),
+        "a repository whose ciphertext git converts must fail the gate:\n{text}"
+    );
+    assert!(
+        text.contains("does not leave its output alone"),
+        "the finding belongs in the setup section, not in the notes:\n{text}"
+    );
+    // The wording is part of the safeguard here too, in the other direction:
+    // git *is* filtering, so telling a user their secret is in the clear would
+    // send them to rotate a credential that was never exposed — and to run
+    // `init`, which does not touch a line they wrote.
+    assert!(
+        !text.contains("stores it in the clear"),
+        "a conversion gap must not be dressed as a plaintext exposure:\n{text}"
+    );
+    assert!(
+        !text.contains("git-xcrypt init"),
+        "`init` does not remove a foreign attribute line; offering it here sends \
+         the reader round a loop that changes nothing:\n{text}"
+    );
+    assert!(
+        !text.contains("no longer matches"),
+        "the managed section is current here; the stale note must not be what \
+         carries this finding:\n{text}"
+    );
+    assert!(
+        text.contains("secrets/klucz.p12"),
+        "the report must name the path whose ciphertext git converts:\n{text}"
+    );
+    assert!(
+        text.contains(".gitattributes"),
+        "the report must name the file the winning line sits in:\n{text}"
+    );
+    assert!(
+        text.contains("secrets/** text"),
+        "the report must name the winning line itself:\n{text}"
+    );
+    assert!(
+        text.contains("checkout"),
+        "the report must say the file is lost at checkout:\n{text}"
+    );
+    assert!(
+        text.contains("-text"),
+        "the report must name the attribute that prevents it:\n{text}"
+    );
+}
+
+#[test]
+fn an_eol_line_alone_over_a_declared_path_fails_the_gate() {
+    // Not in the brief, and measured on git 2.55: with `text` *unspecified*, a
+    // bare `eol=lf` is enough. Git's `convert_attrs` promotes an undefined
+    // `crlf_action` to `CRLF_TEXT_INPUT` the moment an `eol` attribute is
+    // present, and the `CRLF_TEXT_*` actions skip binary detection entirely —
+    // so the leading NUL of our magic saves nothing. Same outcome: the blob is
+    // short, the checkout leaves no file.
+    let secret = two_megabytes();
+
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    // The static catch-all alone: this is a repository where `sync` was never
+    // run after the pattern was added, so nothing declares `-text`.
+    repo.write_file(
+        ".gitattributes",
+        b"# >>> git-xcrypt >>>\n* filter=git-xcrypt\n# <<< git-xcrypt <<<\nsecrets/** eol=lf\n",
+    );
+    repo.write_file("secrets/klucz.p12", &secret);
+    repo.commit_all("a secret under a bare eol line");
+
+    assert_eq!(repo.check_attr("text", "secrets/klucz.p12"), "unspecified");
+    assert_eq!(repo.check_attr("eol", "secrets/klucz.p12"), "lf");
+    assert_ne!(
+        repo.blob_bytes("secrets/klucz.p12").len(),
+        38 + secret.len(),
+        "this test no longer reproduces the corruption it exists to catch"
+    );
+    assert!(!survives_checkout(&repo, "secrets/klucz.p12"));
+
+    let output = repo.xcrypt(["status"]);
+    let text = report(&output);
+
+    assert_eq!(
+        output.status.code(),
+        Some(EXPOSED),
+        "a bare `eol=` over a declared path must fail the gate:\n{text}"
+    );
+    assert!(text.contains("secrets/klucz.p12"), "{text}");
+    assert!(
+        text.contains("secrets/** eol=lf"),
+        "the report must name the winning line:\n{text}"
+    );
+}
+
+#[test]
+fn the_attribute_values_that_leave_the_ciphertext_alone_do_not_fail_the_gate() {
+    // The other half of the fix, and the more important half for a gate nobody
+    // is allowed to learn to ignore. Measured on git 2.55 with a 2 MB file and
+    // a byte-for-byte round trip: `-text`, `binary`, `text=auto` and an
+    // unspecified `text` under every `core.autocrlf` value all leave the
+    // ciphertext untouched — the magic starts with NUL, and every one of those
+    // paths still consults git's binary detection. `eol=` beside `-text` is
+    // measured inert too: `-text` beats `eol`, exactly as `zalozenia.md` says.
+    let secret = two_megabytes();
+
+    for (line, autocrlf) in [
+        ("", "false"),
+        ("", "true"),
+        ("", "input"),
+        ("secrets/** text=auto\n", "false"),
+        ("secrets/** text=auto\n", "true"),
+        ("secrets/** text=auto eol=crlf\n", "false"),
+        ("secrets/** binary\n", "false"),
+        ("secrets/** -text\n", "false"),
+        ("secrets/** -text eol=crlf\n", "false"),
+        ("*.psd filter=lfs\n", "false"),
+        ("secrets/** diff=lfs\n", "false"),
+    ] {
+        let repo = TestRepo::init();
+        repo.git_ok(["config", "core.autocrlf", autocrlf]);
+        repo.init_xcrypt();
+        repo.write_xcrypt_config("secrets/\n");
+        repo.xcrypt_ok(["sync"]);
+
+        let mut attributes = repo.worktree_bytes(".gitattributes");
+        attributes.extend_from_slice(line.as_bytes());
+        repo.write_file(".gitattributes", &attributes);
+        repo.write_file("secrets/klucz.p12", &secret);
+        repo.commit_all("a secret");
+
+        assert_ciphertext_intact(&repo, "secrets/klucz.p12", &secret);
+        assert!(
+            survives_checkout(&repo, "secrets/klucz.p12"),
+            "`{line}` with core.autocrlf={autocrlf} lost the file"
+        );
+        repo.assert_worktree_eq("secrets/klucz.p12", &secret);
+
+        let output = repo.xcrypt(["status"]);
+        let text = report(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "`{line}` with core.autocrlf={autocrlf} damages nothing, so it must \
+             not fail the gate:\n{text}"
+        );
+    }
+}

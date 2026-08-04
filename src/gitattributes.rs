@@ -564,7 +564,138 @@ impl std::fmt::Display for FilterAttribute {
     }
 }
 
-/// Answers "would git run our filter for this path", the way git answers it.
+/// Where an attribute value came from, in terms a reader can act on.
+///
+/// A verdict of "git converts your ciphertext" is unactionable without this: the
+/// stack has four levels and one of them, `$GIT_DIR/info/attributes`, is not
+/// versioned and cannot be seen in a pull request at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Culprit {
+    /// The attributes file the line sits in, when there is one.
+    pub source: Option<PathBuf>,
+    /// The line number within it, as git counts them.
+    pub line: usize,
+    /// The pattern that matched.
+    pub pattern: String,
+    /// The assignment, spelled the way a `.gitattributes` line spells it.
+    pub assignment: String,
+}
+
+impl std::fmt::Display for Culprit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.source {
+            // Forward slashes so the message reads the same on all three
+            // platforms, and so a reader can paste the path back into git.
+            Some(source) => write!(
+                f,
+                "{}:{}: {} {}",
+                source.display().to_string().replace('\\', "/"),
+                self.line,
+                self.pattern,
+                self.assignment
+            ),
+            None => write!(f, "{} {}", self.pattern, self.assignment),
+        }
+    }
+}
+
+/// Whether git would run **its own** end-of-line conversion over stored bytes.
+///
+/// The distinction this type exists for is measured, not reasoned: git's
+/// `convert_attrs` maps the `text` attribute onto a `crlf_action`, and only the
+/// `CRLF_AUTO*` actions consult binary detection. Our magic starts with a NUL
+/// byte, so every action that does consult it leaves the ciphertext alone; the
+/// ones that do not convert it unconditionally, and a converted ciphertext fails
+/// its authentication tag forever.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EolConversion {
+    /// Git leaves the bytes alone.
+    Off,
+    /// Git converts them, because of this assignment.
+    On(Culprit),
+}
+
+/// What git resolves for one path, on both axes the managed section sets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolution {
+    /// Whether git would run this tool for the path.
+    pub filter: FilterAttribute,
+    /// Whether git would convert the path's line endings itself.
+    pub conversion: EolConversion,
+}
+
+/// One resolved attribute: its state, and where the state came from.
+type Resolved = (gix_attributes::State, Culprit);
+
+/// Spells an assignment the way a `.gitattributes` line spells it.
+fn spell_assignment(assignment: gix_attributes::AssignmentRef<'_>) -> String {
+    use gix_attributes::StateRef;
+    let name = assignment.name.as_str();
+    match assignment.state {
+        StateRef::Set => name.to_string(),
+        StateRef::Unset => format!("-{name}"),
+        StateRef::Unspecified => format!("!{name}"),
+        StateRef::Value(value) => format!("{name}={}", value.as_bstr()),
+    }
+}
+
+/// Whether the resolved `text` and `eol` make git convert the stored bytes.
+///
+/// The whole table, measured on git 2.55 with a 2 MB file whose ciphertext
+/// carries `CRLF` pairs, judged by a byte-for-byte round trip through `git add`,
+/// `git commit`, `rm` and `git checkout`:
+///
+/// | `text`        | `eol`      | result                                    |
+/// | ------------- | ---------- | ----------------------------------------- |
+/// | `unset`       | any        | untouched — `-text` beats `eol`           |
+/// | `auto`        | any        | untouched — binary detection sees the NUL |
+/// | `unspecified` | unset      | untouched, at every `core.autocrlf` value |
+/// | `set`         | any        | **converted, file lost at checkout**      |
+/// | `unspecified` | `lf`/`crlf`| **converted, file lost at checkout**      |
+///
+/// The last row is the one nobody expects, and it is not an accident of the
+/// implementation — it is git's, in `convert_attrs`: an `eol` attribute promotes
+/// an undefined `crlf_action` straight to `CRLF_TEXT_INPUT`/`CRLF_TEXT_CRLF`,
+/// and only the `CRLF_AUTO*` actions consult binary detection. `-text` is
+/// exempt because git skips the `eol` attribute entirely when the action is
+/// `CRLF_BINARY`, which is exactly the guarantee the managed section buys.
+///
+/// The safe rows are as load-bearing as the dangerous ones: a gate that fires on
+/// `text=auto` or on an ordinary `core.autocrlf=true` teaches a user to ignore
+/// it, and an ignored gate protects nothing.
+fn converts(text: Option<&Resolved>, eol: Option<&Resolved>) -> EolConversion {
+    use gix_attributes::State;
+
+    let text_state = text.map(|(state, _)| state);
+    match text_state {
+        Some(State::Set) => {
+            return EolConversion::On(text.expect("matched just above").1.clone());
+        }
+        // `-text` and the `binary` macro. Git never converts, and never even
+        // looks at `eol`.
+        Some(State::Unset) => return EolConversion::Off,
+        // `text=auto`, and anything else a value could spell: git keeps binary
+        // detection, and the leading NUL of our magic answers it.
+        Some(State::Value(_)) => return EolConversion::Off,
+        Some(State::Unspecified) | None => {}
+    }
+
+    // `text` unspecified. A bare `eol=` is enough on its own.
+    match eol {
+        Some((State::Value(value), culprit)) => {
+            let value = value.as_ref().as_bstr();
+            if value == "lf" || value == "crlf" {
+                EolConversion::On(culprit.clone())
+            } else {
+                EolConversion::Off
+            }
+        }
+        _ => EolConversion::Off,
+    }
+}
+
+/// Answers "would git run our filter for this path, and would git convert its
+/// line endings", the way git answers both.
 ///
 /// **Resolving rather than naming, since 2026-08-04.** The previous build listed
 /// every attribute source carrying a `filter` line and left the reader to run
@@ -574,6 +705,16 @@ impl std::fmt::Display for FilterAttribute {
 /// note does not fail a CI gate. Naming also cannot tell an ordinary
 /// `*.psd filter=lfs` from a line that reaches a secret, so it either cried wolf
 /// or said nothing useful.
+///
+/// **`text` joined `filter` on 2026-08-04**, for the same reason and at the same
+/// severity. The managed section writes `-text` on every encrypted path, and a
+/// line below it saying `secrets/** text` puts the conversion back — measured on
+/// git 2.55, with `sync` freshly run so nothing else in this command had a
+/// complaint: 34 `CR` bytes eaten out of a 2 MB ciphertext, `git add` and
+/// `git commit` both exit 0, and the checkout fails the authentication tag and
+/// leaves no file at all. `status` printed `VERDICT: no findings.` over it. An
+/// unresolved `filter` costs a plaintext secret; this costs the file outright,
+/// and both answer the same question with "your declaration is not enforced".
 ///
 /// The stack reproduced here is git's, in git's precedence order — lowest first,
 /// because [`gix_attributes::Search`] matches its lists in reverse:
@@ -589,14 +730,14 @@ impl std::fmt::Display for FilterAttribute {
 /// subdirectory is not a macro definition to git and is not one here.
 ///
 /// A source that cannot be read is skipped, exactly as git skips it.
-pub struct FilterResolver {
+pub struct AttributeResolver {
     search: gix_attributes::Search,
     outcome: gix_attributes::search::Outcome,
     case: gix_glob::pattern::Case,
     sources: Vec<PathBuf>,
 }
 
-impl FilterResolver {
+impl AttributeResolver {
     /// Loads every attribute source git would consult under `work_tree`.
     ///
     /// `global` is `core.attributesFile`; `ignore_case` is `core.ignorecase`,
@@ -648,7 +789,9 @@ impl FilterResolver {
         sources.extend(global.map(Path::to_path_buf));
 
         let mut outcome = gix_attributes::search::Outcome::default();
-        outcome.initialize_with_selection(&collection, ["filter"]);
+        // Order matters: `iter_selected` yields one item per name, in this
+        // order, with a placeholder where nothing matched.
+        outcome.initialize_with_selection(&collection, ["filter", "text", "eol"]);
 
         Self {
             search,
@@ -662,9 +805,9 @@ impl FilterResolver {
         }
     }
 
-    /// What git resolves `filter` to for a repository-relative path.
-    pub fn resolve(&mut self, relative_path: &[u8]) -> FilterAttribute {
-        use gix_attributes::StateRef;
+    /// What git resolves for a repository-relative path, on both axes.
+    pub fn resolve(&mut self, relative_path: &[u8]) -> Resolution {
+        use gix_attributes::State;
 
         self.outcome.reset();
         self.search.pattern_matching_relative_path(
@@ -674,21 +817,38 @@ impl FilterResolver {
             &mut self.outcome,
         );
 
-        let Some(found) = self.outcome.iter_selected().next() else {
-            return FilterAttribute::Unspecified;
-        };
-        match found.assignment.state {
-            StateRef::Value(value) => {
-                let value = value.as_bstr().to_string();
-                if value == DRIVER {
-                    FilterAttribute::Ours
-                } else {
-                    FilterAttribute::Foreign(value)
+        // Collected first: every `Match` borrows the outcome, and the decision
+        // below has to outlive that borrow.
+        let mut found = self.outcome.iter_selected().map(|matched| {
+            (
+                matched.assignment.state.to_owned(),
+                Culprit {
+                    source: matched.location.source.map(Path::to_path_buf),
+                    line: matched.location.sequence_number,
+                    pattern: matched.pattern.to_string(),
+                    assignment: spell_assignment(matched.assignment),
+                },
+            )
+        });
+        let filter = found.next();
+        let text = found.next();
+        let eol = found.next();
+
+        Resolution {
+            filter: filter.map_or(FilterAttribute::Unspecified, |(state, _)| match state {
+                State::Value(value) => {
+                    let value = value.as_ref().as_bstr().to_string();
+                    if value == DRIVER {
+                        FilterAttribute::Ours
+                    } else {
+                        FilterAttribute::Foreign(value)
+                    }
                 }
-            }
-            StateRef::Set => FilterAttribute::Set,
-            StateRef::Unset => FilterAttribute::Unset,
-            StateRef::Unspecified => FilterAttribute::Unspecified,
+                State::Set => FilterAttribute::Set,
+                State::Unset => FilterAttribute::Unset,
+                State::Unspecified => FilterAttribute::Unspecified,
+            }),
+            conversion: converts(text.as_ref(), eol.as_ref()),
         }
     }
 
@@ -1073,8 +1233,13 @@ mod tests {
         body: &'a str,
     }
 
-    /// Sets up a repository from `sources`, then asserts our answer for `path`
-    /// is character for character what `git check-attr filter` says.
+    /// Sets up a repository from `sources`, then asserts our answers for `path`
+    /// are character for character what `git check-attr` says.
+    ///
+    /// All three attributes the managed section sets, not just `filter`. The
+    /// stack is one stack, and a precedence bug found through `filter` alone
+    /// would have been just as free to hide behind `text` — which is the more
+    /// expensive of the two to get wrong.
     ///
     /// Comparative rather than expectation-based on purpose: git is the only
     /// authority on its own attribute stack, and every earlier review of this
@@ -1122,27 +1287,45 @@ mod tests {
         fs::create_dir_all(target.parent().expect("a parent")).expect("directories");
         fs::write(&target, b"content\n").expect("writing the subject file");
 
-        let output = Command::new("git")
-            .args(["check-attr", "filter", "--", path])
-            .current_dir(root)
-            .output()
-            .expect("git check-attr");
-        let printed = String::from_utf8(output.stdout).expect("check-attr prints text");
-        let expected = printed
-            .rsplit(": ")
-            .next()
-            .expect("check-attr always prints a value")
-            .trim()
-            .to_string();
+        let ask = |attribute: &str| -> String {
+            let output = Command::new("git")
+                .args(["check-attr", attribute, "--", path])
+                .current_dir(root)
+                .output()
+                .expect("git check-attr");
+            String::from_utf8(output.stdout)
+                .expect("check-attr prints text")
+                .rsplit(": ")
+                .next()
+                .expect("check-attr always prints a value")
+                .trim()
+                .to_string()
+        };
 
         let mut resolver =
-            FilterResolver::new(root, &root.join(".git"), global_path.as_deref(), false);
+            AttributeResolver::new(root, &root.join(".git"), global_path.as_deref(), false);
         let ours = resolver.resolve(path.as_bytes());
 
         assert_eq!(
-            ours.as_check_attr(),
-            expected,
+            ours.filter.as_check_attr(),
+            ask("filter"),
             "git and git-xcrypt disagree about `filter` for {path}"
+        );
+
+        // The conversion verdict rebuilt from git's own two answers. This
+        // proves the *resolution* — precedence, macros, the global file — not
+        // the table in `converts`, which is settled against git's behaviour by
+        // the round trips in `tests/status_command.rs`.
+        let (text, eol) = (ask("text"), ask("eol"));
+        let converts = matches!(
+            (text.as_str(), eol.as_str()),
+            ("set", _) | ("unspecified", "lf" | "crlf")
+        );
+        assert_eq!(
+            matches!(ours.conversion, EolConversion::On(_)),
+            converts,
+            "git says text={text} eol={eol} for {path}, and git-xcrypt read the \
+             stack differently"
         );
     }
 
@@ -1277,6 +1460,85 @@ mod tests {
 
         // …and it decides when nothing in the repository speaks.
         agrees_with_git(&[], "secrets/db.env", Some("* filter=git-xcrypt\n"));
+    }
+
+    #[test]
+    fn the_text_attribute_is_resolved_exactly_as_git_resolves_it() {
+        // The same stack, asked the question that costs the file rather than
+        // the secret. Every shape here resolves `filter` to `git-xcrypt`, so a
+        // build that only followed `filter` calls all of them healthy.
+        let managed = "# >>> git-xcrypt >>>\n* filter=git-xcrypt\n\
+                       **/secrets/** -text diff=git-xcrypt\n# <<< git-xcrypt <<<\n";
+        let bare = "# >>> git-xcrypt >>>\n* filter=git-xcrypt\n# <<< git-xcrypt <<<\n";
+
+        for body in [
+            // The healthy case: the managed `-text` is the last word.
+            managed.to_string(),
+            // A line below it putting `text` back on — the finding.
+            format!("{managed}secrets/** text\n"),
+            // `text=auto`, which keeps git's binary detection and is harmless.
+            format!("{managed}secrets/** text=auto\n"),
+            // `eol=` beside `-text`, which git ignores outright.
+            format!("{managed}secrets/** eol=crlf\n"),
+            // No managed `-text` at all, and a bare `eol=`: harmful, and the
+            // shape neither the brief nor `zalozenia.md` predicted.
+            format!("{bare}secrets/** eol=lf\n"),
+            // No managed `-text`, nothing else either: harmless.
+            bare.to_string(),
+            // Through a macro, where nothing on the reaching line says `text`.
+            format!("[attr]mine text\n{managed}secrets/** mine\n"),
+            // The `binary` macro, which is `-text -diff`.
+            format!("{bare}secrets/** binary\n"),
+        ] {
+            agrees_with_git(
+                &[Source {
+                    path: ".gitattributes",
+                    body: &body,
+                }],
+                "secrets/db.env",
+                None,
+            );
+        }
+
+        // A subdirectory file and `$GIT_DIR/info/attributes`, the two sources
+        // that outrank the managed section without appearing beneath it.
+        agrees_with_git(
+            &[
+                Source {
+                    path: ".gitattributes",
+                    body: managed,
+                },
+                Source {
+                    path: "secrets/.gitattributes",
+                    body: "* text\n",
+                },
+            ],
+            "secrets/db.env",
+            None,
+        );
+        agrees_with_git(
+            &[
+                Source {
+                    path: ".gitattributes",
+                    body: managed,
+                },
+                Source {
+                    path: ".git/info/attributes",
+                    body: "secrets/** text\n",
+                },
+            ],
+            "secrets/db.env",
+            None,
+        );
+        // The global file, lowest precedence: the managed `-text` still wins.
+        agrees_with_git(
+            &[Source {
+                path: ".gitattributes",
+                body: managed,
+            }],
+            "secrets/db.env",
+            Some("* text\n"),
+        );
     }
 
     #[test]
