@@ -23,7 +23,7 @@ wnętrze transformacji na AES-256-SIV, nie ruszając harnessu.
 - Historia repozytorium: jeden commit (`95bc76d`), stan czysty.
 - Środowisko zweryfikowane sondą: rustc 1.97.1, cargo 1.97.1, git 2.55.0, macOS.
 - `cargo audit` przechodzi, ale bez wartości informacyjnej — projekt nie ma zależności
-  (`context/changes/bootstrap-verification/verification.md:90-106`).
+  (log weryfikacji bootstrapu, nie wersjonowany — `git show 069f2f7:context/changes/bootstrap-verification/verification.md`, linie 90-106).
 
 ## Desired End State
 
@@ -387,7 +387,7 @@ Nie dotyczy — brak istniejących danych i brak wydanego formatu.
 - Roadmapa: `context/foundation/roadmap.md` → `F-01`
 - Gwarantki: `context/foundation/prd.md` §Success Criteria → Guardrails
 - Reguły filtrów i CI: `context/foundation/zalozenia.md` §Integracja z git, §Jakość i testy
-- Stan wyjściowy: `context/changes/bootstrap-verification/verification.md`
+- Stan wyjściowy: log weryfikacji bootstrapu, nie wersjonowany — `git show 069f2f7:context/changes/bootstrap-verification/verification.md`
 
 ## Progress
 
