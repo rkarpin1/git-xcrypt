@@ -40,7 +40,7 @@ Produkt rozstrzyga na podstawie wzorców ścieżek, które pliki opuszczają mas
 | S-05  | decrypted-diff               | oglądać różnice na treści jawnej                                         | S-01          | FR-006                 | done     |
 | S-06  | encryption-status-check      | sprawdzić, co jest szyfrowane, a co powinno być                          | S-02          | FR-010                 | done     |
 | S-07  | cross-platform-binaries      | pobrać gotową binarkę dla swojej platformy                               | S-01, S-08    | FR-011                 | proposed |
-| S-08  | binary-detection-parity      | dostać ten sam werdykt tekst/binarny co git, także na pliku z `SUB`     | S-01          | §NFR (trzy platformy)  | proposed |
+| S-08  | binary-detection-parity      | dostać ten sam werdykt tekst/binarny co git, także na pliku z `SUB`     | S-01          | §NFR (trzy platformy)  | done     |
 
 ## Streams
 
@@ -51,7 +51,7 @@ Pomoc nawigacyjna — grupuje elementy dzielące łańcuch wymagań wstępnych. 
 | A      | Rdzeń szyfrowania        | `F-01` → `S-01` → `S-03` → `S-04`    | Ścieżka gwiazdy przewodniej; niosła całe ryzyko techniczne celu `learn`. **Zamknięta 2026-08-04** — cały łańcuch zrobiony i przejrzany. |
 | B      | Konfiguracja i widoczność | `S-02` → `S-06`                      | Dołącza do Strumienia A w `S-01`. **Zamknięta 2026-08-04** — obie decyzje (rozjazd konfiguracji, głębokość skanu) zapadły i są zaimplementowane. |
 | C      | Narzędzia pracy          | `S-05`                               | Dołącza do A w `S-01`. **Zamknięta 2026-08-04**; jedyny element bez własnej niewiadomej — ale plan i tak trafił w błędne założenie o `textconv`, sprostowane pomiarem. |
-| D      | Dystrybucja              | `S-08` → `S-07`                      | Dołącza do A w `S-01`. **Jedyny otwarty strumień.** `S-08` jest pierwszy, bo `looks_binary` zamraża się z pierwszym publicznym wydaniem; nazwa i licencja rozstrzygnięte 2026-08-04. |
+| D      | Dystrybucja              | `S-08` → `S-07`                      | Dołącza do A w `S-01`. **Jedyny otwarty strumień**, i został w nim wyłącznie `S-07`. `S-08` zamknięty 2026-08-04, czyli w wymaganej kolejności: `looks_binary` zamraża się z pierwszym publicznym wydaniem. Nazwa i licencja rozstrzygnięte 2026-08-04. |
 
 ## Baseline
 
@@ -176,9 +176,9 @@ Fundament poniżej zakłada ten stan i nie tworzy ponownie niczego, co jest zgł
 - **Outcome:** użytkownik pobiera plik wykonywalny dla Windows, macOS lub Linuksa i używa go bez kompilowania i bez instalowania dodatkowych bibliotek.
 - **Change ID:** cross-platform-binaries
 - **PRD refs:** FR-011, §Non-Functional Requirements (identyczne zachowanie na trzech platformach)
-- **Prerequisites:** S-01 (zrobiony), S-08 (**musi wejść wcześniej** — `looks_binary` zamraża się z pierwszym publicznym wydaniem)
+- **Prerequisites:** S-01 (zrobiony), S-08 (zrobiony 2026-08-04 — wymagany termin „przed pierwszym wydaniem” dotrzymany)
 - **Parallel with:** —
-- **Blockers:** S-08
+- **Blockers:** —
 - **Zakres zrobiony w przeglądzie końcowym (2026-08-04, runda 3):** infrastruktura tego elementu jest już w repozytorium, bo zamyka luki pokrycia zgłoszone przez dwa poprzednie przeglądy, a nie dlatego, że element został wzięty do realizacji.
   - `.github/workflows/ci.yml` — `cargo test --all-targets` na ubuntu/macOS/Windows, `fmt --check`, `clippy --all-targets -- -D warnings`, `cargo audit`, `cargo deny check licenses advisories sources bans`, plus zadanie `msrv`.
   - `.github/workflows/release.yml` — pięć targetów (Linux musl x86_64/aarch64, macOS x86_64/aarch64, Windows MSVC), pakowanie z sumami SHA-256, publikacja przy tagu `v*`, sprawdzenie zgodności tagu z `Cargo.toml`.
@@ -193,13 +193,13 @@ Fundament poniżej zakłada ten stan i nie tworzy ponownie niczego, co jest zgł
 
 ### S-08: Zgodność wykrywania plików binarnych z gitem
 
-- **Outcome:** plik, który git uznaje za tekst, git-xcrypt też uznaje za tekst — łącznie z plikiem zakończonym DOS-owym znacznikiem końca `SUB` (`0x1A`), który dziś rozjeżdża się z gitem.
+- **Outcome:** plik, który git uznaje za tekst, git-xcrypt też uznaje za tekst — łącznie z plikiem zakończonym DOS-owym znacznikiem końca `SUB` (`0x1A`), który rozjeżdżał się z gitem do 2026-08-04.
 - **Change ID:** binary-detection-parity
 - **PRD refs:** §Non-Functional Requirements (identyczne zachowanie na trzech platformach), §Guardrails (filtr nie uszkadza pliku użytkownika)
 - **Prerequisites:** S-01 (zrobiony)
 - **Parallel with:** —
 - **Blockers:** —
-- **Termin wiążący: przed `S-07`, czyli przed pierwszym publicznym wydaniem binarki.** `looks_binary` jest zamrożony razem z formatem (`src/eol.rs:47`) — dopóki nie istnieje ani jedno repozytorium poza tym projektem, poprawka kosztuje jedną linię; po wydaniu kosztuje nowy `suite`, bo przesuwa granicę tekst/binarny i przepisuje ciphertext istniejących plików.
+- **Termin wiążący — dotrzymany.** Element zamknięty 2026-08-04, przed `S-07`, czyli przed pierwszym publicznym wydaniem binarki. `looks_binary` jest zamrożony razem z formatem (`src/eol.rs:47`) — dopóki nie istnieje ani jedno repozytorium poza tym projektem, poprawka kosztuje jedną linię; po wydaniu kosztuje nowy `suite`, bo przesuwa granicę tekst/binarny i przepisuje ciphertext istniejących plików.
 - **Znalezisko (2026-08-04, review `looks_binary`):** `gather_stats` w `convert.c` gita v2.55.0 kończy się korektą, której nasz port nie ma:
   ```c
   /* If file ends with EOF then don't count this EOF as non-printable. */
@@ -207,25 +207,27 @@ Fundament poniżej zakłada ten stan i nie tworzy ponownie niczego, co jest zgł
           stats->nonprintable--;
   ```
   Zweryfikowane na żywym gicie 2.55, nie tylko z lektury źródeł: repozytorium tymczasowe, `* text=auto`, plik o treści `a\r\n\x1a` → blob `61 0a 1a`, czyli git **znormalizował CRLF**, więc uznał plik za tekst. Nasz `looks_binary` na tej samej treści liczy `printable = 1`, `nonprintable = 1`, `0 < 1` → **binarny**. Granica text/binary leży u nas o jeden bajt bliżej niż u gita.
-- **Zakres:**
-  - korekta w `src/eol.rs::looks_binary` — po pętli zdjąć jeden `nonprintable`, gdy `content.last() == Some(&0x1a)`; `saturating_sub`, bo panic w debug przerywa operację gita, a nie tylko test;
-  - test na dokładnie tę treść, z odsyłaczem do zmierzonego bloba, w stylu pozostałych testów w tym pliku;
-  - test granicy proporcji `(printable >> 7) < nonprintable`, dziś niepokryty: `printable = 128` z `nonprintable = 1` → tekst, z `nonprintable = 2` → binarny;
-  - uzupełnienie `zalozenia.md` §Końce linii → „Zmierzone zachowanie gita", gdzie zapisana reguła jest niepełna wobec kodu: nie wymienia ani reguły lone-`CR` (kod ją ma i słusznie), ani `SUB`.
-- **Sprawdzone przy okazji i zgodne — nie ruszać:** lone `CR` (w tym `CR` na końcu bufora), `CR`/`LF` w żadnym kubełku, `DEL` (`0x7f`) jako non-printable, wybaczone wyłącznie `BS`/`TAB`/`FF`/`ESC`, `≥ 0x80` jako printable, `printable >> 7`, skan całej treści (okno 8000 B należy do `mmfile_is_binary` w `diff.c`, nie tutaj). Port jest wierny — brakuje wyłącznie korekty na `SUB`.
-- **Unknowns:**
-  - Czy przy tej okazji domykamy otwartą decyzję 8 z `zalozenia.md` (odpowiednik `core.safecrlf`)? Powiązanie jest realne: jawny `text` omija ochronę lone-`CR` — zgodnie z gitem, bo `crlf_to_git` konsultuje `convert_is_binary` tylko dla wariantów `CRLF_AUTO*` — więc treść `a\r\r\nb` daje jeden fałszywy „modified" po checkoucie, zanim stan się ustabilizuje. Test `content_that_is_normalised_survives_a_second_pass` pokrywa dziś tylko `Auto`, więc ta dziura nie jest nawet oznaczona testem. — Właściciel: użytkownik. Blokuje: nie.
-- **Risk:** rozjazd dotyczy wąskiej klasy plików (stare pliki tekstowe z DOS-a), więc kusi, żeby go odłożyć — i to jest właśnie pułapka. Koszt nie rośnie liniowo, tylko skacze w momencie pierwszego wydania, bo reguła jest zamrożona z formatem. Sama poprawka jest trywialna; kosztowne jest jej przegapienie przed `S-07`.
-- **Status:** proposed
+- **Zakres — zrobiony 2026-08-04:**
+  - korekta w `src/eol.rs::looks_binary` — po pętli zdejmowany jest jeden `nonprintable`, gdy `content.last() == Some(&0x1a)`; `saturating_sub`, bo panic w debug przerywa operację gita, a nie tylko test;
+  - `eol::tests::a_trailing_sub_is_forgiven_exactly_as_git_forgives_it` — dokładnie ta treść i granice korekty (dwa `SUB`, `SUB` w środku, `SUB` zużyty przez `0x01`, granica 128 : 127, `SUB` bez CR sprawdzony przez checkout);
+  - osiem nowych wektorów w `tests/format_vectors.rs::binary_verdicts`, więc reguła jest zamrożona razem z formatem, a nie tylko przetestowana;
+  - `tests/filter_edge_cases.rs::a_dos_end_of_file_marker_is_classified_the_way_git_classifies_it` — porównanie z **prawdziwym gitem** na czterech kształtach: repozytorium referencyjne z `* text=auto` daje werdykt, nasz blob musi mieć ten sam bit `flags` i ten sam rozmiar plaintextu;
+  - granica proporcji miała już wektor (`the_ratio_sits_exactly_where_gits_does`, przegląd 3), rozszerzony teraz o parę z korektą `SUB`;
+  - `zalozenia.md` §Końce linii → „Zmierzone zachowanie gita" uzupełnione: reguła ma sześć punktów i zdanie mówiące, że zamraża się od 2026-08-04, a nie wcześniej.
+- **Sprawdzone przy okazji i zgodne — nie ruszać:** lone `CR` (w tym `CR` na końcu bufora), `CR`/`LF` w żadnym kubełku, `DEL` (`0x7f`) jako non-printable, wybaczone wyłącznie `BS`/`TAB`/`FF`/`ESC`, `≥ 0x80` jako printable, `printable >> 7`, skan całej treści (okno 8000 B należy do `mmfile_is_binary` w `diff.c`, nie tutaj). Port jest wierny — brakowało wyłącznie korekty na `SUB`, i to jest jedyne, co ten element zmienił.
+- **Unknowns — nierozstrzygnięte przy zamknięciu:**
+  - Czy przy tej okazji domykamy otwartą decyzję 8 z `zalozenia.md` (odpowiednik `core.safecrlf`)? **Nie domknięte** — zostaje otwarte, bo dotyczy ostrzegania, nie parytetu werdyktu, i nie zamraża się z formatem. Powiązanie jest realne: jawny `text` omija ochronę lone-`CR` — zgodnie z gitem, bo `crlf_to_git` konsultuje `convert_is_binary` tylko dla wariantów `CRLF_AUTO*` — więc treść `a\r\r\nb` daje jeden fałszywy „modified" po checkoucie, zanim stan się ustabilizuje. Test `content_that_is_normalised_survives_a_second_pass` pokrywa dziś tylko `Auto`, więc ta dziura nie jest nawet oznaczona testem. — Właściciel: użytkownik. Blokuje: nie.
+- **Risk:** rozjazd dotyczy wąskiej klasy plików (stare pliki tekstowe z DOS-a), więc kusił, żeby go odłożyć — i to była właśnie pułapka. Koszt nie rósł liniowo, tylko skoczyłby w momencie pierwszego wydania, bo reguła jest zamrożona z formatem. Sama poprawka to jedna linia; kosztowne byłoby jej przegapienie przed `S-07`.
+- **Status:** done
 
 ## Backlog Handoff
 
-Do wzięcia są dwa elementy, w tej kolejności — `S-08` przed `S-07`, bo reguła tekst/binarny zamraża się z pierwszym publicznym wydaniem.
+Do wzięcia został jeden element: `S-07`. `S-08` zamknięty 2026-08-04, w wymaganej kolejności — reguła tekst/binarny zamraża się z pierwszym publicznym wydaniem, więc musiał wejść wcześniej.
 
 | Roadmap ID | Change ID                    | Sugerowany tytuł zadania                            | Gotowe do `/10x-plan` | Uwagi                                       |
 | ---------- | ---------------------------- | --------------------------------------------------- | --------------------- | ------------------------------------------- |
-| S-08       | binary-detection-parity      | Zgodność wykrywania plików binarnych z gitem        | tak                   | **Bierz jako pierwsze.** Poprawka w kodzie S-01, znaleziona 2026-08-04. **Musi wejść przed S-07** — reguła jest zamrożona z formatem. Uruchom `/10x-plan binary-detection-parity` |
-| S-07       | cross-platform-binaries      | Binarki dla Windows, macOS i Linuksa                | nie                   | Czeka na S-08. CI, pipeline wydania i metadane publikacyjne powstały przy przeglądzie końcowym; zostaje podpisywanie artefaktów, tap Homebrew, crates.io i pierwszy tag |
+| S-08       | binary-detection-parity      | Zgodność wykrywania plików binarnych z gitem        | zrobione              | Zamknięte 2026-08-04, przed `S-07` — termin dotrzymany |
+| S-07       | cross-platform-binaries      | Binarki dla Windows, macOS i Linuksa                | tak                   | **Jedyny otwarty element** — `S-08` zamknięty, więc nic go już nie blokuje. CI, pipeline wydania i metadane publikacyjne powstały przy przeglądzie końcowym; zostaje podpisywanie artefaktów, tap Homebrew, crates.io i pierwszy tag |
 | F-01       | git-integration-test-harness | Harness testów na prawdziwym repozytorium git       | zrobione              | Zarchiwizowane 2026-08-04                   |
 | S-01       | transparent-encrypt-decrypt  | Przezroczyste szyfrowanie w jednym repozytorium     | zrobione              | Zaimplementowane i przejrzane dwukrotnie 2026-08-04 |
 | S-02       | gitignore-style-config       | Konfiguracja w składni .gitignore                   | zrobione              | Zaimplementowane i przejrzane dwukrotnie 2026-08-04 |
@@ -264,5 +266,6 @@ Do wzięcia są dwa elementy, w tej kolejności — `S-08` przed `S-07`, bo regu
 - **S-04: zamknąć odblokowane repozytorium z powrotem** — Ukończono 2026-08-04 → `context/changes/lock-repository/` (status `impl_reviewed`, dwa przebiegi przeglądu). Lekcja: sprawdzenie i zapis muszą patrzeć na tę samą treść — między dowodem „to już jest blobem" a szyfrowaniem leżało czekanie na odpowiedź człowieka, czyli okno bez ograniczenia. Osobno: klucz jest wspólny dla wszystkich worktree, a przejście po drzewie widzi jeden checkout; ta ścieżka nie była przewidziana ani w planie, ani w `zalozenia.md`.
 - **S-05: oglądać różnice na treści jawnej** — Ukończono 2026-08-04 → `context/changes/decrypted-diff/` (status `impl_reviewed`, dwa przebiegi przeglądu). Lekcja: założenie planu o tym, co git podaje sterownikowi `textconv`, było błędne i wyszło dopiero z pomiaru — sterownik dostaje plaintext, bo obie strony różnicy przechodzą wcześniej przez smudge. Druga lekcja: nazwa pliku jest wejściem od użytkownika także dla naszego własnego parsera argumentów — plik `--help` kazał gitowi wyrenderować tekst pomocy jako treść.
 - **S-06: sprawdzić, co jest szyfrowane, a co powinno być** — Ukończono 2026-08-04 → `context/changes/encryption-status-check/` (status `impl_reviewed`, dwa przebiegi przeglądu plus sondy na repozytoriach nietypowych: SHA-256, podzielony indeks, paczki, podłączony worktree, bare, płytki klon). Lekcja: domyślne wartości bibliotek gitoxide zakładają SHA-1 i asertują — w repozytorium SHA-256 panika sięgała nie tylko komendy, ale i filtra na ścieżce check-in, więc przy `required = true` przewracała każdą operację gita. Nierozstrzygnięte przy zamknięciu: widoczność `stderr` filtra w oknie Git w JetBrains.
+- **S-08: dostać ten sam werdykt tekst/binarny co git, także na pliku z `SUB`** — Ukończono 2026-08-04, **przed `S-07`**, czyli w wymaganym terminie: `looks_binary` zamraża się z pierwszym publicznym wydaniem, więc po nim ta jedna linia przestałaby być poprawką, a stałaby się zmianą przepisującą ciphertext istniejących plików i wymagającą nowego `suite`. Lekcja: parytet z gitem trzeba weryfikować wobec **całej** funkcji źródłowej — brakująca korekta siedziała w trzech ostatnich liniach `gather_stats`, za pętlą, którą port odtwarzał wiernie. Wektory formatu tego nie łapały: żaden z istniejących nie kończył się bajtem `0x1A`.
 
 Po zamknięciu `S-06` całość przeszła przez przegląd końcowy w trzech rundach — `context/changes/final-review/`: `review-1-crypto.md` (warstwa kryptograficzna i format), `review-2-git.md` (integracja z gitem; osiem znalezisk naprawionych, commity `40a15b1` i `53240f2`) oraz `review-3-completeness.md` (kompletność i jakość; scenariusz akceptacyjny jako jeden test z prawdziwym `push`, testy właściwości na `proptest`, CI na trzech platformach, `deny.toml`, metadane publikacyjne, zmierzony MSRV 1.88, dwie mutacje przechodzące zielono zamknięte testami).

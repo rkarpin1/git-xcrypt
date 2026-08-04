@@ -359,3 +359,67 @@ fn crlf_content_round_trips_under_every_autocrlf_setting() {
         );
     }
 }
+
+#[test]
+fn a_dos_end_of_file_marker_is_classified_the_way_git_classifies_it() {
+    // The last text/binary parity gap against git, closed 2026-08-04 as roadmap
+    // item S-08 and deliberately before the first release: `looks_binary` is
+    // frozen with the format, so afterwards this would rewrite the ciphertext of
+    // every file it moves across the boundary rather than fix anything.
+    //
+    // git's `gather_stats` takes a trailing `SUB` (0x1a, the DOS end-of-file
+    // marker) back off the non-printable count. Asked of a real git rather than
+    // asserted from the source: the reference repository below is the authority,
+    // and this test fails if either side ever moves.
+    let shapes: [(&str, &[u8]); 4] = [
+        ("a trailing SUB", b"a\r\n\x1a"),
+        ("two trailing SUBs", b"a\r\n\x1a\x1a"),
+        ("a SUB in the middle", b"a\x1ab\r\n"),
+        ("a trailing SUB spent on a control", b"a\x01\r\n\x1a"),
+    ];
+
+    for (label, content) in shapes {
+        // What git itself does with the content, under the attribute our
+        // default mode reproduces.
+        let reference = TestRepo::init();
+        reference.write_file(".gitattributes", b"* text=auto\n");
+        reference.git_ok(["config", "core.autocrlf", "true"]);
+        reference.write_file("subject.txt", content);
+        reference.commit_all("the subject");
+        let stored = reference.blob_bytes("subject.txt");
+        let git_called_it_text = stored != content;
+
+        // And what we do with the same bytes, all the way through the filter.
+        let ours = TestRepo::init();
+        ours.init_xcrypt();
+        ours.write_xcrypt_config("*.env\n");
+        ours.write_file("subject.env", content);
+        ours.commit_all("the subject");
+        let blob = ours.blob_bytes("subject.env");
+
+        assert!(
+            blob.starts_with(b"\0GITXCRYPT\0"),
+            "{label}: the filter did not run"
+        );
+        // Bit 0 of the header's `flags` byte records whether the plaintext was
+        // normalised, which is precisely the verdict under test.
+        let we_called_it_text = blob[13] & 1 == 1;
+        assert_eq!(
+            we_called_it_text,
+            git_called_it_text,
+            "{label}: git says {}, git-xcrypt says {} — the boundary has moved",
+            if git_called_it_text { "text" } else { "binary" },
+            if we_called_it_text { "text" } else { "binary" }
+        );
+        assert_eq!(
+            blob.len(),
+            38 + stored.len(),
+            "{label}: the encrypted plaintext is not the plaintext git would store"
+        );
+
+        // The whole point of agreeing: the working tree comes back unchanged.
+        std::fs::remove_file(ours.path().join("subject.env")).expect("could not remove");
+        ours.git_ok(["checkout", "--", "subject.env"]);
+        ours.assert_status_clean();
+    }
+}

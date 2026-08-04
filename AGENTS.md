@@ -29,7 +29,7 @@ English for code, comments, identifiers, commit messages, PR descriptions, and f
 - `context/foundation/` — @context/foundation/prd.md (requirements, guardrails, open questions), @context/foundation/roadmap.md (what to build next, in dependency order), @context/foundation/zalozenia.md, @context/foundation/tech-stack.md
 - `context/changes/<id>/` — per-change plan, research, review. Never in `foundation/`.
 
-Read the PRD's `## Open Questions` first; none of them blocks today. Pick work from the roadmap's `## Backlog Handoff`. What is left of v0.1, in this order: **`S-08` first** — the binary-detection parity fix (a trailing `SUB`, 0x1A) has to land *before* anything ships, because `looks_binary` is frozen with the format and changing it afterwards rewrites the ciphertext of existing files — then `S-07`, the release itself.
+Read the PRD's `## Open Questions` first; none of them blocks today. Pick work from the roadmap's `## Backlog Handoff`. What is left of v0.1 is **`S-07`**, the release itself. `S-08` closed 2026-08-04, in the order it had to: the binary-detection parity fix (a trailing `SUB`, 0x1A) had to land *before* anything ships, because `looks_binary` is frozen with the format from that date and changing it afterwards rewrites the ciphertext of existing files.
 
 When asked "co dalej?" (what's next), answer with a lettered list — `a.`, `b.`, `c.`, … — one option per item, so the user can pick by letter.
 

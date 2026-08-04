@@ -320,15 +320,18 @@ Pomiary z 2026-08-04, git 2.55, repozytoria tymczasowe. Cztery pliki, każdy z C
 | 2400 B z zakresu `0x01–0x08`, bez NUL | **binarny** — nietknięty |
 | jeden bajt `0x00` na początku | binarny — nietknięty |
 
-Reguła, w pełnej postaci odtworzonej w `src/eol.rs::looks_binary` i zamrożonej wraz z formatem:
+Reguła, w pełnej postaci odtworzonej w `src/eol.rs::looks_binary`:
 
 1. **bajt NUL** gdziekolwiek → binarny;
 2. **samotny `CR`** (bez następującego `LF`) → binarny. Reguła nieoczywista, ale konieczna: bez niej normalizacja nie jest domknięta na własnym wyjściu i plik po checkoucie wraca zmieniony;
 3. **za dużo znaków sterujących**, dokładnie `(drukowalne >> 7) < niedrukowalne`, czyli **jeden niedrukowalny na 128 drukowalnych**. Zmierzone na git 2.55 przy `* text=auto`: 127 : 1 → binarny, 128 : 1 → tekst, 255 : 2 → binarny, 256 : 2 → tekst. Próg ma własny wektor testowy;
 4. `BS`, `TAB`, `FF` i `ESC` liczą się jako drukowalne; **`DEL` (0x7f) jako niedrukowalny**, mimo że leży powyżej `0x20`;
-5. bajty `≥ 0x80` liczą się jako **drukowalne**, dlatego UTF-8 jest poprawnie rozpoznawane jako tekst.
+5. bajty `≥ 0x80` liczą się jako **drukowalne**, dlatego UTF-8 jest poprawnie rozpoznawane jako tekst;
+6. **końcowy bajt `SUB` (0x1A)** — DOS-owy znacznik końca pliku — jest po skanie odejmowany od licznika niedrukowalnych. Jeden bajt i tylko ostatni. To odpowiednik zamknięcia `gather_stats` w gicie: `if (size >= 1 && buf[size-1] == '\032') stats->nonprintable--;`.
 
-**Znane odstępstwo od gita:** końcowy bajt `SUB` (0x1A). Git odejmuje wtedy jeden `nonprintable` w `gather_stats`, my nie. To **jedyne** odstępstwo z 18 kształtów sprawdzonych wobec prawdziwego gita; usunięcie należy do elementu `S-08` roadmapy i musi zdążyć **przed** pierwszym wydaniem, bo reguła zamraża się razem z formatem.
+**Reguła jest zamrożona wraz z formatem od 2026-08-04, a nie wcześniej.** Do tego dnia punkt 6 nie istniał i był jedynym odstępstwem od gita z 18 kształtów sprawdzonych wobec prawdziwego gita; wcześniejsze wersje tego dokumentu opisywały go jako znany, świadomie odłożony dług (element `S-08`). Domknięte przed pierwszym wydaniem, bo dopóki nie istnieje ani jedno repozytorium poza tym projektem, poprawka kosztuje jedną linię; po wydaniu przesuwałaby granicę tekst/binarny, czyli przepisywała ciphertext istniejących plików, i wymagałaby nowego `suite`.
+
+Zmierzone na git 2.55 przed zmianą, nie odczytane ze źródeł: `* text=auto`, treść `a\r\n\x1a` → blob `61 0a 1a`, czyli git znormalizował CRLF i uznał plik za tekst; nasz `looks_binary` liczył wtedy `printable = 1`, `nonprintable = 1` i mówił „binarny". Zmierzone też granice korekty, każda przez to, czy CR przeżył w blobie: `a\r\n\x1a\x1a` → binarny (odejmowany jest jeden `SUB`, nie oba), `a\x1ab\r\n` → binarny (tylko ostatni bajt), `a\x01\r\n\x1a` → binarny (korekta jest warta jeden bajt i zużywa ją `0x01`), 128 drukowalnych + `0x01` + `SUB` → tekst, przy 127 → binarny. Przypadek bez CR sprawdzony w drugą stronę, przez checkout przy `core.autocrlf=true`: `\n\x1a` wraca jako `\r\n\x1a` (tekst), `\x01\n\x1a` wraca bez zmian (binarny) — stąd `saturating_sub`, bo licznik dochodzi tu do zera.
 
 **Korekta wcześniejszego zapisu w tym dokumencie:** heurystyka nie ogranicza się do „NUL w pierwszych 8000 bajtach". Zmierzone — NUL na offsecie 7 000, 9 000 i **1 000 000** za każdym razem daje werdykt binarny. Ścieżka konwersji CRLF skanuje **całą treść**. Limit 8000 bajtów należy do innej heurystyki: tej, którą `git diff` decyduje o `Binary files differ`.
 

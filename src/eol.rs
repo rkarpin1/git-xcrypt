@@ -28,7 +28,9 @@ use crate::config::{EolMode, TextMode};
 ///
 /// * `CR` and `LF` are counted as line endings and go into **neither** bucket;
 /// * `DEL` (`0x7f`) counts as non-printable, despite being above `0x20`;
-/// * of the bytes below `0x20` only `BS`, `TAB`, `FF` and `ESC` are forgiven.
+/// * of the bytes below `0x20` only `BS`, `TAB`, `FF` and `ESC` are forgiven;
+/// * a **trailing `SUB`** (`0x1a`, the DOS end-of-file marker) is taken back off
+///   the non-printable count after the scan. One byte, only the last one.
 ///
 /// Bytes at or above `0x80` count as printable, which is why UTF-8 text is
 /// recognised as text. The whole content is scanned; the 8000-byte window
@@ -41,8 +43,11 @@ use crate::config::{EolMode, TextMode};
 /// different after a checkout and `git status` reports a file nobody edited.
 /// Git avoids that the same way, by declining to convert at all.
 ///
-/// This rule is **frozen with the format**: changing it would move the
-/// text/binary boundary and rewrite the ciphertext of existing files.
+/// This rule is **frozen with the format from 2026-08-04**, and not before: the
+/// trailing-`SUB` correction landed on that date (roadmap S-08), deliberately
+/// ahead of the first release. Changing it moves the text/binary boundary, so
+/// every file that crosses the boundary encrypts differently — after a release
+/// that stops being a fix and becomes a new `suite`.
 #[must_use]
 pub fn looks_binary(content: &[u8]) -> bool {
     let mut printable = 0usize;
@@ -66,6 +71,23 @@ pub fn looks_binary(content: &[u8]) -> bool {
             0x01..0x20 | 0x7f => nonprintable += 1,
             _ => printable += 1,
         }
+    }
+
+    // git's `gather_stats` closes with this, verbatim:
+    //
+    //     /* If file ends with EOF then don't count this EOF as non-printable. */
+    //     if (size >= 1 && buf[size-1] == '\032')
+    //             stats->nonprintable--;
+    //
+    // A `SUB` is below 0x20 and is not one of the four forgiven bytes, so the
+    // loop above has always counted it; this takes exactly one back. Measured on
+    // git 2.55: with `* text=auto`, `a\r\n\x1a` is stored as `61 0a 1a` — git
+    // normalised the CRLF, so it read the file as text. `saturating_sub` rather
+    // than `-`: a debug build's overflow panic on the filter path would abort
+    // every git operation in the repository, and a file that is nothing but a
+    // `SUB` reaches zero here.
+    if content.last() == Some(&0x1a) {
+        nonprintable = nonprintable.saturating_sub(1);
     }
 
     (printable >> 7) < nonprintable
@@ -256,6 +278,62 @@ mod tests {
                 if binary { "binary" } else { "text" }
             );
         }
+    }
+
+    #[test]
+    fn a_trailing_sub_is_forgiven_exactly_as_git_forgives_it() {
+        // The last parity gap against git, closed 2026-08-04 (roadmap S-08) and
+        // deliberately before the first release: `looks_binary` freezes with the
+        // format, so after a release this stops being a fix and becomes a change
+        // that rewrites the ciphertext of every file it moves across the
+        // boundary.
+        //
+        // git's `gather_stats` ends with, verbatim:
+        //
+        //     /* If file ends with EOF then don't count this EOF as non-printable. */
+        //     if (size >= 1 && buf[size-1] == '\032')
+        //             stats->nonprintable--;
+        //
+        // Measured on git 2.55 rather than read off the source. `* text=auto`,
+        // content `a\r\n\x1a` (0x61 0x0d 0x0a 0x1a) → blob `61 0a 1a`: git
+        // normalised the CRLF, so it called the file text. This port said
+        // binary, because it counted the SUB.
+        assert!(
+            !looks_binary(b"a\r\n\x1a"),
+            "the DOS EOF marker is forgiven"
+        );
+
+        // Once, and only as the last byte. Both measured the same way, by
+        // whether the CR survived into the blob.
+        assert!(looks_binary(b"a\r\n\x1a\x1a"), "only one SUB is forgiven");
+        assert!(
+            looks_binary(b"a\x1ab\r\n"),
+            "only a trailing SUB is forgiven"
+        );
+        assert!(
+            looks_binary(b"a\x01\r\n\x1a"),
+            "the forgiveness is worth one byte, and 0x01 spends it"
+        );
+
+        // The ratio boundary with the correction applied: 128 printable against
+        // one control plus a trailing SUB is text, 127 is binary. Measured on
+        // git 2.55; this is the pair that would move if the correction were
+        // applied before the comparison rather than to the counter.
+        let boundary = |printable: usize| {
+            let mut content = vec![b'A'; printable];
+            content.extend_from_slice(b"\x01\r\n\x1a");
+            looks_binary(&content)
+        };
+        assert!(!boundary(128));
+        assert!(boundary(127));
+
+        // A SUB with nothing to cancel it out against. Measured through a
+        // checkout with `core.autocrlf=true`, since there is no CR to watch:
+        // `\n\x1a` comes back as `\r\n\x1a`, so git called it text, while
+        // `\x01\n\x1a` came back unchanged.
+        assert!(!looks_binary(b"\n\x1a"), "the counter must not underflow");
+        assert!(!looks_binary(b"\x1a"));
+        assert!(looks_binary(b"\x01\n\x1a"));
     }
 
     #[test]

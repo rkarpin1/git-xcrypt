@@ -213,6 +213,51 @@ fn binary_verdicts() -> Vec<(&'static str, Vec<u8>, bool)> {
             },
             false,
         ),
+        // A trailing SUB — the DOS end-of-file marker — is the one control byte
+        // git forgives after the fact: `gather_stats` ends with
+        // `if (size >= 1 && buf[size-1] == '\032') stats->nonprintable--;`.
+        // Measured on git 2.55 with `* text=auto`: `a\r\n\x1a` is stored as
+        // `61 0a 1a`, so git normalised the CRLF and called the file text.
+        ("a trailing SUB", b"a\r\n\x1a".to_vec(), false),
+        // Only the last byte, and only one of them. Measured: `a\r\n\x1a\x1a`
+        // keeps its CR in the blob, so git calls it binary.
+        ("two trailing SUBs", b"a\r\n\x1a\x1a".to_vec(), true),
+        // In the middle it counts like any other control byte. Measured:
+        // `a\x1ab\r\n` keeps its CR.
+        ("a SUB in the middle", b"a\x1ab\r\n".to_vec(), true),
+        // The forgiveness is worth exactly one byte, no more. Measured:
+        // `a\x01\r\n\x1a` keeps its CR — the SUB cancels itself, not the 0x01.
+        (
+            "a trailing SUB and one control",
+            b"a\x01\r\n\x1a".to_vec(),
+            true,
+        ),
+        // The ratio boundary with the correction applied, both sides of it.
+        // Measured: 128 printable with `\x01` and a trailing SUB is text,
+        // 127 printable is binary.
+        (
+            "128 printable, one control, trailing SUB",
+            {
+                let mut v = vec![b'A'; 128];
+                v.extend_from_slice(b"\x01\r\n\x1a");
+                v
+            },
+            false,
+        ),
+        (
+            "127 printable, one control, trailing SUB",
+            {
+                let mut v = vec![b'A'; 127];
+                v.extend_from_slice(b"\x01\r\n\x1a");
+                v
+            },
+            true,
+        ),
+        // Nothing but a SUB: the correction takes the only non-printable away
+        // and must not go below zero. Measured through a checkout with
+        // `core.autocrlf=true`: `\n\x1a` comes back as `\r\n\x1a`, so text.
+        ("LF then SUB", b"\n\x1a".to_vec(), false),
+        ("a control, LF, then SUB", b"\x01\n\x1a".to_vec(), true),
     ]
 }
 
