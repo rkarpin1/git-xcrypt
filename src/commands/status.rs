@@ -469,6 +469,17 @@ pub fn run(repo: &Repo, fix: bool) -> Result<Report> {
         blobs: scan.blobs,
     };
     report.warnings.extend(scan.warnings);
+    if scan.shallow {
+        // Named before the object count, and separately: a shallow clone is not
+        // a damaged one, and telling a user to run `git fsck` over a graft point
+        // sends them after a problem that is not there.
+        report.undetermined.push(
+            "this is a shallow clone, so the history before its graft point was \
+             never fetched and could not be scanned. `git fetch --unshallow` \
+             brings the rest down; until then nothing here covers it."
+                .into(),
+        );
+    }
     if scan.unreadable > 0 {
         report.undetermined.push(format!(
             "{} object(s) in this repository could not be read, so they were not \

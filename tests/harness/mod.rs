@@ -241,6 +241,36 @@ impl TestRepo {
         clone
     }
 
+    /// Clones only the tip commit, the way CI checkouts do.
+    ///
+    /// A shallow clone is an ordinary, healthy state whose history genuinely
+    /// stops at a graft point — which must not be mistaken for a damaged object
+    /// database.
+    pub fn clone_shallow(&self) -> Self {
+        let dir = TempDir::new().expect("could not create a temporary directory");
+        let path = dir.path().join("clone");
+
+        let output = Command::new("git")
+            .arg("clone")
+            .arg("-q")
+            .arg("--depth")
+            .arg("1")
+            .arg(format!("file://{}", self.path.display()))
+            .arg(&path)
+            .output()
+            .expect("could not run git clone");
+        assert!(
+            output.status.success(),
+            "git clone --depth 1 failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let clone = Self { _dir: dir, path };
+        clone.git_ok(["config", "user.name", "git-xcrypt tests"]);
+        clone.git_ok(["config", "user.email", "tests@git-xcrypt.invalid"]);
+        clone
+    }
+
     /// Adds a linked worktree and returns it as a repository in its own right.
     ///
     /// Linked worktrees are the case where "the git directory" and "the

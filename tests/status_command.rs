@@ -761,3 +761,31 @@ fn a_tag_on_something_that_is_not_a_commit_does_not_fail_the_gate() {
     assert_eq!(output.status.code(), Some(0), "{text}");
     assert!(!text.contains("undetermined"), "{text}");
 }
+
+#[test]
+fn a_shallow_clone_is_named_as_such_rather_than_reported_as_corruption() {
+    // Measured before the graft points were honoured: the walk queued the
+    // parents git deliberately did not fetch, failed to read them, and told the
+    // user "1 object(s) could not be read ... `git fsck` says what is missing".
+    // `git fsck` is perfectly happy with a shallow clone. The finding is right —
+    // a history that was never fetched cannot be vouched for — but the reason
+    // given was not, and it sent the user after a problem that is not there.
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.write_file("secrets/db.env", b"hunter2\n");
+    repo.commit_all("one");
+    repo.write_file("README.md", b"two\n");
+    repo.commit_all("two");
+
+    let clone = repo.clone_shallow();
+    let output = clone.xcrypt(["status"]);
+    let text = report(&output);
+
+    assert!(text.contains("shallow clone"), "{text}");
+    assert!(text.contains("--unshallow"), "{text}");
+    assert!(
+        !text.contains("git fsck"),
+        "a graft point was reported as a missing object:\n{text}"
+    );
+}

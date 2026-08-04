@@ -108,6 +108,16 @@ pub struct Scan {
     /// The reference store could not be enumerated at all, so nothing here
     /// covers anything.
     pub refs_unavailable: bool,
+    /// This is a shallow clone, so history stops at the graft points.
+    ///
+    /// Reported rather than treated as corruption. A shallow clone is an
+    /// ordinary, healthy state — and before this was honoured, the walk queued
+    /// the parents git deliberately did not fetch, failed to read them, and told
+    /// the user that objects were missing and to run `git fsck`, which is happy
+    /// with a shallow clone and would have reported nothing. The finding still
+    /// stands, because a history that was never fetched genuinely cannot be
+    /// vouched for; only the explanation was wrong.
+    pub shallow: bool,
     /// Anything worth saying once, carried out so the binary owns the messages.
     pub warnings: Vec<String>,
 }
@@ -137,6 +147,8 @@ pub fn scan(
 ) -> Result<Scan> {
     let mut scan = Scan::default();
     let tips = tips(git_dir, common_dir, hash, objects, &mut scan);
+    let grafts = grafts(git_dir, common_dir);
+    scan.shallow = !grafts.is_empty();
 
     let mut queue: Vec<ObjectId> = tips;
     let mut seen_commits: HashSet<ObjectId> = HashSet::new();
@@ -179,12 +191,38 @@ pub fn scan(
             &mut found,
             &mut scan,
         );
-        queue.extend(parents);
+        // A graft point is where a shallow clone stops. Its parents were never
+        // fetched, so queuing them would be asking the object database for
+        // objects git knows are absent — which read as corruption.
+        if !grafts.contains(&commit) {
+            queue.extend(parents);
+        }
     }
 
     scan.blobs = verdicts.len();
     scan.exposed = collect(found);
     Ok(scan)
+}
+
+/// The commits a shallow clone was cut off at, if it is one.
+///
+/// `$GIT_COMMON_DIR/shallow` holds one object id per line. Anything unparsable
+/// is skipped rather than reported: this file only ever makes the walk stop
+/// earlier, so misreading it costs coverage that is already absent, never a
+/// false clean bill of health.
+fn grafts(git_dir: &Path, common_dir: &Path) -> HashSet<ObjectId> {
+    let mut found = HashSet::new();
+    for directory in [common_dir, git_dir] {
+        let Ok(text) = std::fs::read_to_string(directory.join("shallow")) else {
+            continue;
+        };
+        for line in text.lines() {
+            if let Ok(id) = ObjectId::from_hex(line.trim().as_bytes()) {
+                found.insert(id);
+            }
+        }
+    }
+    found
 }
 
 /// Opens the repository's object database.
