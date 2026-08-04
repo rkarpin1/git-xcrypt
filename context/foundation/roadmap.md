@@ -39,7 +39,7 @@ Produkt rozstrzyga na podstawie wzorców ścieżek, które pliki opuszczają mas
 | S-04  | lock-repository              | zamknąć odblokowane repozytorium z powrotem                              | S-03          | FR-009                 | blocked  |
 | S-05  | decrypted-diff               | oglądać różnice na treści jawnej                                         | S-01          | FR-006                 | proposed |
 | S-06  | encryption-status-check      | sprawdzić, co jest szyfrowane, a co powinno być                          | S-02          | FR-010                 | blocked  |
-| S-07  | cross-platform-binaries      | pobrać gotową binarkę dla swojej platformy                               | S-01          | FR-011                 | blocked  |
+| S-07  | cross-platform-binaries      | pobrać gotową binarkę dla swojej platformy                               | S-01          | FR-011                 | proposed |
 
 ## Streams
 
@@ -50,7 +50,7 @@ Pomoc nawigacyjna — grupuje elementy dzielące łańcuch wymagań wstępnych. 
 | A      | Rdzeń szyfrowania        | `F-01` → `S-01` → `S-03` → `S-04`    | Ścieżka gwiazdy przewodniej; niesie całe ryzyko techniczne celu `learn`.      |
 | B      | Konfiguracja i widoczność | `S-02` → `S-06`                      | Dołącza do Strumienia A w `S-01`. Oba elementy zablokowane decyzjami.         |
 | C      | Narzędzia pracy          | `S-05`                               | Dołącza do A w `S-01`. Jedyny element bez własnej niewiadomej.                |
-| D      | Dystrybucja              | `S-07`                               | Dołącza do A w `S-01`. Blokowany decyzjami o nazwie i licencji, nie techniką. |
+| D      | Dystrybucja              | `S-07`                               | Dołącza do A w `S-01`. Decyzje o nazwie i licencji zapadły 2026-08-04; czeka już tylko na `S-01`. |
 
 ## Baseline
 
@@ -174,9 +174,9 @@ Fundament poniżej zakłada ten stan i nie tworzy ponownie niczego, co jest zgł
 - **Blockers:** —
 - **Unknowns:**
   - ~~Jaka nazwa crate'a i binarki wobec kolizji z oryginalnym `git-crypt` w menedżerach pakietów?~~ Rozstrzygnięte 2026-08-04: `git-xcrypt`. — Właściciel: użytkownik. Blokuje: nie.
-  - Jaka licencja projektu wobec GPL-3.0 projektów inspirujących? — Właściciel: użytkownik. Blokuje: tak.
-- **Risk:** publikacja pod kolidującą nazwą albo bez rozstrzygniętej licencji jest trudna do wycofania — obie decyzje muszą zapaść przed pierwszym publicznym wydaniem, nie po nim. Sama technika jest tu najprostsza w całej roadmapie; blokują decyzje, nie kod.
-- **Status:** blocked
+  - ~~Jaka licencja projektu wobec GPL-3.0 projektów inspirujących?~~ Rozstrzygnięte 2026-08-04: `MIT OR Apache-2.0`, teksty licencji w repozytorium. — Właściciel: użytkownik. Blokuje: nie.
+- **Risk:** publikacja pod kolidującą nazwą albo bez rozstrzygniętej licencji jest trudna do wycofania — obie decyzje musiały zapaść przed pierwszym publicznym wydaniem i zapadły 2026-08-04. Sama technika jest tu najprostsza w całej roadmapie; pozostaje pilnować, by `cargo deny check licenses` w CI nie wpuściło zależności copyleft, która unieważniłaby wybór.
+- **Status:** proposed
 
 ## Backlog Handoff
 
@@ -189,7 +189,7 @@ Fundament poniżej zakłada ten stan i nie tworzy ponownie niczego, co jest zgł
 | S-04       | lock-repository              | Zamknięcie repozytorium                             | nie                   | Zablokowane: zabezpieczenie przed utratą klucza |
 | S-05       | decrypted-diff               | Różnice na treści odszyfrowanej                     | nie                   | Czeka na S-01                               |
 | S-06       | encryption-status-check      | Widoczność stanu szyfrowania                        | nie                   | Zablokowane: głębokość sprawdzenia          |
-| S-07       | cross-platform-binaries      | Binarki dla Windows, macOS i Linuksa                | nie                   | Zablokowane: nazwa i licencja               |
+| S-07       | cross-platform-binaries      | Binarki dla Windows, macOS i Linuksa                | nie                   | Czeka na S-01; nazwa i licencja rozstrzygnięte |
 
 ## Open Roadmap Questions
 
@@ -197,7 +197,7 @@ Fundament poniżej zakłada ten stan i nie tworzy ponownie niczego, co jest zgł
 2. **Co chroni przed zamknięciem repozytorium bez wcześniejszego wyeksportowania klucza?** — Właściciel: użytkownik. Blokuje: `S-04`.
 3. **Jak głęboko `status` sprawdza repozytorium — bieżący stan czy cała historia?** — Właściciel: użytkownik. Blokuje: `S-06`.
 4. ~~**Jaka nazwa crate'a i binarki wobec kolizji z oryginalnym `git-crypt`?**~~ Rozstrzygnięte 2026-08-04: `git-xcrypt` dla crate'a i binarki. — Właściciel: użytkownik. Blokuje: nic.
-5. **Jaka licencja projektu wobec GPL-3.0 projektów inspirujących?** — Właściciel: użytkownik. Blokuje: `S-07`.
+5. ~~**Jaka licencja projektu wobec GPL-3.0 projektów inspirujących?**~~ Rozstrzygnięte 2026-08-04: `MIT OR Apache-2.0` dla crate'a i binarki. — Właściciel: użytkownik. Blokuje: nic.
 6. **Co chroni użytkownika przed utratą jedynego pliku klucza?** — Właściciel: użytkownik. Blokuje: nic; wpływa na zakres `S-03`.
 7. **Jaki jest liczbowy próg dla wymagania wydajnościowego?** — Właściciel: użytkownik. Blokuje: roadmap-wide; bez liczby nie da się stwierdzić, czy wymaganie zostało spełnione.
 8. **Czy któreś wymaganie ma być opcjonalne zamiast koniecznego?** — Właściciel: użytkownik. Blokuje: roadmap-wide; wszystkie 11 wymagań przyjęto jako konieczne domyślnie, bez potwierdzenia.

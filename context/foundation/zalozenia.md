@@ -140,7 +140,10 @@ Wszystkie poniższe są **akceptowanymi kompromisami** konstrukcji, nie błędam
 
 # Dystrybucja, licencja i nazewnictwo
 
-- **Licencja do rozstrzygnięcia przed pierwszym publicznym wydaniem.** AGWA/git-crypt jest na GPL-3.0. Skoro nie kopiujemy kodu ani formatu, praca pochodna prawdopodobnie nie zachodzi, ale należy to potwierdzić — również dla `git-crypt-rs`, którego licencję trzeba sprawdzić. Do czasu rozstrzygnięcia repozytorium pozostaje prywatne albo oznaczone jako GPL-3.0.
+- **Licencja — rozstrzygnięte 2026-08-04: `MIT OR Apache-2.0`** (dual, wybór po stronie odbiorcy), teksty w `LICENSE-MIT` i `LICENSE-APACHE`, deklaracja w `Cargo.toml`. Sprawdzone przed decyzją: AGWA/git-crypt ma w `COPYING` GPL-3.0, a `AprilNEA/git-crypt-rs` deklaruje w `Cargo.toml` `MIT OR Apache-2.0` — choć **nie dołącza żadnego pliku licencji**, więc GitHub raportuje dla tego repozytorium brak licencji; my tego błędu nie powtarzamy.
+  - Copyleft GPL-3.0 nie sięga tego projektu, bo nie powstaje praca pochodna: nie bierzemy kodu ani formatu, a zgodne pozostają wyłącznie nazwy komend, model clean/smudge i UX — czyli warstwa funkcjonalna. Podpiera to CJEU C-406/10 (SAS v. World Programming, 2012): funkcjonalność programu, język programowania i **format plików danych** nie podlegają ochronie prawnoautorskiej. Analogicznie Google v. Oracle (US, 2021) dla odtworzenia deklaracji API.
+  - **Warunek, pod którym to trzyma:** nie czytamy źródeł C++ `git-crypt` przy pisaniu odpowiadających im funkcji Rusta. Tłumaczenie funkcja po funkcji z otwartym oryginałem to jedyna droga, którą GPL mogłoby tu wejść. Wobec `git-crypt-rs` ryzyko jest tanie (MIT/Apache — wystarcza atrybucja), wobec `git-crypt` nie jest.
+  - Wybór `MIT OR Apache-2.0` zamiast GPL-3.0: grant patentowy z Apache (istotny dla narzędzia kryptograficznego), zgodność z GPL-2.0 z MIT, `lib` publikowalna na crates.io bez zobowiązań dla odbiorcy oraz brak sugestii pokrewieństwa z oryginałem, którego nie ma. Zastrzeżenie: to nie jest porada prawna.
 - Atrybucja projektów inspirujących w README niezależnie od wyniku analizy licencyjnej.
 - **Kolizja nazw — rozstrzygnięte 2026-08-04: crate i binarka nazywają się `git-xcrypt`.** Sprawdzone przed decyzją: `git-crypt` na crates.io jest **zajęte** przez `AprilNEA/git-crypt-rs` (0.1.4, ostatnia aktualizacja 2025-11-15), a binarki `git-crypt` i `git-secret` mają formuły w Homebrew — plik wykonywalny o którejkolwiek z tych nazw byłby po cichu przesłaniany na `PATH` przez wcześniejszy wpis. `git-xcrypt` jest wolne na crates.io, nie ma formuły w Homebrew i nie znaleziono kolidującego projektu. Nazwa zachowuje mechanizm podkomendy: binarka `git-xcrypt` na `PATH` daje `git xcrypt <komenda>`.
 - Homebrew wymaga własnego tapa (do core trafiają tylko projekty z ustaloną popularnością).
@@ -151,7 +154,7 @@ Wszystkie poniższe są **akceptowanymi kompromisami** konstrukcji, nie błędam
 - Testy integracyjne na **prawdziwych repozytoriach git** w katalogu tymczasowym: init → dodanie sekretu → commit → sprawdzenie, że blob w obiekcie gita jest zaszyfrowany → clone → unlock → porównanie treści.
 - Testy właściwości: `decrypt(encrypt(x)) == x` oraz `encrypt(x) == encrypt(x)` (determinizm).
 - Wektory testowe formatu zamrożone w repo — chronią przed przypadkową zmianą formatu psującą istniejące repozytoria.
-- CI na wszystkich trzech platformach: `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check`, `cargo audit`.
+- CI na wszystkich trzech platformach: `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check`, `cargo audit`, `cargo deny check licenses` (pilnuje, by copyleft nie wszedł bocznymi drzwiami z zależnością i nie unieważnił wyboru `MIT OR Apache-2.0`).
 - Scenariusz regresyjny na Windows z włączonym `core.autocrlf=true`.
 
 # Kryteria akceptacji
@@ -169,7 +172,7 @@ Projekt uznajemy za działający, gdy poniższy scenariusz przechodzi automatycz
 
 1. **Format odbiorców: age czy OpenPGP (sequoia)?** Rekomendacja: age dla v0.1.
 2. ~~**Nazwa crate'a i binarki** wobec kolizji z oryginalnym `git-crypt`.~~ Rozstrzygnięte 2026-08-04: `git-xcrypt` dla obu — patrz „Dystrybucja, licencja i nazewnictwo".
-3. **Licencja projektu** po weryfikacji licencji projektów inspirujących.
+3. ~~**Licencja projektu** po weryfikacji licencji projektów inspirujących.~~ Rozstrzygnięte 2026-08-04: `MIT OR Apache-2.0` — patrz „Dystrybucja, licencja i nazewnictwo".
 4. ~~Nazwa pliku konfiguracyjnego.~~ Rozstrzygnięte 2026-08-04: plik nazywa się `.git-xcrypt`, a koperty kluczy — gdyby kiedykolwiek powstały — trafiają do `.git-xcrypt-keys/`. To usuwa kolizję, która była istotą tego pytania: plik i katalog o identycznej nazwie nie mogą współistnieć.
 5. Próg rozmiaru pliku, powyżej którego przechodzimy na buforowanie dyskowe zamiast RAM.
 6. Które komendy z oryginału poza listą MVP faktycznie chcemy odtworzyć.
