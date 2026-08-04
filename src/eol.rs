@@ -17,11 +17,19 @@ use crate::config::{EolMode, TextMode};
 
 /// Whether git — and therefore we — would treat this content as binary.
 ///
-/// Measured against git 2.55 rather than taken from documentation. Binary means
-/// a NUL byte anywhere, or too many control characters below `0x20`. Bytes at
-/// or above `0x80` count as printable, which is why UTF-8 text is recognised as
-/// text. The whole content is scanned; the 8000-byte window belongs to a
-/// different heuristic, the one `git diff` uses to print `Binary files differ`.
+/// Measured against git 2.55 rather than taken from documentation, and matching
+/// git's own `convert_is_binary`. Binary means a NUL byte anywhere, a lone `CR`
+/// — one not followed by `LF` — or too many control characters below `0x20`.
+/// Bytes at or above `0x80` count as printable, which is why UTF-8 text is
+/// recognised as text. The whole content is scanned; the 8000-byte window
+/// belongs to a different heuristic, the one `git diff` uses to print
+/// `Binary files differ`.
+///
+/// The lone-`CR` rule is not decoration. Without it, content such as
+/// `a\r\r\nb` normalises to `a\r\nb`, which normalises again to `a\nb` — so the
+/// conversion is not closed over its own output, the working tree comes back
+/// different after a checkout and `git status` reports a file nobody edited.
+/// Git avoids that the same way, by declining to convert at all.
 ///
 /// This rule is **frozen with the format**: changing it would move the
 /// text/binary boundary and rewrite the ciphertext of existing files.
@@ -30,9 +38,10 @@ pub fn looks_binary(content: &[u8]) -> bool {
     let mut printable = 0usize;
     let mut nonprintable = 0usize;
 
-    for &byte in content {
+    for (index, &byte) in content.iter().enumerate() {
         match byte {
             0 => return true,
+            b'\r' if content.get(index + 1) != Some(&b'\n') => return true,
             b'\t' | b'\n' | b'\r' | 0x0c | 0x08 | 0x1b => printable += 1,
             0x01..0x20 => nonprintable += 1,
             _ => printable += 1,
@@ -62,8 +71,13 @@ pub fn should_normalise(mode: TextMode, content: &[u8]) -> bool {
 ///
 /// A lone `CR` is left alone: it is not a line ending git would have produced,
 /// and rewriting it would corrupt content that merely happens to contain the
-/// byte. The function is idempotent, which matters because the round trip runs
-/// it again on content it has already normalised.
+/// byte.
+///
+/// **Not idempotent in general** — `\r\r\n` collapses to `\r\n` and would
+/// collapse again to `\n` on a second pass, exactly as git's own conversion
+/// does. It *is* idempotent on every input that reaches it, because content
+/// carrying a lone `CR` is classified binary by [`looks_binary`] and never
+/// normalised. That pairing is what keeps the round trip stable.
 #[must_use]
 pub fn normalise_to_lf(content: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(content.len());
@@ -111,14 +125,26 @@ pub fn resolve_output(
     }
 
     match autocrlf.map(str::to_ascii_lowercase).as_deref() {
-        Some("true") => EolMode::Crlf,
         Some("input") => EolMode::Lf,
+        // `core.autocrlf` is a git boolean plus the special value `input`, and
+        // git accepts every boolean spelling here: `1`, `yes` and `on` are as
+        // valid as `true`. Matching only `true` silently downgraded them to
+        // `false` and wrote LF where the user asked for CRLF.
+        Some(value) if is_git_true(value) => EolMode::Crlf,
         _ => match eol.map(str::to_ascii_lowercase).as_deref() {
             Some("crlf") => EolMode::Crlf,
             Some("lf") => EolMode::Lf,
             _ => EolMode::Native,
         },
     }
+}
+
+/// Whether a configuration value is one of git's spellings of true.
+///
+/// A key present with no value at all is true as well, which is why the empty
+/// string counts.
+fn is_git_true(value: &str) -> bool {
+    matches!(value, "true" | "yes" | "on" | "1" | "")
 }
 
 /// Applies a resolved line-ending mode to content that was normalised to LF.
@@ -176,6 +202,44 @@ mod tests {
     }
 
     #[test]
+    fn a_lone_carriage_return_means_binary() {
+        // Git's own `convert_is_binary` refuses these, and so must we: without
+        // the rule, `a\r\r\nb` normalises to something that normalises again,
+        // so a checked-out file comes back changed and `git status` never
+        // settles.
+        assert!(looks_binary(b"old mac\rline endings\r"));
+        assert!(looks_binary(b"a\r\r\nb\r\n"));
+        assert!(looks_binary(b"trailing\r"));
+        assert!(looks_binary(b"\n\r"));
+        assert!(!looks_binary(b"a\r\nb\r\n"), "plain CRLF is still text");
+    }
+
+    #[test]
+    fn content_that_is_normalised_survives_a_second_pass() {
+        // The invariant the lone-CR rule exists to protect: everything
+        // `should_normalise` says yes to must be closed under normalisation.
+        for content in [
+            &b"a\r\nb\r\n"[..],
+            b"a\r\r\nb\r\n",
+            b"trailing\r",
+            b"plain\n",
+            b"\n\r",
+            b"",
+        ] {
+            if !should_normalise(TextMode::Auto, content) {
+                continue;
+            }
+            let once = normalise_to_lf(content);
+            assert_eq!(
+                normalise_to_lf(&once),
+                once,
+                "{content:?} was normalised into something that normalises again, \
+                 so its round trip would never settle"
+            );
+        }
+    }
+
+    #[test]
     fn normalising_is_idempotent() {
         let once = normalise_to_lf(b"a\r\nb\r\n");
         let twice = normalise_to_lf(&once);
@@ -228,6 +292,24 @@ mod tests {
             EolMode::Native
         );
         assert_eq!(resolve_output(None, None, None), EolMode::Native);
+    }
+
+    #[test]
+    fn every_git_spelling_of_true_means_crlf() {
+        for spelling in ["true", "TRUE", "yes", "on", "1", ""] {
+            assert_eq!(
+                resolve_output(None, Some(spelling), None),
+                EolMode::Crlf,
+                "`core.autocrlf = {spelling}` is true to git and must be to us"
+            );
+        }
+        for spelling in ["false", "no", "off", "0"] {
+            assert_eq!(
+                resolve_output(None, Some(spelling), Some("lf")),
+                EolMode::Lf,
+                "`core.autocrlf = {spelling}` is false to git, so core.eol decides"
+            );
+        }
     }
 
     #[test]

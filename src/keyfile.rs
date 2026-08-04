@@ -7,6 +7,8 @@
 use std::fs;
 use std::path::Path;
 
+use zeroize::{Zeroize as _, Zeroizing};
+
 use crate::key::{MASTER_KEY_LEN, MasterKey};
 use crate::{Error, Result};
 
@@ -20,12 +22,16 @@ const KEY_FILE_VERSION: u8 = 1;
 const KEY_FILE_LEN: usize = KEY_FILE_MAGIC.len() + 1 + MASTER_KEY_LEN;
 
 /// Serialises a key into the bytes stored on disk.
-fn encode(key: &MasterKey) -> Vec<u8> {
+///
+/// The buffer holds the master key, so it is wrapped in [`Zeroizing`]: without
+/// that, `MasterKey`'s own `ZeroizeOnDrop` would protect one copy of the key and
+/// leave this one behind on the heap.
+fn encode(key: &MasterKey) -> Zeroizing<Vec<u8>> {
     let mut bytes = Vec::with_capacity(KEY_FILE_LEN);
     bytes.extend_from_slice(KEY_FILE_MAGIC);
     bytes.push(KEY_FILE_VERSION);
     bytes.extend_from_slice(key.expose_bytes());
-    bytes
+    Zeroizing::new(bytes)
 }
 
 /// Parses the bytes of a key file.
@@ -42,14 +48,18 @@ fn decode(bytes: &[u8]) -> Result<MasterKey> {
 
     let mut material = [0u8; MASTER_KEY_LEN];
     material.copy_from_slice(&bytes[KEY_FILE_MAGIC.len() + 1..]);
-    Ok(MasterKey::from_bytes(material))
+    let key = MasterKey::from_bytes(material);
+    material.zeroize();
+    Ok(key)
 }
 
 /// Writes `key` to `path`, creating parent directories.
 ///
-/// The file is owner-only from the moment it exists: on Unix it is created with
-/// mode `0600` rather than created and then chmod-ed, so there is no window in
-/// which the key is world readable.
+/// The file is owner-only before any key material reaches it: on Unix it is
+/// created with mode `0600`, and an already existing file — where the creation
+/// mode would be ignored — is narrowed straight after opening and before the
+/// first write. Either way there is no window in which the key is world
+/// readable.
 ///
 /// # Errors
 ///
@@ -68,8 +78,9 @@ pub fn write(path: &Path, key: &MasterKey) -> Result<()> {
 /// [`Error::NoKey`] when the file is absent, [`Error::Format`] when it is not a
 /// key file this build understands.
 pub fn read(path: &Path) -> Result<MasterKey> {
+    // Zeroizing, because this buffer is a full copy of the master key.
     let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
+        Ok(bytes) => Zeroizing::new(bytes),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Err(Error::NoKey),
         Err(err) => return Err(Error::Io(err)),
     };
@@ -96,6 +107,16 @@ pub fn write_owner_only(path: &Path, contents: &[u8]) -> Result<()> {
     }
 
     let mut file = options.open(path)?;
+
+    // `mode` above applies only when the file is created. A key file that
+    // already existed keeps whatever permissions it had, so it is narrowed
+    // here — before a single byte of key material is written into it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+
     file.write_all(contents)?;
     file.sync_all()?;
 
@@ -150,6 +171,29 @@ mod tests {
         bytes[KEY_FILE_MAGIC.len()] = KEY_FILE_VERSION + 1;
         fs::write(&path, &bytes).expect("writing must succeed");
         assert!(read(&path).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pre_existing_loose_file_is_narrowed_before_the_key_lands_in_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = TempDir::new().expect("temporary directory");
+        let path = dir.path().join("default");
+        fs::write(&path, b"world readable placeholder").expect("writing must succeed");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod must succeed");
+
+        write(&path, &MasterKey::from_bytes([4u8; MASTER_KEY_LEN])).expect("writing must succeed");
+
+        let mode = fs::metadata(&path)
+            .expect("the key file")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "an existing key file kept its loose permissions"
+        );
     }
 
     #[cfg(unix)]

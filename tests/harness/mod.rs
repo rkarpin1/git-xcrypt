@@ -2,8 +2,8 @@
 //!
 //! Only git's stored objects prove that content left the working tree in the
 //! shape we intended, so every assertion here goes through real `git` calls and
-//! compares raw bytes. Nothing on this path may become a `String`: ciphertext —
-//! and, for now, reversed binary content — is not valid UTF-8.
+//! compares raw bytes. Nothing on this path may become a `String`: ciphertext is
+//! not valid UTF-8.
 
 // Each integration test file compiles its own copy of this module, so helpers
 // used by only one of them would otherwise trip `-D warnings`.

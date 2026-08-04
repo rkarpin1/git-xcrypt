@@ -28,6 +28,23 @@ pub fn open_local(path: &Path) -> Result<File> {
         .map_err(|err| Error::Config(format!("could not read {}: {err}", path.display())))
 }
 
+/// The configuration git itself would see, for reading only.
+///
+/// Full precedence: git installation, system, global, repository-local,
+/// worktree and `GIT_CONFIG_*` overrides, with `include`/`includeIf` followed.
+/// The smudge path needs this rather than `.git/config` alone, because
+/// `core.autocrlf` and `core.eol` are almost always set globally — on Windows
+/// the installer does it — and reading only the local file would leave the
+/// measured line-ending table unreachable on exactly the platform it exists for.
+///
+/// # Errors
+///
+/// [`Error::Config`] when a file in the cascade cannot be parsed.
+pub fn open_full(git_dir: &Path) -> Result<File> {
+    File::from_git_dir(git_dir.to_path_buf())
+        .map_err(|err| Error::Config(format!("could not read git configuration: {err}")))
+}
+
 /// Writes a configuration file back to disk.
 ///
 /// # Errors

@@ -42,8 +42,12 @@ impl MasterKey {
     /// Falling back to anything weaker would be worse than failing.
     pub fn generate() -> Result<Self> {
         let mut bytes = [0u8; MASTER_KEY_LEN];
-        getrandom::fill(&mut bytes).map_err(|err| Error::Entropy(err.to_string()))?;
-        Ok(Self(bytes))
+        let drawn = getrandom::fill(&mut bytes).map_err(|err| Error::Entropy(err.to_string()));
+        let key = drawn.map(|()| Self(bytes));
+        // The staging array is a second copy of the key; the one inside
+        // `MasterKey` is the only one allowed to outlive this call.
+        bytes.zeroize();
+        key
     }
 
     /// Wraps key material that came from a key file.
@@ -66,6 +70,12 @@ impl MasterKey {
     /// Identifies the *key*, not the suite, so it survives a future change of
     /// cipher and keeps `unlock`, `export-key` and `import-key` working across
     /// one.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: [`KEY_ID_LEN`] is eight bytes against HKDF's ceiling
+    /// of 8160, so the expansion cannot fail. Handing back half-derived material
+    /// instead would put a wrong `key_id` into a file header for good.
     #[must_use]
     pub fn key_id(&self) -> [u8; KEY_ID_LEN] {
         let mut key_id = [0u8; KEY_ID_LEN];
@@ -91,16 +101,24 @@ impl MasterKey {
 
     /// HKDF-SHA-256 expansion with no salt and a domain-separating `info`.
     ///
-    /// The output lengths used here are far below HKDF's ceiling of 255 hash
-    /// blocks, so expansion cannot fail and the length error is unreachable.
+    /// # Panics
+    ///
+    /// Never for the call sites in this module: both output lengths are
+    /// compile-time constants far below HKDF's ceiling of 8160 bytes, and the
+    /// only documented failure is an out-of-range length. Aborting is
+    /// deliberate — the alternative shapes (a zeroed buffer, a half-filled one)
+    /// would encrypt real content under a predictable key and say nothing,
+    /// which is the one failure mode this codebase refuses everywhere else.
     fn expand(&self, info: &[u8], out: &mut [u8]) {
+        const HKDF_SHA256_MAX_OUTPUT: usize = 255 * 32;
+        assert!(
+            out.len() <= HKDF_SHA256_MAX_OUTPUT,
+            "HKDF output length is out of range"
+        );
+
         let hkdf = Hkdf::<Sha256>::new(None, &self.0);
-        debug_assert!(out.len() <= 255 * 32, "HKDF output length is out of range");
-        if hkdf.expand(info, out).is_err() {
-            // Unreachable for our fixed lengths; zero the buffer rather than
-            // let a caller use half-filled key material.
-            out.zeroize();
-        }
+        hkdf.expand(info, out)
+            .expect("HKDF cannot fail for a length already checked above");
     }
 }
 

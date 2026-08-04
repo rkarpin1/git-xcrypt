@@ -84,7 +84,21 @@ pub fn run(repo: &Repo) -> Result<Report> {
 /// managed attributes section and the versioned config file. Both survive
 /// cloning; the key does not.
 fn refuse_if_previously_configured(repo: &Repo) -> Result<()> {
-    let attributes = fs::read_to_string(repo.attributes_path()).unwrap_or_default();
+    // A `.gitattributes` we cannot read is not evidence of absence. Treating a
+    // read failure as "no traces" is the one direction that generates a fresh
+    // key over a repository that already has one — the irreversible outcome
+    // this whole function exists to prevent.
+    let attributes = match fs::read_to_string(repo.attributes_path()) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => {
+            return Err(Error::Config(format!(
+                "cannot tell whether this repository was already set up: {} could not be \
+                 read ({err}). Refusing rather than risk generating a second key.",
+                repo.attributes_path().display()
+            )));
+        }
+    };
     let has_section = gitattributes::has_section(&attributes);
     let has_config = repo.xcrypt_config_path().is_file();
 
@@ -98,7 +112,10 @@ fn refuse_if_previously_configured(repo: &Repo) -> Result<()> {
          read, for good.\n\
          If this is a clone, run `git-xcrypt unlock <key-file>`.\n\
          If you have the key elsewhere, run `git-xcrypt import-key <key-file>`.\n\
+         If this repository never used git-xcrypt and you wrote {} by hand, delete it \
+         and run `init` again.\n\
          (found: {})",
+        crate::repo::CONFIG_FILE,
         match (has_section, has_config) {
             (true, true) => "a managed .gitattributes section and .git-xcrypt",
             (true, false) => "a managed .gitattributes section",
@@ -107,7 +124,7 @@ fn refuse_if_previously_configured(repo: &Repo) -> Result<()> {
     )))
 }
 
-/// Registers the filter and diff drivers, reporting whether anything changed.
+/// Registers the filter driver, reporting whether anything changed.
 ///
 /// `required = true` is what makes a failing filter abort the operation. Without
 /// it git treats the failure as harmless and commits the unfiltered content with
@@ -116,6 +133,11 @@ fn refuse_if_previously_configured(repo: &Repo) -> Result<()> {
 /// The filter is registered as `process`, the long-running protocol: a process
 /// per file was measured 22× slower, which the catch-all construction cannot
 /// afford.
+///
+/// The `diff` driver is deliberately **not** registered here. It belongs to
+/// S-05, and pointing `diff.git-xcrypt.textconv` at a subcommand this build does
+/// not have would break `git diff` the moment S-02 emits the cosmetic
+/// `diff=git-xcrypt` lines.
 fn register_driver(repo: &Repo) -> Result<bool> {
     let path = repo.config_path();
     let mut config = gitconfig::open_local(&path)?;
@@ -127,7 +149,6 @@ fn register_driver(repo: &Repo) -> Result<bool> {
             format!("{binary} process"),
         ),
         (format!("filter.{DRIVER}.required"), "true".to_string()),
-        (format!("diff.{DRIVER}.textconv"), format!("{binary} diff")),
     ];
 
     let mut changed = false;

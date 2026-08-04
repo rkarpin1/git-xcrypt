@@ -118,17 +118,18 @@ pub fn write_section(path: &Path, extra_lines: &[String]) -> Result<bool> {
     Ok(true)
 }
 
-/// Whether the repository-local config registers the filter completely.
+/// The configuration keys `init` writes, for `status` to check for completeness.
 ///
 /// A clone that never ran `init` or `unlock` carries the catch-all attribute
 /// through history but not `.git/config`, and git treats an undefined filter as
-/// no filter at all — content passes through in the clear.
+/// no filter at all — content passes through in the clear. `diff.git-xcrypt.*`
+/// is absent on purpose: it arrives with S-05, and listing it here would make
+/// every repository report itself incomplete until then.
 #[must_use]
-pub fn driver_keys() -> [String; 3] {
+pub fn driver_keys() -> [String; 2] {
     [
         format!("filter.{DRIVER}.process"),
         format!("filter.{DRIVER}.required"),
-        format!("diff.{DRIVER}.textconv"),
     ]
 }
 

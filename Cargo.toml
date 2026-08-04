@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
+[lints.rust]
+# AGENTS.md makes "zero unsafe" a hard rule; this is what enforces it.
+unsafe_code = "forbid"
+
 [dependencies]
 aes-siv = "0.7"
 bstr = "1.13.0"

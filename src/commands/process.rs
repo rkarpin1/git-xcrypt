@@ -17,9 +17,14 @@ use crate::repo::Repo;
 /// [`crate::Error::Io`] on a broken pipe.
 pub fn run() -> Result<()> {
     let repo = Repo::discover_from_cwd()?;
-    let context = Context::load(&repo)?;
+    let mut context = Context::load(&repo)?;
 
     let mut input = io::stdin().lock();
-    let mut output = io::stdout().lock();
-    filter::run(&context, &mut input, &mut output)
+    // `BufWriter`, not the bare lock: `StdoutLock` is line buffered, and
+    // ciphertext is uniformly random, so roughly one byte in 256 is `\n` and
+    // would force a syscall. This is the path whose entire justification is the
+    // 22× measurement. `pktline::write_flush` still forces the real flush at
+    // every point the protocol requires one.
+    let mut output = io::BufWriter::new(io::stdout().lock());
+    filter::run(&mut context, &mut input, &mut output)
 }

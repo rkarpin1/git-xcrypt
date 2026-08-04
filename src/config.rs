@@ -93,6 +93,16 @@ pub struct Config {
     /// Pointless rather than dangerous — git itself lets `-text` win over `eol` —
     /// so it is a warning the caller prints once, not an error.
     pub pointless_eol: Vec<String>,
+    /// The file was not on disk at all.
+    ///
+    /// Kept rather than turned into an error at load time because the two filter
+    /// directions need opposite answers: check-in must refuse, since "no
+    /// declaration" is indistinguishable from "the declaration has not been
+    /// checked out yet" and guessing wrong writes a secret in the clear;
+    /// check-out must carry on, because a file's own header already says
+    /// everything smudge needs and git gives no order in which it writes the
+    /// working tree.
+    pub missing: bool,
 }
 
 impl Config {
@@ -149,17 +159,22 @@ impl Config {
         Ok(config)
     }
 
-    /// Reads and parses the file at `path`, treating absence as an empty config.
+    /// Reads and parses the file at `path`, recording an absent file as such.
+    ///
+    /// An unreadable file is an error here and an absent one is flagged, because
+    /// neither may end up meaning "encrypt nothing" on the check-in path.
     ///
     /// # Errors
     ///
-    /// [`Error::Io`] when the file cannot be read, [`Error::Config`] when it
-    /// cannot be understood. An unreadable configuration must never be treated
-    /// as "encrypt nothing".
+    /// [`Error::Io`] when the file exists but cannot be read, [`Error::Config`]
+    /// when it cannot be understood.
     pub fn load(path: &std::path::Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
             Ok(text) => Self::parse(&text),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self {
+                missing: true,
+                ..Self::default()
+            }),
             Err(err) => Err(Error::Io(err)),
         }
     }
@@ -188,8 +203,12 @@ impl Config {
     }
 
     /// What this configuration says about `path`, given relative to the root.
+    ///
+    /// The path is bytes, not text: on Unix a path is an arbitrary byte string,
+    /// and lossy decoding would match a file under a name it does not have —
+    /// which in the pass-through direction means storing a secret in the clear.
     #[must_use]
-    pub fn decide(&self, path: &str) -> Decision {
+    pub fn decide(&self, path: &[u8]) -> Decision {
         if is_never_encrypted(path) {
             return Decision::default();
         }
@@ -227,12 +246,23 @@ impl Config {
 ///
 /// They are needed to bootstrap: git reads `.gitattributes` to know to call us
 /// at all, we read `.git-xcrypt` to know what to do, and the envelope directory
-/// must stay readable to whoever holds a recipient key.
-fn is_never_encrypted(path: &str) -> bool {
-    path == ATTRIBUTES_FILE
-        || path == CONFIG_FILE
-        || path == KEY_ENVELOPE_DIR
-        || path.starts_with(&format!("{KEY_ENVELOPE_DIR}/"))
+/// must stay readable to whoever holds a recipient key. Public because the
+/// check-in path consults it before anything else, including before refusing on
+/// a missing `.git-xcrypt` — otherwise a user who deleted the file could not
+/// commit its replacement.
+#[must_use]
+pub fn is_never_encrypted(path: &[u8]) -> bool {
+    // `.gitattributes` is matched by basename, not by root path: git reads one
+    // per directory, so encrypting `sub/.gitattributes` would leave git unable
+    // to read the attributes for that whole subtree. `.git-xcrypt` is read only
+    // from the root, so there the root path is the right test.
+    let basename = path.rsplit_str("/").next().unwrap_or(path);
+    let envelope_prefix = format!("{KEY_ENVELOPE_DIR}/");
+
+    basename == ATTRIBUTES_FILE.as_bytes()
+        || path == CONFIG_FILE.as_bytes()
+        || path == KEY_ENVELOPE_DIR.as_bytes()
+        || path.starts_with(envelope_prefix.as_bytes())
 }
 
 /// Splits a line into its pattern and its attributes.
@@ -289,13 +319,13 @@ fn parse_attributes(text: &str, line: usize) -> Result<Declared> {
 /// A pattern written as `secrets/` only matches a directory, so git also treats
 /// everything beneath it as matched. `gix-glob` answers about one path at a
 /// time, so the ancestors are offered to it explicitly.
-fn matches(pattern: &Pattern, path: &str) -> bool {
+fn matches(pattern: &Pattern, path: &[u8]) -> bool {
     if match_one(pattern, path, false) {
         return true;
     }
 
-    for (index, byte) in path.bytes().enumerate() {
-        if byte == b'/' && match_one(pattern, &path[..index], true) {
+    for (index, byte) in path.iter().enumerate() {
+        if *byte == b'/' && match_one(pattern, &path[..index], true) {
             return true;
         }
     }
@@ -303,9 +333,9 @@ fn matches(pattern: &Pattern, path: &str) -> bool {
 }
 
 /// One `gix-glob` question.
-fn match_one(pattern: &Pattern, path: &str, is_dir: bool) -> bool {
-    let bytes: &BStr = path.as_bytes().as_bstr();
-    let basename_start = path.rfind('/').map(|index| index + 1);
+fn match_one(pattern: &Pattern, path: &[u8], is_dir: bool) -> bool {
+    let bytes: &BStr = path.as_bstr();
+    let basename_start = path.rfind_byte(b'/').map(|index| index + 1);
     pattern.matches_repo_relative_path(
         bytes,
         basename_start,
@@ -326,41 +356,41 @@ mod tests {
     #[test]
     fn a_directory_pattern_covers_everything_beneath_it() {
         let config = config("secrets/\n");
-        assert!(config.decide("secrets/a/b.txt").encrypt);
-        assert!(config.decide("secrets/one.env").encrypt);
-        assert!(!config.decide("public/one.env").encrypt);
+        assert!(config.decide(b"secrets/a/b.txt").encrypt);
+        assert!(config.decide(b"secrets/one.env").encrypt);
+        assert!(!config.decide(b"public/one.env").encrypt);
     }
 
     #[test]
     fn a_glob_does_not_cross_a_slash_but_a_double_star_does() {
         let config = config("*.env\nlogs/**/*.key\n");
-        assert!(config.decide("one.env").encrypt);
+        assert!(config.decide(b"one.env").encrypt);
         assert!(
-            config.decide("nested/one.env").encrypt,
+            config.decide(b"nested/one.env").encrypt,
             "gitignore globs float"
         );
-        assert!(config.decide("logs/a/b/x.key").encrypt);
+        assert!(config.decide(b"logs/a/b/x.key").encrypt);
     }
 
     #[test]
     fn a_leading_slash_anchors_to_the_root() {
         let config = config("/deploy/id_rsa\n");
-        assert!(config.decide("deploy/id_rsa").encrypt);
-        assert!(!config.decide("nested/deploy/id_rsa").encrypt);
+        assert!(config.decide(b"deploy/id_rsa").encrypt);
+        assert!(!config.decide(b"nested/deploy/id_rsa").encrypt);
     }
 
     #[test]
     fn a_negation_turns_a_path_back_off() {
         let config = config("secrets/\n!secrets/README.md\n");
-        assert!(config.decide("secrets/password").encrypt);
-        assert!(!config.decide("secrets/README.md").encrypt);
+        assert!(config.decide(b"secrets/password").encrypt);
+        assert!(!config.decide(b"secrets/README.md").encrypt);
     }
 
     #[test]
     fn the_last_selecting_line_wins() {
         let config = config("!secrets/README.md\nsecrets/\n");
         assert!(
-            config.decide("secrets/README.md").encrypt,
+            config.decide(b"secrets/README.md").encrypt,
             "a later selection must override an earlier negation"
         );
     }
@@ -369,7 +399,7 @@ mod tests {
     fn a_broad_pattern_without_attributes_does_not_erase_a_narrow_declaration() {
         // This is the whole point of resolving on two axes.
         let config = config("*.env text\nsecrets/\n");
-        let decision = config.decide("secrets/a.env");
+        let decision = config.decide(b"secrets/a.env");
         assert!(decision.encrypt);
         assert_eq!(decision.text, TextMode::Text);
     }
@@ -377,7 +407,7 @@ mod tests {
     #[test]
     fn a_later_declaration_overrides_only_what_it_names() {
         let config = config("secrets/ text eol=lf\nsecrets/*.sh eol=crlf\n");
-        let decision = config.decide("secrets/deploy.sh");
+        let decision = config.decide(b"secrets/deploy.sh");
         assert_eq!(decision.text, TextMode::Text, "text was not re-declared");
         assert_eq!(decision.eol, Some(EolMode::Crlf));
     }
@@ -385,14 +415,14 @@ mod tests {
     #[test]
     fn the_default_is_auto_detection() {
         let config = config("secrets/\n");
-        assert_eq!(config.decide("secrets/x").text, TextMode::Auto);
-        assert_eq!(config.decide("secrets/x").eol, None);
+        assert_eq!(config.decide(b"secrets/x").text, TextMode::Auto);
+        assert_eq!(config.decide(b"secrets/x").eol, None);
     }
 
     #[test]
     fn binary_is_minus_text_plus_no_diff() {
         let config = config("secrets/key.p12 binary\n");
-        let decision = config.decide("secrets/key.p12");
+        let decision = config.decide(b"secrets/key.p12");
         assert_eq!(decision.text, TextMode::Binary);
         assert!(decision.suppress_diff);
     }
@@ -402,15 +432,18 @@ mod tests {
         let config = config("*\n");
         for path in [
             ATTRIBUTES_FILE,
+            // Git reads one .gitattributes per directory; encrypting a nested
+            // one would blind it for that whole subtree.
+            "sub/dir/.gitattributes",
             CONFIG_FILE,
             "\u{2e}git-xcrypt-keys/robert.age",
         ] {
             assert!(
-                !config.decide(path).encrypt,
+                !config.decide(path.as_bytes()).encrypt,
                 "{path} must never be encrypted; it is needed to bootstrap"
             );
         }
-        assert!(config.decide("anything-else").encrypt);
+        assert!(config.decide(b"anything-else").encrypt);
     }
 
     #[test]
@@ -426,20 +459,20 @@ mod tests {
     #[test]
     fn comments_and_blank_lines_are_ignored() {
         let config = config("# a comment\n\n   \n*.env\n");
-        assert!(config.decide("one.env").encrypt);
+        assert!(config.decide(b"one.env").encrypt);
     }
 
     #[test]
     fn eol_on_a_binary_path_is_reported_as_pointless_not_fatal() {
         let config = config("secrets/key.p12 -text eol=lf\n");
         assert_eq!(config.pointless_eol.len(), 1);
-        assert!(config.decide("secrets/key.p12").encrypt);
+        assert!(config.decide(b"secrets/key.p12").encrypt);
     }
 
     #[test]
     fn an_empty_configuration_encrypts_nothing() {
         let config = Config::default();
-        assert!(!config.decide("secrets/anything").encrypt);
+        assert!(!config.decide(b"secrets/anything").encrypt);
     }
 
     #[test]

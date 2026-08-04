@@ -148,13 +148,90 @@ fn init_refuses_in_a_clone_that_has_no_key() {
 
     let output = clone.xcrypt(["init"]);
 
-    assert!(
-        !output.status.success(),
-        "init generated a fresh key in a clone, stranding every existing blob"
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a state conflict is exit code 2 in the frozen table; \
+         init generated a fresh key in a clone, stranding every existing blob"
     );
     let message = String::from_utf8_lossy(&output.stderr);
     assert!(
         message.contains("unlock") || message.contains("import-key"),
         "the refusal must point somewhere useful, got: {message}"
+    );
+}
+
+#[test]
+fn init_outside_a_repository_reports_a_state_conflict() {
+    let elsewhere = tempfile::TempDir::new().expect("temporary directory");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_git-xcrypt"))
+        .arg("init")
+        .current_dir(elsewhere.path())
+        .output()
+        .expect("could not run git-xcrypt");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "not being a git repository is exit code 2"
+    );
+}
+
+#[test]
+fn deleting_the_declaration_stops_the_commit_instead_of_leaking() {
+    // The worst failure mode reachable by one command: with `.git-xcrypt` gone
+    // the filter used to have nothing to match against, so every selected path
+    // sailed into the object database in the clear, exit code 0.
+    let repo = repo_with_secret();
+    std::fs::remove_file(repo.path().join(".git-xcrypt")).expect("could not remove the config");
+    repo.write_file("another.env", b"api_key = second-secret\n");
+
+    let output = repo.git(["add", "another.env"]);
+
+    assert!(
+        !output.status.success(),
+        "git add succeeded without a declaration, so the plaintext was committed"
+    );
+    assert!(
+        !repo.object_exists_for(b"api_key = second-secret\n"),
+        "the object database holds the plaintext"
+    );
+    repo.assert_not_staged("another.env");
+}
+
+#[test]
+fn the_declaration_can_still_be_restored_after_it_is_deleted() {
+    // The refusal above must not be a dead end. Check-out is unaffected by a
+    // missing declaration — smudge decides from each file's own header — so the
+    // recovery the error message names actually works.
+    let repo = repo_with_secret();
+    std::fs::remove_file(repo.path().join(".git-xcrypt")).expect("could not remove the config");
+
+    repo.git_ok(["checkout", "--", ".git-xcrypt"]);
+
+    repo.assert_status_clean();
+    repo.write_file("another.env", b"api_key = second-secret\n");
+    repo.commit_all("add another secret once the declaration is back");
+    assert!(
+        repo.blob_bytes("another.env").starts_with(b"\0GITXCRYPT\0"),
+        "encryption did not resume after the declaration was restored"
+    );
+}
+
+#[test]
+fn a_file_whose_name_ends_in_a_space_is_still_encrypted() {
+    // The pathname arrives as `pathname=<name>\n`; trimming more than that one
+    // newline matched this file against the wrong pattern and stored it plain.
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n!secrets/README.md\n");
+    repo.write_file("secrets/README.md ", SECRET);
+
+    repo.commit_all("add a file whose name ends in a space");
+
+    let blob = repo.blob_bytes("secrets/README.md ");
+    assert!(
+        blob.starts_with(b"\0GITXCRYPT\0"),
+        "`secrets/README.md ` does not match the negation, so it must be encrypted"
     );
 }

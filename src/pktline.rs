@@ -29,6 +29,14 @@ pub fn read_packet(input: &mut impl Read) -> Result<Packet> {
     let mut length = [0u8; 4];
     input.read_exact(&mut length)?;
 
+    // Four hexadecimal digits and nothing else. `from_str_radix` alone would
+    // accept `+abc`, and this is the one parser standing between a malformed
+    // stream and the rest of the filter.
+    if !length.iter().all(u8::is_ascii_hexdigit) {
+        return Err(Error::Format(
+            "the filter protocol sent a non-hex packet length".into(),
+        ));
+    }
     let text = std::str::from_utf8(&length)
         .map_err(|_| Error::Format("the filter protocol sent a non-hex packet length".into()))?;
     let length = usize::from_str_radix(text, 16)
@@ -182,6 +190,10 @@ mod tests {
         assert!(read_packet(&mut cursor).is_err());
 
         let mut cursor = b"0002".as_slice();
+        assert!(read_packet(&mut cursor).is_err());
+
+        // `from_str_radix` on its own would read this as 2748.
+        let mut cursor = b"+abcpayload".as_slice();
         assert!(read_packet(&mut cursor).is_err());
     }
 
