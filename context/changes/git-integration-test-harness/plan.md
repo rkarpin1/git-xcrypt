@@ -358,9 +358,15 @@ Nie dotyczy — brak istniejących danych i brak wydanego formatu.
   globalnym `core.autocrlf=true` (zweryfikowane). Ale `-text` nie chroni przed **naszymi własnymi
   odczytami konfiguracji**: w `S-01` binarka uruchomiona jako smudge sięgnie po `~/.gitconfig`
   dewelopera, więc wynik `unlock` stanie się zależny od maszyny **z założenia projektu**, a nie
-  przez przypadek. Testy round-tripu w `S-01` będą wtedy nieodtwarzalne między maszynami, dopóki
-  harness nie zacznie przybijać tych kluczy albo izolować konfiguracji. Decyzja do ponownego
-  rozważenia przed `S-01`, nie w tym elemencie.
+  przez przypadek.
+
+  **Decyzja potwierdzona po zmianie przesłanki (2026-08-04): dziedziczenie zostaje.** Uzasadnienie
+  przemawiające za nim: testy odzwierciedlają środowisko, które użytkownik faktycznie ma, więc
+  realny błąd konfiguracji wyjdzie w teście, zamiast zostać zamaskowany. Przyjęta konsekwencja:
+  testy round-tripu w `S-01` nie są odtwarzalne między maszynami z samego harnessu. Każdy test
+  `S-01` zależny od końców linii musi więc **sam** ustawić `core.autocrlf` i `core.eol` lokalnie
+  w repozytorium testowym — inaczej jego wynik opisuje maszynę, a nie kod. Pytanie jest zamknięte;
+  nie otwierać go ponownie przy planowaniu `S-01`.
 - **`zalozenia.md` §Integracja z git zawiera nieprawdziwe zdanie** o przerywaniu operacji przy
   niezerowym kodzie filtra — jest prawdziwe wyłącznie z `required = true`. Dokument fundamentowy
   nie jest poprawiany w tym elemencie; poprawka to osobna praca przed `S-01`.
