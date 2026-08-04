@@ -578,10 +578,17 @@ Dwa przebiegi `/10x-impl-review`; pełny raport w `reviews/impl-review.md`.
 - [x] 5.3 Determinizm potwierdzony empirycznie: identyczny blob przy `core.autocrlf`
       `false`/`true`/`input`; ścieżka clean nie czyta konfiguracji gita
 - [x] 5.4 Zamrożone wektory formatu niezmienione
-- [x] 5.5 `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` (130)
+- [x] 5.5 Drugi przebieg: `looks_binary` jest portem `convert_is_binary` bajt w bajt,
+      zweryfikowanym przeciw prawdziwemu gitowi na sześciu kształtach treści
+- [x] 5.6 Reguła `text=auto` ma własne zamrożone wektory, w tym wektor przechodzący
+      przez `decide::clean` — dotąd nie miała żadnych, wbrew `zalozenia.md`
+- [x] 5.7 Ostrzeżenie „stored in the clear" tylko dla ścieżek wybranych: 301 plików
+      dawało 301 ostrzeżeń, teraz jedno
+- [x] 5.8 `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`
+      (139 testów), także w `--release`
 
 #### Ręczne
 
-- [ ] 5.6 Ścieżka spoza UTF-8 zweryfikowana na Linuksie — nie do odtworzenia na macOS
+- [ ] 5.9 Ścieżka spoza UTF-8 zweryfikowana na Linuksie — nie do odtworzenia na macOS
       (APFS wymusza UTF-8); czeka na nogę CI
-- [ ] 5.7 Scenariusz regresyjny `core.autocrlf=true` na Windows
+- [ ] 5.10 Scenariusz regresyjny `core.autocrlf=true` na Windows

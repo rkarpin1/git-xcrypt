@@ -4,9 +4,11 @@
 - **Plan**: `context/changes/transparent-encrypt-decrypt/plan.md`
 - **Zakres**: Fazy 1–4 z 4 (wszystkie ukończone)
 - **Data**: 2026-08-04
-- **Werdykt**: ODRZUCONY przy pierwszym przebiegu → ZAAKCEPTOWANY po naprawach
-- **Ustalenia**: 4 krytyczne, 9 ostrzeżeń, 8 obserwacji
-- **Przebiegi**: dwa, zgodnie z poleceniem; drugi szukał regresji po naprawach
+- **Werdykt**: ODRZUCONY po pierwszym przebiegu → ODRZUCONY po drugim → ZAAKCEPTOWANY
+- **Ustalenia**: przebieg 1 — 4 krytyczne, 9 ostrzeżeń, 8 obserwacji;
+  przebieg 2 — 1 krytyczne, 4 ostrzeżenia, 6 obserwacji
+- **Przebiegi**: dwa. Drugi nie był formalnością: znalazł błąd **wprowadzony przez
+  naprawę z pierwszego** (F14) i brak wektorów, który pozwolił mu przejść niezauważenie.
 
 ## Werdykty
 
@@ -210,6 +212,113 @@ broni cała konstrukcja catch-all i `required = true`.
 - Testy: kod wyjścia `2` jest teraz sprawdzany dosłownie (kryteria 2.3 i 2.4 asertowały samo
   `!success`), doszedł test `init` poza repozytorium git.
 
+## Drugi przebieg — regresje i to, co umknęło
+
+### F14 — `looks_binary` wciąż rozjeżdżał się z gitem, po naprawie F5
+
+- **Ważność**: ❌ KRYTYCZNE · **Lokalizacja**: `src/eol.rs:29`
+- **Szczegóły**: F5 dodało regułę samotnego `CR` i opisało funkcję jako zgodną z
+  `convert_is_binary`. Zgodna nie była — zostały dwa rozjazdy, oba przesuwające
+  realne pliki przez granicę tekst/binarny:
+  - **`DEL` (`0x7f`)** liczony jako drukowalny; git liczy go do `nonprintable`
+    mimo że jest powyżej `0x20`;
+  - **`CR` i `LF`** liczone jako drukowalne; git robi na nich `continue` i nie
+    liczy ich do żadnego kubełka, więc nasza lewa strona proporcji
+    `(printable >> 7) < nonprintable` była zawyżona.
+
+  Zmierzone na git 2.55, te same bajty do obu:
+
+  | treść | git | git-xcrypt (przed) |
+  | --- | --- | --- |
+  | `\x7f` × 200 + `x\r\n` | binarny | **tekst** |
+  | `\n` × 200 + `\x01\r\n` | binarny | **tekst** |
+
+  Skutek: oba pliki commitowane po normalizacji, a po `rm` i `git checkout --`
+  wracały o bajt krótsze — `CR` znikał na trwałe — przy czystym `git status`, więc
+  użytkownik nie dostawał żadnego sygnału. Ciche uszkodzenie pliku, który git sam
+  uznaje za binarny, wprost przeciw guardrailowi „filtr nigdy nie uszkadza pliku".
+- **Naprawa**: `looks_binary` jest teraz portem `gather_stats` + `convert_is_binary`
+  bajt w bajt. Zweryfikowane przeciw prawdziwemu gitowi na sześciu kształtach —
+  werdykty zgodne we wszystkich sześciu, pliki binarne wracają identyczne.
+- **Decyzja**: NAPRAWIONE
+
+### F15 — reguła `text=auto` zamrożona bez wektorów
+
+- **Ważność**: ⚠️ OSTRZEŻENIE · **Lokalizacja**: `tests/format_vectors.rs`
+- **Szczegóły**: `zalozenia.md` żąda dla tej reguły **własnych wektorów testowych**,
+  obok wektorów formatu. Nie istniały. Cztery zamrożone wektory wołają
+  `crypto::encrypt` z jawnymi flagami, więc są ślepe na `looks_binary` — i to jest
+  dokładny powód, dla którego naprawa F5 mogła przesunąć granicę tekst/binarny,
+  czyli wprowadzić zmianę niekompatybilną wstecz, przy zielonym całym zestawie.
+  Bez tego F14 też przeszłoby niezauważone.
+- **Naprawa**: zamrożona tabela werdyktów dla piętnastu kształtów treści plus wektor
+  przechodzący przez `decide::clean`, a nie `crypto::encrypt` — pinuje cały łańcuch:
+  dopasowanie wzorca, werdykt tekst/binarny, bit `flags`, ciphertext.
+- **Decyzja**: NAPRAWIONE
+
+### F16 — ostrzeżenie „stored in the clear" dla każdego pliku w repozytorium
+
+- **Ważność**: ⚠️ OSTRZEŻENIE · **Lokalizacja**: `src/decide.rs:164`
+- **Szczegóły**: smudge ostrzegał zawsze, gdy treść nie ma magic, nie pytając, czy
+  ścieżka jest w ogóle wybrana — a konstrukcja catch-all przepuszcza przez smudge
+  **każdy** plik. Zmierzone: checkout repozytorium z 301 plikami dawał 301 ostrzeżeń,
+  z czego **zero** dotyczyło ścieżki wybranej. Jedyny komunikat, który coś znaczy,
+  tonął w reszcie, a świeży klon witał użytkownika ścianą „whether it leaked".
+  Uzasadnienie tego ostrzeżenia w `zalozenia.md` jest wąskie: plik zacommitowany,
+  zanim wzorzec trafił do konfiguracji — czyli ścieżka **wybrana**, znaleziona jawna.
+- **Naprawa**: bramka na `Decision::encrypt`. To samo repozytorium: jedno ostrzeżenie.
+- **Decyzja**: NAPRAWIONE
+
+### F17 — bezwartościowy `core.autocrlf` czytany jako fałsz
+
+- **Ważność**: ⚠️ OSTRZEŻENIE · **Lokalizacja**: `src/gitconfig.rs:55`, `src/eol.rs:146`
+- **Szczegóły**: `[core]` z samym `autocrlf` bez wartości jest dla gita prawdą
+  (zweryfikowane). `get` to było `raw_value(key).ok()`, a gix-config nie ma surowej
+  wartości dla klucza bez wartości, więc wychodziło `None` i tabela spadała do
+  `core.eol` → `Native`. Gałąź `is_git_true("")` dodana przy F6 była martwym kodem.
+- **Naprawa**: `get` odróżnia klucz nieobecny od obecnego bez wartości i zwraca dla
+  tego drugiego `Some("")`. Samonaprawialne, więc determinizm był nienaruszony —
+  ale katalog roboczy dostawał ciche złe końce linii.
+- **Decyzja**: NAPRAWIONE
+
+### F18 — `init` nie usuwał sterownika `diff` zapisanego przez starszy build
+
+- **Ważność**: ⚠️ OSTRZEŻENIE · **Lokalizacja**: `src/commands/init.rs:119`
+- **Szczegóły**: F7 przestało *pisać* `diff.git-xcrypt.textconv`, ale nie usuwało go
+  tam, gdzie już jest. Zweryfikowane: przy obecnym kluczu `init` wypisywał „already
+  set up; nothing to do" i zostawiał klucz w `.git/config`. Kto uruchomił poprzedni
+  build, zachowywał dokładnie tę awarię, której naprawa miała zapobiec — a kontrakt
+  `init` brzmi „naprawiamy resztę".
+- **Naprawa**: `register_driver` kasuje klucze, których już nie chce; nowa
+  `gitconfig::unset`.
+- **Decyzja**: NAPRAWIONE
+
+### Obserwacje z drugiego przebiegu, naprawione
+
+- Wzorzec z końcową spacją (`!secrets/README.md\ `) był niezapisywalny: `raw.trim_end()`
+  zjadał escape, zanim `split_pattern` — jedyna funkcja, która go rozumie — zdążyła go
+  zobaczyć. To dokładne dopełnienie naprawy F1: filtr dopasowywał takie ścieżki
+  poprawnie, ale deklaracja nie umiała ich nazwać (`src/config.rs:120`).
+- Koniec strumienia w środku żądania był traktowany jak czyste zamknięcie, więc proces
+  kończył się zerem, nie odpowiedziawszy nic. `read_content` traktował ten sam warunek
+  jako błąd — dwie połówki się nie zgadzały (`src/filter.rs:173`).
+- Plaintext z weryfikującego deszyfrowania zostawał na stercie; teraz `Zeroizing`
+  (`src/decide.rs:140`).
+
+### Potwierdzone jako poprawne w drugim przebiegu
+
+Wszystkie trzynaście napraw z pierwszego przebiegu prześledzono osobno. Warte
+odnotowania, bo to były realne ryzyka:
+
+- **Determinizm nienaruszony przez `open_full`** — `autocrlf`/`core_eol` trafiają
+  wyłącznie do `decide::smudge`; `clean` nie ma na nie parametru. Zweryfikowane
+  macierzą 3 × 3 (`core.autocrlf` × `core.eol`): wszystkie dziewięć blobów identyczne.
+- **Brak zakleszczenia po `BufWriter`** — każda granica protokołu przechodzi przez
+  `write_flush`, które woła `flush()`. Zweryfikowane plikiem 64 MB i 4001 plikami.
+- **`refresh_config_if_absent` bez wady** — zero kosztu na ścieżce gorącej, brak pętli
+  ponowień, podmiana tylko gdy plik faktycznie wrócił.
+- **Nowe testy testują to, co twierdzą** — sprawdzone przeciw staremu kodowi.
+
 ## Ustalenia świadomie odrzucone
 
 - **`.git-xcrypt` jako ślad brany z katalogu roboczego, nie z HEAD** (`init.rs:89`).
@@ -223,9 +332,10 @@ broni cała konstrukcja catch-all i `required = true`.
   nie kod.
 - **Brak wektora RFC 5297 Appendix A.2** — A.2 opisuje SIV z wieloma nagłówkami AD, a my
   podajemy dokładnie jeden element. A.1 jest wektorem stosującym się do naszej konstrukcji.
-- **`0x7f` (DEL) liczony jako drukowalny** — odbiega od gita, ale reguła jest zamrożona
-  wraz z formatem, a rozbieżność nie powoduje ani utraty determinizmu, ani uszkodzenia
-  treści (w odróżnieniu od samotnego `CR`, który powodował i dlatego został naprawiony).
+- ~~**`0x7f` (DEL) liczony jako drukowalny**~~ — odrzucone w pierwszym przebiegu jako
+  „nie powoduje uszkodzenia treści". **Błędna ocena**: drugi przebieg pokazał
+  zmierzony przypadek, w którym powoduje. Patrz F14. Lekcja: „rozjazd z gitem bez
+  widocznego skutku" trzeba było zweryfikować, a nie oszacować.
 - **`gix-ignore` nieużyty** — dopasowanie stoi na `gix-glob` z jawnym przejściem po
   katalogach nadrzędnych. `gix-ignore` obsługuje stos plików ignore, którego tu nie ma;
   semantyka jest ta sama i pokryta testami.
