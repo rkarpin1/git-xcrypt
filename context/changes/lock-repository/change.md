@@ -2,7 +2,7 @@
 id: lock-repository
 title: Zamknięcie repozytorium
 roadmap_id: S-04
-status: implemented
+status: impl_reviewed
 created: 2026-08-04
 updated: 2026-08-04
 ---

@@ -36,7 +36,7 @@ Produkt rozstrzyga na podstawie wzorców ścieżek, które pliki opuszczają mas
 | S-01  | transparent-encrypt-decrypt  | commitować plik i dostać ciphertext w repo, plaintext w katalogu roboczym | F-01          | FR-001, FR-004, FR-005 | proposed |
 | S-02  | gitignore-style-config       | wskazać pliki do szyfrowania w składni `.gitignore`                      | S-01          | FR-002, FR-003         | proposed |
 | S-03  | key-export-and-unlock        | odzyskać sekrety po klonie na drugiej maszynie                           | S-01          | US-01, FR-007, FR-008  | proposed |
-| S-04  | lock-repository              | zamknąć odblokowane repozytorium z powrotem                              | S-03          | FR-009                 | proposed |
+| S-04  | lock-repository              | zamknąć odblokowane repozytorium z powrotem                              | S-03          | FR-009                 | done     |
 | S-05  | decrypted-diff               | oglądać różnice na treści jawnej                                         | S-01          | FR-006                 | proposed |
 | S-06  | encryption-status-check      | sprawdzić, co jest szyfrowane, a co powinno być                          | S-02          | FR-010                 | proposed |
 | S-07  | cross-platform-binaries      | pobrać gotową binarkę dla swojej platformy                               | S-01          | FR-011                 | proposed |
@@ -138,8 +138,8 @@ Fundament poniżej zakłada ten stan i nie tworzy ponownie niczego, co jest zgł
 - **Blockers:** —
 - **Unknowns:**
   - ~~Co chroni przed zamknięciem repozytorium bez wcześniejszego wyeksportowania klucza?~~ Rozstrzygnięte 2026-08-04: `lock` domyślnie interaktywny z potwierdzeniem `yes`, flaga `--yes` na tryb nieinteraktywny, ostrzeżenie w obu trybach z `key_id` (nigdy z kluczem), plus odmowa przy niezacommitowanych zmianach, której `--yes` nie obchodzi. Patrz `zalozenia.md` §Zarządzanie kluczami → „Zabezpieczenia `lock`". — Właściciel: użytkownik. Blokuje: nie.
-- **Risk:** jedna komenda może odciąć użytkownika od całej historii własnych sekretów. Rzadko używana ścieżka o wysokim koszcie błędu jest jednocześnie tą najsłabiej przetestowaną w praktyce — stąd zabezpieczenia są dwa i osobne, bo utrata klucza i utrata niezacommitowanych zmian to różne ryzyka.
-- **Status:** proposed
+- **Risk:** jedna komenda może odciąć użytkownika od całej historii własnych sekretów. Rzadko używana ścieżka o wysokim koszcie błędu jest jednocześnie tą najsłabiej przetestowaną w praktyce — stąd zabezpieczenia są dwa i osobne, bo utrata klucza i utrata niezacommitowanych zmian to różne ryzyka. Potwierdzone w praktyce: oba przebiegi przeglądu znalazły ścieżki kończące się usuniętym kluczem nad jawnym katalogiem roboczym, w tym dwie w podłączonych worktree — trzeci checkout czytający ten sam klucz nie był przewidziany ani w planie, ani w `zalozenia.md`.
+- **Status:** done
 
 ### S-05: Różnice na treści odszyfrowanej
 
@@ -218,7 +218,7 @@ Fundament poniżej zakłada ten stan i nie tworzy ponownie niczego, co jest zgł
 | S-01       | transparent-encrypt-decrypt  | Przezroczyste szyfrowanie w jednym repozytorium     | tak                   | F-01 zamknięty, obie niewiadome rozstrzygnięte 2026-08-04. Uruchom `/10x-plan transparent-encrypt-decrypt` |
 | S-02       | gitignore-style-config       | Konfiguracja w składni .gitignore                   | nie                   | Czeka na S-01; wszystkie trzy niewiadome rozstrzygnięte 2026-08-04 |
 | S-03       | key-export-and-unlock        | Eksport klucza i odblokowanie po klonie             | nie                   | Czeka na S-01                               |
-| S-04       | lock-repository              | Zamknięcie repozytorium                             | nie                   | Czeka na S-03; zabezpieczenia rozstrzygnięte 2026-08-04 |
+| S-04       | lock-repository              | Zamknięcie repozytorium                             | zrobione              | Zaimplementowane i przejrzane dwukrotnie 2026-08-04 |
 | S-05       | decrypted-diff               | Różnice na treści odszyfrowanej                     | nie                   | Czeka na S-01                               |
 | S-06       | encryption-status-check      | Widoczność stanu szyfrowania                        | nie                   | Czeka na S-02; głębokość rozstrzygnięta 2026-08-04 |
 | S-07       | cross-platform-binaries      | Binarki dla Windows, macOS i Linuksa                | nie                   | Czeka na S-01; nazwa i licencja rozstrzygnięte |
