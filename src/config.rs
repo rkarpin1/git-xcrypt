@@ -257,12 +257,15 @@ pub fn is_never_encrypted(path: &[u8]) -> bool {
     // to read the attributes for that whole subtree. `.git-xcrypt` is read only
     // from the root, so there the root path is the right test.
     let basename = path.rsplit_str("/").next().unwrap_or(path);
-    let envelope_prefix = format!("{KEY_ENVELOPE_DIR}/");
 
+    // No `format!` here: this runs once per file in the repository, and the
+    // allocation bought nothing that `strip_prefix` does not.
     basename == ATTRIBUTES_FILE.as_bytes()
         || path == CONFIG_FILE.as_bytes()
         || path == KEY_ENVELOPE_DIR.as_bytes()
-        || path.starts_with(envelope_prefix.as_bytes())
+        || path
+            .strip_prefix(KEY_ENVELOPE_DIR.as_bytes())
+            .is_some_and(|rest| rest.starts_with(b"/"))
 }
 
 /// Splits a line into its pattern and its attributes.
