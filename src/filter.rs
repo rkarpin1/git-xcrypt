@@ -40,14 +40,17 @@ pub struct Context {
     /// What [`crate::history::HeadLookup::open`] needs, kept so it can be built
     /// later.
     location: Option<Location>,
-    /// Paths already warned about in this process.
+    /// What the `HEAD` lookup answered for each path this process has seen.
     ///
-    /// One process serves one git operation, and git cleans the same file
-    /// several times within one: measured on git 2.55, a single `git status`
-    /// filtered one path four times, so the un-deduplicated warning arrived four
-    /// times over. Four copies of a message teach a reader to skip it, which is
-    /// the opposite of what this one is for.
-    warned: std::collections::HashSet<Vec<u8>>,
+    /// Both answers are kept, and the negative one matters more. One process
+    /// serves one git operation and git cleans the same file several times
+    /// within one — measured on git 2.55, a single `git status` filtered one
+    /// path four times. Remembering only the positive answer would fix the
+    /// duplicated warning and leave the *healthy* repository, where the answer
+    /// is always `false`, decompressing that path's `HEAD` blob in full on every
+    /// one of those four calls, for ever. So `true` suppresses the repeat
+    /// message and `false` suppresses the repeat work.
+    answered: std::collections::HashMap<Vec<u8>, bool>,
 }
 
 /// Where this repository's objects and references live.
@@ -100,17 +103,23 @@ impl Context {
                     crate::gitconfig::get(&git_config, "extensions.objectformat").as_deref(),
                 ),
             }),
-            warned: std::collections::HashSet::new(),
+            answered: std::collections::HashMap::new(),
         })
     }
 
-    /// Whether `HEAD` already holds `path` in the clear.
+    /// Whether `path` needs the "already in `HEAD` in the clear" warning.
     ///
     /// Built on first use and kept for the rest of the process, which is what the
     /// long-running protocol makes worth doing: one `git add -A` asks this once
     /// per newly encrypted file, over the same trees.
+    ///
+    /// **A path already answered gets `false`, whatever the answer was.** Both
+    /// halves of that are deliberate: a repeat `true` would print the same
+    /// message a second time in the same git operation, and a repeat `false`
+    /// would re-walk the trees and decompress the `HEAD` blob again to reach the
+    /// same conclusion.
     fn head_holds_in_the_clear(&mut self, path: &[u8]) -> bool {
-        if self.warned.contains(path) {
+        if self.answered.contains_key(path) {
             return false;
         }
         if self.head.is_none() {
@@ -128,9 +137,7 @@ impl Context {
             .as_mut()
             .and_then(Option::as_mut)
             .is_some_and(|head| head.holds_in_the_clear(path));
-        if found {
-            self.warned.insert(path.to_vec());
-        }
+        self.answered.insert(path.to_vec(), found);
         found
     }
 
@@ -371,7 +378,7 @@ mod tests {
             // answers `false` and the protocol is exercised on its own.
             head: Some(None),
             location: None,
-            warned: std::collections::HashSet::new(),
+            answered: std::collections::HashMap::new(),
         }
     }
 
@@ -462,7 +469,7 @@ mod tests {
             // answers `false` and the protocol is exercised on its own.
             head: Some(None),
             location: None,
-            warned: std::collections::HashSet::new(),
+            answered: std::collections::HashMap::new(),
         };
 
         let mut reply = Vec::new();

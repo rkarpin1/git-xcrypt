@@ -26,13 +26,31 @@
 //! missing object is broken in a way this command did not cause and cannot fix,
 //! and refusing outright would withhold the findings from every object that
 //! *did* read. Such objects are counted and reported, so "nothing found" and
-//! "nothing found in what I could read" never look the same.
+//! "nothing found in what I could read" never look the same. A **reference**
+//! that will not resolve is counted separately and weighs more, because it is a
+//! whole branch unvisited rather than one file unjudged.
+//!
+//! Known limits, recorded rather than hidden:
+//!
+//! * **The walk state is unbounded.** `seen_trees` holds one entry per
+//!   `(tree, path)` pair over all reachable history, with the path cloned. It is
+//!   comfortable for ordinary repositories and there is no cap, no progress
+//!   output and no way to interrupt it part way. If that ever bites, interning
+//!   the path prefixes and keying on `(ObjectId, usize)` cuts the dominant term.
+//! * **A path mid-merge is invisible to the index half** of `status`, which
+//!   reads stage 0 only. The history scan still sees the conflicting blobs,
+//!   because they come from commits; what is missing is a statement about what
+//!   the *next* commit would store, which is genuinely undecided until the merge
+//!   is resolved.
+//! * **[`HeadLookup`] resolves `HEAD` once per filter process.** A long-running
+//!   filter outlives a `git rebase` that moves it, so the warning can be judged
+//!   against the tree `HEAD` had at startup. It is advisory either way.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use gix_hash::ObjectId;
-use gix_object::{Find as _, FindExt as _};
+use gix_object::{Find as _, FindExt as _, FindHeader as _};
 use gix_ref::file::ReferenceExt as _;
 
 use crate::config::Config;
@@ -77,6 +95,19 @@ pub struct Scan {
     /// report means: a scan that skipped something has not proved anything about
     /// it, and must not be summarised as though it had.
     pub unreadable: usize,
+    /// References the walk could not start from.
+    ///
+    /// Counted apart from the objects for the same reason and a sharper one: a
+    /// reference store that cannot be read at all yields **no tips**, so the
+    /// scan visits nothing and finds nothing. Measured on the build before this
+    /// existed — `chmod 000 .git/packed-refs` and a removed loose branch left
+    /// `status` reporting a repository with a plaintext blob in its history as
+    /// clean, exit code 0. A warning on `stderr` is not enough: a CI gate reads
+    /// the code.
+    pub unresolved_refs: usize,
+    /// The reference store could not be enumerated at all, so nothing here
+    /// covers anything.
+    pub refs_unavailable: bool,
     /// Anything worth saying once, carried out so the binary owns the messages.
     pub warnings: Vec<String>,
 }
@@ -368,7 +399,7 @@ fn tips(
     git_dir: &Path,
     common_dir: &Path,
     hash: gix_hash::Kind,
-    objects: &dyn gix_object::Find,
+    objects: &gix_odb::Handle,
     scan: &mut Scan,
 ) -> Vec<ObjectId> {
     let options = gix_ref::store::init::Options {
@@ -403,10 +434,27 @@ fn tips(
             return;
         }
         match reference.peel_to_id(&store, objects) {
-            Ok(id) => tips.push(id),
-            Err(err) => scan.warnings.push(format!(
-                "{name}: not scanned, it could not be resolved ({err})"
-            )),
+            // A tag on a blob or a tree is a real thing — git.git carries
+            // `junio-gpg-pub` — and it names no history at all. Queuing it would
+            // make the commit walk fail to read a "commit" that was never one,
+            // which counted as an unreadable object and turned a healthy
+            // repository into a permanently red gate advising `git fsck`, which
+            // would then report nothing wrong.
+            Ok(id) => match objects.try_header(&id) {
+                Ok(Some(header)) if header.kind == gix_object::Kind::Commit => tips.push(id),
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => {
+                    scan.unresolved_refs += 1;
+                    scan.warnings
+                        .push(format!("{name}: not scanned, {id} could not be read"));
+                }
+            },
+            Err(err) => {
+                scan.unresolved_refs += 1;
+                scan.warnings.push(format!(
+                    "{name}: not scanned, it could not be resolved ({err})"
+                ));
+            }
         }
     };
 
@@ -416,19 +464,25 @@ fn tips(
                 for reference in references {
                     match reference {
                         Ok(reference) => push(reference, scan),
-                        Err(err) => scan
-                            .warnings
-                            .push(format!("a reference could not be read ({err})")),
+                        Err(err) => {
+                            scan.unresolved_refs += 1;
+                            scan.warnings
+                                .push(format!("a reference could not be read ({err})"));
+                        }
                     }
                 }
             }
-            Err(err) => scan
-                .warnings
-                .push(format!("the references could not be listed ({err})")),
+            Err(err) => {
+                scan.refs_unavailable = true;
+                scan.warnings
+                    .push(format!("the references could not be listed ({err})"));
+            }
         },
-        Err(err) => scan
-            .warnings
-            .push(format!("packed-refs could not be read ({err})")),
+        Err(err) => {
+            scan.refs_unavailable = true;
+            scan.warnings
+                .push(format!("packed-refs could not be read ({err})"));
+        }
     }
 
     // `HEAD` is a pseudo-reference and is not part of `all()`. On a detached
@@ -438,9 +492,11 @@ fn tips(
         Ok(Some(head)) => push(head, scan),
         // An unborn branch: a fresh repository with no commit yet.
         Ok(None) => {}
-        Err(err) => scan
-            .warnings
-            .push(format!("HEAD could not be read ({err})")),
+        Err(err) => {
+            scan.refs_unavailable = true;
+            scan.warnings
+                .push(format!("HEAD could not be read ({err})"));
+        }
     }
 
     tips.sort();
@@ -548,9 +604,13 @@ fn is_clear(objects: &gix_odb::Handle, id: &ObjectId, scan: &mut Scan) -> Option
 }
 
 /// Records an object the scan could not judge.
+///
+/// The budget counts the messages this function has produced, not the whole
+/// warning list: sharing it with the per-reference messages meant five bad refs
+/// left every unreadable object unnamed, counted but never identified.
 fn note_unreadable(scan: &mut Scan, id: &ObjectId, why: &str) {
     scan.unreadable += 1;
-    if scan.warnings.len() < MAX_UNREADABLE_WARNINGS {
+    if scan.unreadable <= MAX_UNREADABLE_WARNINGS {
         scan.warnings.push(format!("{id}: not scanned, {why}"));
     }
 }

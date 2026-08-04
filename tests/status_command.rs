@@ -417,21 +417,33 @@ fn fix_leaves_the_working_tree_readable() {
 }
 
 #[test]
-fn fix_without_a_key_refuses_rather_than_pretending() {
+fn fix_without_a_key_says_so_without_throwing_the_report_away() {
     // A locked repository, reached the only way this state is reachable here:
     // `lock` itself refuses over a file stored in the clear, which is the very
     // state under test.
+    //
+    // The repair needs a key; the diagnosis does not. Propagating the missing
+    // key as an error would leave a user who typed one flag too many with less
+    // information than if they had not typed it at all.
     let repo = leaked_before_the_declaration();
     std::fs::remove_file(repo.path().join(".git/git-xcrypt/keys/default")).expect("removing");
 
     let output = repo.xcrypt(["status", "--fix"]);
+    let text = report(&output);
 
     assert_eq!(
         output.status.code(),
-        Some(3),
-        "a missing key has its own code:\n{}",
+        Some(EXPOSED),
+        "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(text.contains("--fix needs the repository key"), "{text}");
+    assert!(text.contains("unlock"), "{text}");
+    assert!(
+        text.contains("leaked in history"),
+        "the diagnosis was thrown away with the repair:\n{text}"
+    );
+    assert!(!text.contains("fixed:"), "nothing was fixed:\n{text}");
 }
 
 #[test]
@@ -659,4 +671,93 @@ fn a_declaration_added_later_does_not_reach_an_untouched_file_and_status_says_so
             .starts_with(b"\0GITXCRYPT\0"),
         "--fix did not repair what git's shortcut left behind"
     );
+}
+
+#[test]
+fn a_tracked_symlink_is_left_alone_by_fix() {
+    // Measured on the build that read index entries without their mode: a
+    // symlink's blob is its target string, which carries no magic, so it was
+    // reported "in the clear"; `--fix` then followed the link with `fs::read`,
+    // encrypted the file it pointed at — one no pattern selected — and left the
+    // entry at mode 120000 with ciphertext behind it. A clone got a symlink
+    // whose target was the first NUL of that ciphertext.
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.write_file("target.txt", b"NOT DECLARED\n");
+    std::fs::create_dir_all(repo.path().join("secrets")).expect("directories");
+    std::os::unix::fs::symlink("../target.txt", repo.path().join("secrets/link.env"))
+        .expect("symlink");
+    repo.commit_all("a link");
+
+    let before = repo.blob_bytes("secrets/link.env");
+    let output = repo.xcrypt(["status", "--fix"]);
+    let text = report(&output);
+
+    assert!(!text.contains("link.env"), "a symlink was judged:\n{text}");
+    assert_eq!(
+        repo.blob_bytes("secrets/link.env"),
+        before,
+        "the symlink was rewritten"
+    );
+    assert_eq!(before, b"../target.txt", "the blob is the link target");
+    repo.assert_status_clean();
+}
+
+#[test]
+fn references_that_cannot_be_read_fail_the_gate_instead_of_reading_as_clean() {
+    // A store that cannot be enumerated yields no tips, so the walk visits
+    // nothing and finds nothing. Measured before this: a repository with a
+    // plaintext blob in its history reported clean and exited 0, with only a
+    // line on stderr — and a CI gate reads the exit code.
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("# nothing declared yet\n");
+    repo.write_file("secrets/db.env", b"hunter2\n");
+    repo.commit_all("leak");
+    repo.write_xcrypt_config("secrets/\n");
+    repo.git_ok(["pack-refs", "--all"]);
+
+    // Unreadable rather than absent: absent is an ordinary, honest state.
+    let packed = repo.path().join(".git/packed-refs");
+    let mut permissions = std::fs::metadata(&packed).expect("metadata").permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o000);
+    std::fs::set_permissions(&packed, permissions).expect("chmod");
+
+    let output = repo.xcrypt(["status"]);
+
+    let mut restore = std::fs::metadata(&packed).expect("metadata").permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut restore, 0o644);
+    std::fs::set_permissions(&packed, restore).expect("chmod");
+
+    let text = report(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(EXPOSED),
+        "an unscannable repository reported clean:\n{text}"
+    );
+    assert!(text.contains("undetermined"), "{text}");
+}
+
+#[test]
+fn a_tag_on_something_that_is_not_a_commit_does_not_fail_the_gate() {
+    // `junio-gpg-pub` in git.git is a tag on a blob. Queuing it as a commit made
+    // the walk fail to read a "commit" that never was one, which counted as an
+    // unreadable object — a permanently red gate advising `git fsck`, which
+    // would then report nothing wrong.
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.write_file("secrets/db.env", b"hunter2\n");
+    repo.commit_all("secret");
+
+    let hashed = repo.git_with_stdin(["hash-object", "-w", "--stdin"], b"a public key\n");
+    let blob = String::from_utf8(hashed.stdout).expect("a hash");
+    repo.git_ok(["tag", "keyring", blob.trim()]);
+
+    let output = repo.xcrypt(["status"]);
+    let text = report(&output);
+
+    assert_eq!(output.status.code(), Some(0), "{text}");
+    assert!(!text.contains("undetermined"), "{text}");
 }

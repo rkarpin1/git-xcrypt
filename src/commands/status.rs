@@ -477,6 +477,24 @@ pub fn run(repo: &Repo, fix: bool) -> Result<Report> {
             scan.unreadable
         ));
     }
+    // A reference the walk could not start from is not one skipped object — it
+    // is a whole branch's history unvisited, and if the store as a whole cannot
+    // be enumerated the scan visited nothing at all and found nothing for that
+    // reason alone. Measured before this: `chmod 000 .git/packed-refs` left a
+    // repository with a plaintext blob in its history reporting clean, exit 0.
+    if scan.refs_unavailable {
+        report.undetermined.push(
+            "this repository's references could not be listed, so no history was \
+             scanned at all. Nothing above says anything about what is in it."
+                .into(),
+        );
+    } else if scan.unresolved_refs > 0 {
+        report.undetermined.push(format!(
+            "{} reference(s) could not be resolved, so whatever is reachable only \
+             through them was not scanned.",
+            scan.unresolved_refs
+        ));
+    }
     report.leaked = scan.exposed;
 
     Ok(report)
@@ -512,7 +530,18 @@ fn inspect_index(
         }
     };
 
-    for (name, id) in entries {
+    for entry in entries {
+        // A symbolic link and a submodule gitlink are not file content, so git
+        // never filters them and no declaration could have applied. Measured on
+        // the build that skipped this check: a tracked symlink read as "in the
+        // clear", `--fix` followed it, encrypted the file it pointed at — one
+        // no pattern selected — and left a symlink whose target was the first
+        // NUL of a ciphertext. `history::walk_tree` had the check all along.
+        if !entry.is_regular_file() {
+            continue;
+        }
+        let gitindex::Tracked { path: name, id, .. } = entry;
+
         if declarations.negated(&name) {
             report.by_choice.push(name);
             continue;
@@ -559,6 +588,11 @@ fn inspect_index(
 ///
 /// A path whose working-tree file is gone is left alone: there is nothing to
 /// clean, and inventing content for it would be worse than saying so.
+///
+/// The blob is written before the index is locked, so a run that then finds the
+/// lock held — or an index it will not patch — leaves an unreferenced ciphertext
+/// object behind. Harmless, and `git gc` collects it; worth knowing only because
+/// "nothing was re-staged" does not mean "nothing was written".
 fn restage(
     repo: &Repo,
     declarations: &Config,
@@ -569,9 +603,24 @@ fn restage(
         return Ok(());
     }
 
-    // Asked for only now, and reported as its own exit code: `--fix` re-encrypts,
-    // which is the one thing in this command that cannot be done without a key.
-    let key = repo.load_key()?;
+    // A missing key stops the repair, not the report. `--fix` is the one part of
+    // this command that needs a key, and propagating the error here would throw
+    // away the setup findings and the whole history scan — leaving a user who
+    // typed one flag too many with less information than if they had not.
+    let key = match repo.load_key() {
+        Ok(key) => key,
+        Err(crate::Error::NoKey) => {
+            report.undetermined.push(format!(
+                "--fix needs the repository key in order to re-encrypt, and there \
+                 is none here, so nothing was re-staged. Run \
+                 `git-xcrypt unlock <key-file>` first. The {} path(s) below are \
+                 still stored in the clear.",
+                report.in_the_clear.len()
+            ));
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    };
     let loose = gix_odb::loose::Store::at(
         repo.common_dir().join("objects"),
         gix_odb::loose::Options {

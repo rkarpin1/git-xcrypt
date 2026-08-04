@@ -422,11 +422,42 @@ pub fn staged_ids(index_path: &Path, hash: gix_hash::Kind, paths: &[Vec<u8>]) ->
 /// build cannot parse is not evidence that nothing is tracked.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Listed {
-    /// Path and object id of every stage-0 entry, in the order the index stores
-    /// them.
-    Read(Vec<(Vec<u8>, Vec<u8>)>),
+    /// Every stage-0 entry, in the order the index stores them.
+    Read(Vec<Tracked>),
     /// The index could not be read, and why.
     Unavailable(String),
+}
+
+/// One tracked path, as the index records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tracked {
+    /// The path, spelled exactly as the index spells it.
+    pub path: Vec<u8>,
+    /// Object id of its cleaned content.
+    pub id: Vec<u8>,
+    /// The entry mode: `0o100644`, `0o100755`, `0o120000` for a symbolic link,
+    /// `0o160000` for a submodule.
+    ///
+    /// Carried rather than dropped, and the reason is not tidiness. Measured on
+    /// the build before it was: `status --fix` read a tracked **symlink** as
+    /// ordinary content — a symlink's blob is its target string, which carries
+    /// no magic — followed it with `fs::read`, encrypted whatever it pointed at
+    /// and repointed the entry, leaving the mode at `0o120000`. The next clone
+    /// got a symlink whose target was the first NUL of a ciphertext, and the
+    /// plaintext of a file no pattern declared was now a blob in the object
+    /// database. The history scan had the check all along and the two disagreed.
+    pub mode: u32,
+}
+
+impl Tracked {
+    /// Whether this entry is a regular file, the only kind git filters.
+    ///
+    /// A symbolic link and a submodule gitlink both hold something that is not
+    /// file content, so no declaration could ever have applied to them.
+    #[must_use]
+    pub fn is_regular_file(&self) -> bool {
+        self.mode & 0o170_000 == 0o100_000
+    }
 }
 
 /// Lists what the index records, without being told the paths in advance.
@@ -465,7 +496,11 @@ pub fn list(index_path: &Path, hash: gix_hash::Kind) -> Result<Listed> {
             // content, and reporting whichever side came last as "what this
             // repository stores" would be a guess presented as a fact.
             if entry.stage == 0 {
-                entries.push((entry.name.to_vec(), entry.id.to_vec()));
+                entries.push(Tracked {
+                    path: entry.name.to_vec(),
+                    id: entry.id.to_vec(),
+                    mode: entry.mode,
+                });
             }
         },
     );
@@ -612,7 +647,14 @@ struct Entry<'a> {
     id: &'a [u8],
     /// Merge stage; anything but 0 is an unresolved conflict.
     stage: u8,
+    /// The entry mode, which says whether this is a file at all.
+    mode: u32,
 }
+
+/// Offset of the `mode` field from the start of an entry.
+///
+/// After `ctime` (8), `mtime` (8), `dev` (4) and `ino` (4).
+const MODE_FIELD: usize = 24;
 
 /// Finds the entries the caller asked about, if the whole index parses.
 ///
@@ -731,6 +773,12 @@ fn walk(
             name: &name,
             id: &body[start + ID_FIELD..flags_at],
             stage,
+            mode: u32::from_be_bytes([
+                body[start + MODE_FIELD],
+                body[start + MODE_FIELD + 1],
+                body[start + MODE_FIELD + 2],
+                body[start + MODE_FIELD + 3],
+            ]),
         });
         previous = name;
     }
