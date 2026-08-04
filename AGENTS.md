@@ -1,6 +1,6 @@
 # Repository Guidelines
 
-`git-crypt` is a Rust CLI that transparently encrypts selected files on commit and decrypts them on checkout. `src/main.rs` is still hello world; the decisions live under `context/foundation/`.
+`git-crypt` is a Rust CLI that transparently encrypts selected files on commit and decrypts them on checkout. The crate is split into `src/lib.rs` (logic) and a thin `src/main.rs` (arguments, exit codes). No real command exists yet: the only mode is the hidden `__test-filter`, a byte-reversing placeholder that gives the integration harness something git can run — S-01 replaces it with the real cipher and must remove it. The decisions live under `context/foundation/`.
 
 ## Hard rules
 
@@ -8,7 +8,8 @@
 - **Never commit a key or a secret.** Not to the working tree, a commit, or `stdout` outside an explicit `export-key`. Tests and examples included.
 - **Encryption must be deterministic.** Same plaintext and key, same ciphertext, or git reports unchanged files as modified.
 - **Zero `unsafe`; crypto from audited crates only.**
-- **An error aborts the operation.** Never pass content through silently.
+- **An error aborts the operation — but only with `filter.git-crypt.required = true`.** Without that flag git ignores a non-zero filter exit: `git add` returns 0 and the plaintext reaches the object database. `init` must set it; two tests in `tests/filter_edge_cases.rs` guard it. Never pass content through silently.
+- **The clean path never reads git's EOL config; the smudge path does.** Encrypted paths carry `-text`, so git-crypt owns the LF/CRLF conversion. Normalizing to LF before encryption must be identical on every machine, or the same file yields different ciphertext on Windows and Linux.
 
 Why each rule, plus the file format and threat model: @context/foundation/zalozenia.md
 
@@ -23,6 +24,8 @@ English for code, comments, identifiers, commit messages, PR descriptions, and f
 - `context/changes/<id>/` — per-change plan, research, review. Never in `foundation/`.
 
 Read the PRD's `## Open Questions` first — item 1 is blocking. Pick work from the roadmap's `## Backlog Handoff`.
+
+When asked "co dalej?" (what's next), answer with a lettered list — `a.`, `b.`, `c.`, … — one option per item, so the user can pick by letter.
 
 ## Conventions
 

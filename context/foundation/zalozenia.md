@@ -86,9 +86,46 @@ Przyjęte rozwiązanie:
 - Mechanizm: filtry `clean` / `smudge` / `diff` zarejestrowane w `.git/config`, aktywowane wpisami `filter=git-crypt diff=git-crypt` w `.gitattributes`.
 - **Twarda reguła: na ścieżce clean/smudge nic poza danymi nie może trafić na `stdout`.** Żadnych `println!`, logów, pasków postępu. Diagnostyka wyłącznie na `stderr`. Naruszenie tej reguły cicho uszkadza pliki użytkownika.
 - Filtr musi być odporny na wielokrotne uruchomienie: szyfrowanie już zaszyfrowanej treści i deszyfrowanie plaintextu to przypadki do wykrycia i obsłużenia (idempotencja po nagłówku).
-- Kody wyjścia: `0` sukces, niezerowe kody rozróżniające „brak klucza", „zły format", „błąd konfiguracji". Git przerywa operację przy niezerowym kodzie filtra — to zamierzone zabezpieczenie.
-- `.gitattributes` dla plików szyfrowanych musi zawierać `-text`, żeby `core.autocrlf` na Windows nie modyfikował ciphertextu.
+- Kody wyjścia: `0` sukces, niezerowe kody rozróżniające „brak klucza", „zły format", „błąd konfiguracji".
+- **Twarda reguła: filtr rejestrujemy z `filter.git-crypt.required = true`.** Wbrew intuicji sam niezerowy kod filtra **nie** przerywa operacji gita. Zmierzone na git 2.55 (repozytorium tymczasowe, nie na tym projekcie): bez tej flagi filtr `clean` kończący się kodem `3` daje `git add` **kod wyjścia 0**, git traktuje awarię jako nieszkodliwą i przepuszcza treść bez zmian — do indeksu i do bazy obiektów trafia **plaintext**, a użytkownik widzi tylko `error:` w szumie i udany commit. Z flagą: `fatal: <plik>: clean filter 'git-crypt' failed`, plik nie wchodzi do indeksu, żaden obiekt nie powstaje. Zabezpieczenie „błąd przerywa operację" jest więc własnością tej flagi, a nie samego gita — jej ustawienie należy do `init` i jest warunkiem gwarantki z PRD §Guardrails, nie detalem konfiguracji. Regresji pilnują dwa testy w `tests/filter_edge_cases.rs`; usunięcie flagi z harnessu wywala oba.
+- `.gitattributes` dla plików szyfrowanych musi zawierać `-text`, żeby `core.autocrlf` na Windows nie modyfikował ciphertextu — patrz „Końce linii (LF/CRLF)", gdzie opisany jest zmierzony mechanizm i jego konsekwencje.
 - Znane ograniczenia do udokumentowania: `git archive` eksportuje treść zaszyfrowaną (filtry nie są stosowane); submoduły mają własną konfigurację i wymagają osobnej inicjacji.
+
+# Końce linii (LF/CRLF)
+
+Ustalenia z 2026-08-04, oparte na pomiarach na git 2.55 (repozytorium tymczasowe, nie na tym projekcie).
+
+**Kolejność, w jakiej git składa filtr z konwersją EOL** — to jest fakt, na którym wisi cała reszta:
+
+- checkin: katalog roboczy → **clean** → `CRLF→LF` → blob
+- checkout: blob → `LF→CRLF` → **smudge** → katalog roboczy
+
+Filtr zawsze widzi bajty od strony katalogu roboczego, a git swoją konwersję wykonuje **na wyniku filtra**, czyli na ciphertexcie. Wniosek: git nie może przeprowadzić konwersji dla plików szyfrowanych w żadnym ustawieniu — zawsze trafiłby w ciphertext, nie w plaintext. Dlatego `-text` na ścieżkach szyfrowanych jest wymogiem, a nie ostrożnością.
+
+**`-text` wygrywa z `eol`.** Zmierzone: blob trzymający CRLF, `core.autocrlf=true`, atrybut `-text eol=lf` → w katalogu roboczym nadal CRLF, git nie zmienia ani bajta. Skoro na naszych ścieżkach wymuszamy `-text`, użytkownik **nie ma sposobu**, żeby środkami gita oznaczyć plik szyfrowany jako „tylko LF" — atrybut `eol=lf`, którym repozytoria trzymają np. skrypty powłoki, jest niedostępny dokładnie na tych plikach, na których byłby potrzebny.
+
+**Konwersję przejmuje git-crypt, ale asymetrycznie:**
+
+- **clean (przed szyfrowaniem) nie czyta konfiguracji gita.** Zawsze `CRLF→LF` dla plików zadeklarowanych jako tekst, identycznie na każdej maszynie. Gdyby czytał `core.autocrlf`, ten sam plik dałby na Windows inny plaintext niż na Linuksie, więc inny ciphertext, więc inny blob — i determinizm pada.
+- **smudge (po odszyfrowaniu) czyta konfigurację gita.** To jedyny moment, w którym różnice między maszynami są dozwolone i pożądane. Potrzebne klucze: `core.autocrlf`, `core.eol`, plus platforma dla wartości `native`.
+
+Reguła do odtworzenia na wyjściu smudge (zmierzona, przy ustawionym `text`):
+
+| `core.autocrlf` | `core.eol` | wynik w katalogu roboczym          |
+| --------------- | ---------- | ---------------------------------- |
+| `true`          | dowolne    | CRLF (`core.eol` ignorowany)       |
+| `input`         | dowolne    | LF (`core.eol` ignorowany)         |
+| `false`         | `crlf`     | CRLF                               |
+| `false`         | `lf`       | LF                                 |
+| `false`         | `native`   | platforma (LF/macOS, CRLF/Windows) |
+
+Niezmiennik, który spina asymetrię: na Windows z `autocrlf=true` smudge zapisuje CRLF, w katalogu roboczym leży CRLF, a następny clean normalizuje z powrotem do LF → ten sam ciphertext co przed checkoutem → `git status` czysty. To ten sam model, którym git obsługuje indeks, przesunięty o jeden krok, przed AEAD.
+
+**Deklaracja trybu należy do `.git-crypt`, nie do gita.** Skoro `-text` odbiera użytkownikowi atrybuty `text`/`eol` na plikach szyfrowanych, `.git-crypt` musi przejąć tę samą semantykę per wzorzec: `text`, `-text`, `eol=lf`, `eol=crlf` oraz zachowanie domyślne przy braku deklaracji. Nie wymyślamy własnego modelu — odtwarzamy ten, który użytkownik zna z `.gitattributes`, z tą różnicą, że `eol=*` działa u nas na wyjściu smudge, a nie w gicie. Deklaracja jest wersjonowana, więc jest jednakowa na wszystkich maszynach — i to jest warunek, pod którym powyższy niezmiennik trzyma.
+
+**Konfigurację czytamy biblioteką, nie procesem potomnym.** `gix-config` (gitoxide) daje pełną precedencję system/global/repo/worktree wraz z `include`/`includeIf`, kompiluje się do środka binarki i nie łamie wymogu samowystarczalności z „Założeń technicznych". Wywoływanie `git config` odpada: git uruchamia nowy proces filtra na każdy plik, więc byłoby to N spawnów na ścieżce gorącej, najdroższych akurat na Windows. Pozostaje jedna binarka `git-crypt` w kilku trybach (`clean`, `smudge`, `diff` rejestrowane przez `init`; reszta wywoływana przez użytkownika); żadnego osobnego programu pomocniczego ani demona.
+
+**Świadomie przyjęte ograniczenie:** plik o mieszanych końcach linii nie przetrwa round-tripu — normalizacja jest stratna, więc po `unlock` taki plik wróci inny niż był i `git status` pokaże zmianę. Git broni się przed tym przez `core.safecrlf`; czy odtwarzamy to ostrzeżenie, jest otwarte.
 
 # Bezpieczeństwo i świadome ograniczenia
 
@@ -136,3 +173,5 @@ Projekt uznajemy za działający, gdy poniższy scenariusz przechodzi automatycz
 4. Nazwa pliku konfiguracyjnego: `.git-crypt` (kolizja z ewentualnym katalogiem na koperty kluczy) czy `.gitcrypt` / `.git-crypt-attributes`.
 5. Próg rozmiaru pliku, powyżej którego przechodzimy na buforowanie dyskowe zamiast RAM.
 6. Które komendy z oryginału poza listą MVP faktycznie chcemy odtworzyć.
+7. **Zachowanie domyślne przy braku deklaracji EOL w `.git-crypt`**: traktować plik jako binarny (żadnej konwersji, bezpieczne) czy jako `text=auto` z heurystyką gita (NUL w pierwszych 8000 bajtach)? Heurystyka nie łamie determinizmu — ta sama treść daje tę samą decyzję — ale jest cicha: dopisanie bajtu zerowego przełącza tryb i zmienia cały ciphertext. Patrz „Końce linii (LF/CRLF)".
+8. **Czy odtwarzamy ostrzeżenie `core.safecrlf`** dla plików o mieszanych końcach linii, które nie przetrwają round-tripu.
