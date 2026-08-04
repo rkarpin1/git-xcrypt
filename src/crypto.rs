@@ -1,0 +1,233 @@
+//! Encryption and decryption — the one pair of functions every path shares.
+//!
+//! AES-256-SIV (RFC 5297) is a deterministic AEAD: the synthetic IV is computed
+//! from the content, so identical plaintext under identical key yields byte
+//! identical ciphertext. That is not a workaround, it is the construction, and
+//! it is what keeps `git status` quiet on an unchanged file.
+
+use aes_siv::KeyInit;
+use aes_siv::siv::Aes256Siv;
+
+use crate::format::{Header, KEY_ID_LEN, SUITE_AES_256_SIV};
+use crate::key::MasterKey;
+use crate::{Error, Result};
+
+/// Encrypts `plaintext`, recording `flags` in the authenticated header.
+///
+/// The returned blob is `header || synthetic IV || ciphertext`. The header goes
+/// in as associated data, so flipping the suite or flag byte invalidates the
+/// tag instead of quietly changing how the file is read.
+///
+/// # Errors
+///
+/// [`Error::Crypto`] if the cipher refuses the input, which for a single
+/// associated-data item cannot happen in practice.
+pub fn encrypt(key: &MasterKey, flags: u8, plaintext: &[u8]) -> Result<Vec<u8>> {
+    let header = Header::new(flags, key.key_id()).to_bytes();
+    let suite_key = key.suite_key(SUITE_AES_256_SIV)?;
+
+    let mut cipher = Aes256Siv::new(suite_key.expose_bytes().as_slice().into());
+    let sealed = cipher
+        .encrypt([header.as_slice()], plaintext)
+        .map_err(|_| Error::Crypto("encryption failed".into()))?;
+
+    let mut blob = Vec::with_capacity(header.len() + sealed.len());
+    blob.extend_from_slice(&header);
+    blob.extend_from_slice(&sealed);
+    Ok(blob)
+}
+
+/// Decrypts a blob produced by [`encrypt`], returning its flags and plaintext.
+///
+/// # Errors
+///
+/// [`Error::Format`] for anything the header rejects, [`Error::KeyMismatch`]
+/// when the file belongs to a different key, and [`Error::Crypto`] when the
+/// authentication tag does not verify. A failed tag is an error, never a
+/// warning: passing the bytes through would hand the caller content nobody
+/// vouched for.
+pub fn decrypt(key: &MasterKey, blob: &[u8]) -> Result<(u8, Vec<u8>)> {
+    let header = Header::parse(blob)?;
+    let our_key_id = key.key_id();
+    if header.key_id != our_key_id {
+        return Err(Error::KeyMismatch {
+            wanted: header.key_id,
+            have: our_key_id,
+        });
+    }
+
+    let suite_key = key.suite_key(header.suite)?;
+    // The associated data must be the bytes actually on disk, not a header we
+    // rebuild from expected values — rebuilding would hide a tampered byte.
+    let (header_bytes, body) = blob.split_at(crate::format::HEADER_LEN);
+
+    let mut cipher = Aes256Siv::new(suite_key.expose_bytes().as_slice().into());
+    let plaintext = cipher
+        .decrypt([header_bytes], body)
+        .map_err(|_| Error::Crypto("authentication failed; the file has been altered".into()))?;
+
+    Ok((header.flags, plaintext))
+}
+
+/// The key fingerprint a blob claims, without needing the key itself.
+///
+/// Used by `status` and by `unlock` to check the key *before* touching a single
+/// file, so a wrong key fails loudly instead of half-way through.
+///
+/// # Errors
+///
+/// [`Error::Format`] when the blob is not one of ours.
+pub fn blob_key_id(blob: &[u8]) -> Result<[u8; KEY_ID_LEN]> {
+    Ok(Header::parse(blob)?.key_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::format::{FLAG_LF_NORMALIZED, MAGIC, OVERHEAD};
+    use crate::key::MASTER_KEY_LEN;
+
+    fn key() -> MasterKey {
+        MasterKey::from_bytes([42u8; MASTER_KEY_LEN])
+    }
+
+    fn other_key() -> MasterKey {
+        MasterKey::from_bytes([43u8; MASTER_KEY_LEN])
+    }
+
+    fn samples() -> Vec<Vec<u8>> {
+        vec![
+            Vec::new(),
+            b"x".to_vec(),
+            b"api_key = do-not-commit-me\n".to_vec(),
+            (0u8..=255).cycle().take(4096).collect(),
+        ]
+    }
+
+    #[test]
+    fn round_trips_every_shape_of_input() {
+        for plaintext in samples() {
+            let blob = encrypt(&key(), 0, &plaintext).expect("encryption must succeed");
+            let (flags, recovered) = decrypt(&key(), &blob).expect("decryption must succeed");
+            assert_eq!(flags, 0);
+            assert_eq!(recovered, plaintext);
+        }
+    }
+
+    #[test]
+    fn encryption_is_deterministic() {
+        for plaintext in samples() {
+            let first = encrypt(&key(), 0, &plaintext).expect("encryption must succeed");
+            let second = encrypt(&key(), 0, &plaintext).expect("encryption must succeed");
+            assert_eq!(first, second, "the same plaintext must give the same bytes");
+        }
+    }
+
+    #[test]
+    fn flags_survive_the_round_trip_and_change_the_ciphertext() {
+        let plaintext = b"line\n";
+        let plain = encrypt(&key(), 0, plaintext).expect("encryption must succeed");
+        let flagged = encrypt(&key(), FLAG_LF_NORMALIZED, plaintext).expect("encryption");
+
+        assert_ne!(
+            plain, flagged,
+            "flags are authenticated, so they alter the tag"
+        );
+        let (flags, recovered) = decrypt(&key(), &flagged).expect("decryption must succeed");
+        assert_eq!(flags, FLAG_LF_NORMALIZED);
+        assert_eq!(recovered, plaintext);
+    }
+
+    #[test]
+    fn an_empty_file_costs_exactly_the_overhead() {
+        let blob = encrypt(&key(), 0, b"").expect("encryption must succeed");
+        assert_eq!(blob.len(), OVERHEAD);
+        assert!(blob.starts_with(&MAGIC));
+    }
+
+    #[test]
+    fn the_blob_is_the_plaintext_length_plus_the_overhead() {
+        for plaintext in samples() {
+            let blob = encrypt(&key(), 0, &plaintext).expect("encryption must succeed");
+            assert_eq!(blob.len(), plaintext.len() + OVERHEAD);
+        }
+    }
+
+    #[test]
+    fn flipping_any_byte_is_detected() {
+        let blob = encrypt(&key(), 0, b"api_key = secret\n").expect("encryption must succeed");
+        for index in 0..blob.len() {
+            let mut tampered = blob.clone();
+            tampered[index] ^= 0x01;
+            assert!(
+                decrypt(&key(), &tampered).is_err(),
+                "a flipped bit at offset {index} went unnoticed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_foreign_key_id_is_reported_as_a_mismatch() {
+        let blob = encrypt(&other_key(), 0, b"secret").expect("encryption must succeed");
+        match decrypt(&key(), &blob) {
+            Err(Error::KeyMismatch { .. }) => {}
+            other => panic!("expected a key mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_claimed_key_id_is_readable_without_the_key() {
+        let blob = encrypt(&key(), 0, b"secret").expect("encryption must succeed");
+        assert_eq!(blob_key_id(&blob).expect("our own blob"), key().key_id());
+        assert!(blob_key_id(b"not ours").is_err());
+    }
+
+    /// RFC 5297 Appendix A.1 — the specification's own vector.
+    ///
+    /// It pins the crate, not our wrapper: `aes-siv` has never been audited, so
+    /// the cheapest available substitute is proving it computes what the RFC
+    /// says. The vector uses AES-128-SIV (a 256-bit key in two halves) while we
+    /// ship AES-256-SIV, but the S2V and CTR construction under test is the same.
+    #[test]
+    fn the_crate_matches_rfc_5297_appendix_a1() {
+        use aes_siv::siv::Aes128Siv;
+
+        let key = hex_bytes("fffefdfcfbfaf9f8f7f6f5f4f3f2f1f0f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff");
+        let associated_data = hex_bytes("101112131415161718191a1b1c1d1e1f2021222324252627");
+        let plaintext = hex_bytes("112233445566778899aabbccddee");
+        let expected = hex_bytes("85632d07c6e8f37f950acd320a2ecc9340c02b9690c4dc04daef7f6afe5c");
+
+        let mut cipher = Aes128Siv::new(key.as_slice().into());
+        let sealed = cipher
+            .encrypt([associated_data.as_slice()], plaintext.as_slice())
+            .expect("the RFC vector must encrypt");
+        assert_eq!(sealed, expected, "aes-siv diverged from RFC 5297");
+
+        let mut cipher = Aes128Siv::new(key.as_slice().into());
+        let recovered = cipher
+            .decrypt([associated_data.as_slice()], sealed.as_slice())
+            .expect("the RFC vector must decrypt");
+        assert_eq!(recovered, plaintext);
+    }
+
+    /// Parses a hex string in a test. Panics on malformed input by design.
+    fn hex_bytes(text: &str) -> Vec<u8> {
+        assert!(text.len().is_multiple_of(2), "hex needs an even length");
+        (0..text.len())
+            .step_by(2)
+            .map(|index| {
+                u8::from_str_radix(&text[index..index + 2], 16).expect("test vectors must be hex")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn plaintext_is_not_recoverable_from_the_blob() {
+        let plaintext = b"api_key = do-not-commit-me\n";
+        let blob = encrypt(&key(), 0, plaintext).expect("encryption must succeed");
+        assert!(
+            !blob.windows(plaintext.len()).any(|w| w == plaintext),
+            "the plaintext appears verbatim inside the ciphertext"
+        );
+    }
+}
