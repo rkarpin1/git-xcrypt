@@ -1,6 +1,6 @@
 # Repository Guidelines
 
-`git-xcrypt` is a Rust CLI that transparently encrypts selected files on commit and decrypts them on checkout. The crate is split into `src/lib.rs` (logic) and a thin `src/main.rs` (arguments, exit codes). No real command exists yet: the only mode is the hidden `__test-filter`, a byte-reversing placeholder that gives the integration harness something git can run — S-01 replaces it with the real cipher and must remove it. The decisions live under `context/foundation/`.
+`git-xcrypt` is a Rust CLI that transparently encrypts selected files on commit and decrypts them on checkout. The crate is split into `src/lib.rs` (logic) and a thin `src/main.rs` (arguments, exit codes). S-01 has shipped, so the real path exists end to end: `init` sets the repository up and `process` serves git's long-running filter protocol. Everything else — `status`, `lock`, `unlock`, `export-key`, `import-key`, `sync`, `diff` — is still unbuilt, so do not register or reference a subcommand before it exists. The decisions live under `context/foundation/`.
 
 ## Hard rules
 
@@ -8,8 +8,9 @@
 - **Never commit a key or a secret.** Not to the working tree, a commit, or `stdout` outside an explicit `export-key`. Tests and examples included.
 - **Encryption must be deterministic.** Same plaintext and key, same ciphertext, or git reports unchanged files as modified.
 - **Pass-through must be byte-identical.** `.gitattributes` carries a static `* filter=git-xcrypt`, so the filter runs on *every* file in the repository and passes unencrypted ones through untouched. A bug there corrupts the whole project, not just the secrets. `passthrough(x) == x` is a property test, not a nicety. The filter is registered as `filter.git-xcrypt.process` (long-running): a process per file was measured 22× slower.
-- **Zero `unsafe`; crypto from RustCrypto crates only — never hand-rolled, and never a construction we assemble ourselves.** Not "audited crates": the chosen `aes-siv` has no audit, and that is a recorded, deliberate risk. The cipher is AES-256-SIV (RFC 5297); the file format is frozen in `context/foundation/zalozenia.md`.
+- **Zero `unsafe`** — enforced by `unsafe_code = "forbid"` in `Cargo.toml`, not by convention. **Crypto from RustCrypto crates only — never hand-rolled, and never a construction we assemble ourselves.** Not "audited crates": the chosen `aes-siv` has no audit, and that is a recorded, deliberate risk. The cipher is AES-256-SIV (RFC 5297); the file format is frozen in `context/foundation/zalozenia.md`.
 - **An error aborts the operation — but only with `filter.git-xcrypt.required = true`.** Without that flag git ignores a non-zero filter exit: `git add` returns 0 and the plaintext reaches the object database. `init` must set it; two tests in `tests/filter_edge_cases.rs` guard it. Never pass content through silently.
+- **A path is bytes, never a `String`.** The filter protocol carries `pathname=` as arbitrary bytes and only the terminating `\n` may be stripped. Lossy UTF-8 decoding, or `trim_end()` on a name that legally ends in a space, matches a file under a name it does not have — and in the pass-through direction that is a secret stored in the clear. Both were real bugs, both are regression-tested.
 - **The clean path never reads git's EOL config; the smudge path does.** Encrypted paths carry `-text`, so git-xcrypt owns the LF/CRLF conversion. Normalizing to LF before encryption must be identical on every machine, or the same file yields different ciphertext on Windows and Linux.
 
 Why each rule, plus the file format and threat model: @context/foundation/zalozenia.md
