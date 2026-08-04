@@ -168,12 +168,12 @@ kodem co `sync`, zamiast wypisywać samą linię catch-all.
 
 #### Automatyczne
 
-- [x] 2.1 `sync` aktualizuje sekcję po dopisaniu wzorca
-- [x] 2.2 Drugi `sync` nic nie zmienia
-- [x] 2.3 `sync --check` zwraca `1` przy nieaktualnej sekcji
-- [x] 2.4 `init` generuje sekcję identyczną z `sync`
-- [x] 2.5 `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`
+- [x] 2.1 `sync` aktualizuje sekcję po dopisaniu wzorca — 39be751
+- [x] 2.2 Drugi `sync` nic nie zmienia — 39be751
+- [x] 2.3 `sync --check` zwraca `1` przy nieaktualnej sekcji — 39be751
+- [x] 2.4 `init` generuje sekcję identyczną z `sync` — 39be751
+- [x] 2.5 `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` — 39be751
 
 #### Ręczne
 
-- [x] 2.6 Komunikat `sync` jasno mówi, czy plik został zmieniony
+- [x] 2.6 Komunikat `sync` jasno mówi, czy plik został zmieniony — 39be751

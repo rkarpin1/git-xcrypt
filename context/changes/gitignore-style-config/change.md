@@ -2,7 +2,7 @@
 id: gitignore-style-config
 title: Synchronizacja .gitattributes z .git-xcrypt
 roadmap_id: S-02
-status: implementing
+status: implemented
 created: 2026-08-04
 updated: 2026-08-04
 ---
