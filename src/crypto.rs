@@ -123,6 +123,41 @@ mod tests {
         }
     }
 
+    proptest::proptest! {
+        // `zalozenia.md` §Jakość i testy asks for these two as *properties*, not
+        // as a list: `decrypt(encrypt(x)) == x` and `encrypt(x) == encrypt(x)`.
+        // The hand-written samples above stay because they name the shapes that
+        // once broke — empty, one byte, every byte value — and a generator that
+        // happens not to draw them would quietly stop covering them.
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn decrypting_what_we_encrypted_gives_the_plaintext_back(
+            plaintext in proptest::collection::vec(proptest::num::u8::ANY, 0..8192),
+            flags in proptest::prelude::prop_oneof![
+                proptest::prelude::Just(0u8),
+                proptest::prelude::Just(FLAG_LF_NORMALIZED),
+            ],
+        ) {
+            let blob = encrypt(&key(), flags, &plaintext).expect("encryption must succeed");
+            let (recovered_flags, recovered) =
+                decrypt(&key(), &blob).expect("decryption must succeed");
+            proptest::prop_assert_eq!(recovered_flags, flags);
+            proptest::prop_assert_eq!(&recovered, &plaintext);
+            // The frozen overhead, on arbitrary input rather than on four shapes.
+            proptest::prop_assert_eq!(blob.len(), plaintext.len() + OVERHEAD);
+        }
+
+        #[test]
+        fn encrypting_the_same_bytes_twice_gives_the_same_blob(
+            plaintext in proptest::collection::vec(proptest::num::u8::ANY, 0..8192),
+        ) {
+            let first = encrypt(&key(), 0, &plaintext).expect("encryption must succeed");
+            let second = encrypt(&key(), 0, &plaintext).expect("encryption must succeed");
+            proptest::prop_assert_eq!(first, second);
+        }
+    }
+
     #[test]
     fn flags_survive_the_round_trip_and_change_the_ciphertext() {
         let plaintext = b"line\n";

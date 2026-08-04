@@ -2,7 +2,21 @@
 name = "git-xcrypt"
 version = "0.1.0"
 edition = "2024"
+# Measured, not guessed. Edition 2024 alone needs 1.85, but the code uses `let`
+# chains in `if` conditions, which are stable only from 1.88 — on 1.85 the crate
+# does not compile at all (12 × E0658). The whole suite passes on 1.88, so that
+# is the floor, and the `msrv` job in CI holds it there: a bump has to be a
+# decision, not a side effect of an edit nobody noticed.
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
+description = "Transparent, deterministic encryption of selected files in a git repository: plaintext in your working tree, ciphertext in the remote."
+repository = "https://github.com/rkarpin1/git-xcrypt"
+homepage = "https://github.com/rkarpin1/git-xcrypt"
+documentation = "https://docs.rs/git-xcrypt"
+readme = "README.md"
+keywords = ["git", "encryption", "secrets", "aes-siv", "cli"]
+categories = ["command-line-utilities", "cryptography", "development-tools"]
+exclude = ["/context", "/.idea", "/.github"]
 
 [lints.rust]
 # AGENTS.md makes "zero unsafe" a hard rule; this is what enforces it.
@@ -32,4 +46,15 @@ thiserror = "2.0.19"
 zeroize = { version = "1.9.0", features = ["derive"] }
 
 [dev-dependencies]
+proptest = "1.11.0"
 tempfile = "3.27.0"
+
+# A shipped binary is what FR-011 promises, so the release profile is part of
+# the product rather than a preference. `panic = "abort"` is deliberately *not*
+# set: `lock` and `unlock` walk a working tree file by file, and an abort there
+# would skip the reporting that tells a user which files were already rewritten.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

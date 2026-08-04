@@ -247,6 +247,85 @@ mod tests {
         }
     }
 
+    proptest::proptest! {
+        // `AGENTS.md` calls `passthrough(x) == x` a property test rather than a
+        // nicety, and `zalozenia.md` §Konstrukcja catch-all asks for it over
+        // *arbitrary* bytes: with the catch-all attribute every file in the
+        // repository comes through here, so the blast radius of a bug is the
+        // whole project. The listed shapes above stay; this covers what a list
+        // cannot.
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn an_unselected_path_is_handed_back_byte_for_byte(
+            content in proptest::collection::vec(proptest::num::u8::ANY, 0..16384),
+            path in proptest::prelude::prop_oneof![
+                proptest::prelude::Just(&b"README.md"[..]),
+                proptest::prelude::Just(&b"src/main.rs"[..]),
+                proptest::prelude::Just(&b"secrets/README.md"[..]),
+                proptest::prelude::Just(&b".gitattributes"[..]),
+                proptest::prelude::Just(&b".git-xcrypt"[..]),
+            ],
+        ) {
+            let outcome = clean(Some(&key()), &config(), path, &content)
+                .expect("an unselected path must never fail");
+            proptest::prop_assert_eq!(&outcome.content, &content);
+            proptest::prop_assert!(outcome.warning.is_none());
+        }
+
+        /// The other half: content git already stores in the clear must reach
+        /// the working tree untouched, whatever it is.
+        #[test]
+        fn content_without_our_magic_reaches_the_working_tree_unchanged(
+            content in proptest::collection::vec(proptest::num::u8::ANY, 0..16384),
+        ) {
+            proptest::prop_assume!(!looks_encrypted(&content));
+            let outcome = smudge(Some(&key()), b"README.md", &content, false, None, None, None)
+                .expect("content that is not ours must pass through");
+            proptest::prop_assert_eq!(&outcome.content, &content);
+        }
+
+        /// The full working-tree round trip, on arbitrary content, for a path
+        /// the declaration does select. Anything the clean path normalises has
+        /// to come back as the bytes git would hand out again — otherwise
+        /// `git status` reports a file nobody edited.
+        #[test]
+        fn a_selected_path_survives_check_in_and_check_out(
+            content in proptest::collection::vec(proptest::num::u8::ANY, 0..16384),
+        ) {
+            proptest::prop_assume!(!looks_encrypted(&content));
+            let stored = clean(Some(&key()), &config(), b"secrets/pw", &content)
+                .expect("encryption must succeed");
+            proptest::prop_assert!(looks_encrypted(&stored.content));
+
+            let back = smudge(
+                Some(&key()),
+                b"secrets/pw",
+                &stored.content,
+                true,
+                Some(EolMode::Lf),
+                None,
+                None,
+            )
+            .expect("decryption must succeed");
+
+            // Equal to the input except where the clean path normalised CRLF,
+            // which is exactly what `normalise_to_lf` did on the way in.
+            let expected = if eol::should_normalise(config().decide(b"secrets/pw").text, &content) {
+                eol::normalise_to_lf(&content)
+            } else {
+                content.clone()
+            };
+            proptest::prop_assert_eq!(&back.content, &expected);
+
+            // And the loop closes: feeding the working tree back in reproduces
+            // the same blob, which is what keeps `git status` quiet.
+            let again = clean(Some(&key()), &config(), b"secrets/pw", &back.content)
+                .expect("re-encryption must succeed");
+            proptest::prop_assert_eq!(&again.content, &stored.content);
+        }
+    }
+
     #[test]
     fn a_selected_path_is_encrypted() {
         let outcome = clean(Some(&key()), &config(), b"secrets/pw", b"hunter2\n")

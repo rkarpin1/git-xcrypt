@@ -225,6 +225,40 @@ mod tests {
     }
 
     #[test]
+    fn the_ratio_sits_exactly_where_gits_does() {
+        // Git's `is_binary`: `(printable >> 7) < nonprintable`, i.e. one
+        // disallowed control byte is forgiven per 128 printable ones. The rule
+        // is frozen with the format — moving the boundary moves which files get
+        // normalised to LF, which rewrites their ciphertext — and nothing else
+        // in this module pins the divisor, so a `>> 6` or `>> 8` typo used to
+        // pass the whole suite.
+        //
+        // Measured on git 2.55 with `* text=auto` and `core.autocrlf=true`, on
+        // `b'A' * printable + b'\x01' * nonprintable + b"\r\n"`: the CRLF
+        // survives (binary) or collapses to LF (text) exactly as asserted here.
+        for (printable, nonprintable, binary) in [
+            (127usize, 1usize, true),
+            (128, 1, false),
+            (129, 1, false),
+            (255, 2, true),
+            (256, 2, false),
+            (1023, 8, true),
+            (1024, 8, false),
+        ] {
+            let mut content = vec![b'A'; printable];
+            content.extend(std::iter::repeat_n(0x01, nonprintable));
+            content.extend_from_slice(b"\r\n");
+            assert_eq!(
+                looks_binary(&content),
+                binary,
+                "{printable} printable against {nonprintable} non-printable: git \
+                 calls this {}",
+                if binary { "binary" } else { "text" }
+            );
+        }
+    }
+
+    #[test]
     fn ordinary_text_is_text() {
         assert!(!looks_binary(b"api_key = do-not-commit-me\n"));
         assert!(!looks_binary(b""));

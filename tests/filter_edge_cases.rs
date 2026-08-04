@@ -277,3 +277,85 @@ fn a_file_whose_name_ends_in_a_space_is_still_encrypted() {
         "`secrets/README.md ` does not match the negation, so it must be encrypted"
     );
 }
+
+#[test]
+fn crlf_content_round_trips_under_every_autocrlf_setting() {
+    // `zalozenia.md` §Jakość i testy asks for a regression scenario with
+    // `core.autocrlf=true`, and the string did not appear anywhere in `tests/`.
+    // The table it comes from was reproduced only as a unit test that is handed
+    // the configuration values as arguments — so the bridge from git's actual
+    // configuration to `resolve_output` was never crossed by a test at all, and
+    // a filter that read the wrong key would have looked fine.
+    //
+    // The invariant being measured is the one the whole asymmetry exists for:
+    // clean normalises to LF whatever the machine says, smudge writes back
+    // whatever the machine asks for, and the next clean normalises again — so
+    // the blob is identical across settings and `git status` stays quiet.
+    let content = b"first\r\nsecond\r\nthird\r\n";
+    let mut blobs = Vec::new();
+
+    // One key across every repository, or the `key_id` in the header would make
+    // the blobs differ for a reason that has nothing to do with line endings.
+    let scratch = tempfile::TempDir::new().expect("could not create a temporary directory");
+    let key_file = scratch.path().join("shared.key");
+    let source = TestRepo::init();
+    source.init_xcrypt();
+    source.xcrypt_ok(["export-key", &key_file.to_string_lossy()]);
+
+    for autocrlf in ["true", "false", "input"] {
+        for eol in ["", "lf", "crlf", "native"] {
+            let repo = TestRepo::init();
+            repo.git_ok(["config", "core.autocrlf", autocrlf]);
+            if !eol.is_empty() {
+                repo.git_ok(["config", "core.eol", eol]);
+            }
+            repo.xcrypt_ok(["import-key", &key_file.to_string_lossy()]);
+            repo.init_xcrypt();
+            repo.write_xcrypt_config("secrets/\n");
+            repo.write_file("secrets/db.env", content);
+            repo.commit_all("a secret with CRLF in it");
+
+            let label = format!("core.autocrlf={autocrlf} core.eol={eol:?}");
+
+            // The stored blob must not depend on the machine, or the same file
+            // encrypts differently on Windows and Linux.
+            let blob = repo.blob_bytes("secrets/db.env");
+            assert!(
+                blob.starts_with(b"\0GITXCRYPT\0"),
+                "{label}: the filter did not run"
+            );
+            assert_eq!(
+                blob.len(),
+                content.len() - 3 + 38,
+                "{label}: the plaintext was not normalised to LF before encryption"
+            );
+            blobs.push((label.clone(), blob));
+
+            // And the working tree survives a checkout without going dirty,
+            // whatever line ending git asked us to write.
+            std::fs::remove_file(repo.path().join("secrets/db.env")).expect("could not remove");
+            repo.git_ok(["checkout", "--", "secrets/db.env"]);
+            repo.assert_status_clean();
+
+            let seen = repo.worktree_bytes("secrets/db.env");
+            let wants_crlf = autocrlf == "true"
+                || (autocrlf == "false" && eol == "crlf")
+                || (autocrlf == "false" && eol == "native" && cfg!(windows));
+            assert_eq!(
+                seen.windows(2).filter(|w| *w == b"\r\n").count() > 0,
+                wants_crlf,
+                "{label}: the checked-out line endings are not what git's own \
+                 table says this configuration asks for"
+            );
+        }
+    }
+
+    let (first_label, first) = &blobs[0];
+    for (label, blob) in &blobs[1..] {
+        assert_eq!(
+            blob, first,
+            "{label} stored different bytes than {first_label}: determinism \
+             across machines is gone"
+        );
+    }
+}

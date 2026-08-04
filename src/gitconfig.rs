@@ -257,10 +257,37 @@ mod tests {
     }
 
     #[test]
-    fn unsetting_an_absent_key_is_not_an_error() {
+    fn unsetting_an_absent_key_leaves_its_neighbours_alone() {
+        // `lock` unsets the diff driver on a repository that may never have had
+        // one, so this path runs on the command after which the user has no key
+        // left to repair anything with. The test used to assert nothing at all
+        // beyond "it returned Ok", which an implementation that dropped the
+        // whole section would have satisfied — and dropping the section takes
+        // `filter.git-xcrypt.required` with it.
         let dir = TempDir::new().expect("temporary directory");
-        let mut config = open_local(&dir.path().join("config")).expect("empty config");
+        let path = dir.path().join("config");
+
+        let mut config = open_local(&path).expect("empty config");
+        set(&mut config, "filter.git-xcrypt.process", "xcrypt process").expect("set");
+        set(&mut config, "filter.git-xcrypt.required", "true").expect("set");
+        save_local(&path, &config).expect("save");
+
+        let mut config = open_local(&path).expect("valid config");
         unset(&mut config, "diff.git-xcrypt.textconv").expect("unsetting must succeed");
+        save_local(&path, &config).expect("save");
+
+        let reloaded = open_local(&path).expect("valid config");
+        assert_eq!(
+            get(&reloaded, "filter.git-xcrypt.process").as_deref(),
+            Some("xcrypt process"),
+            "unsetting an absent key removed a key that was there"
+        );
+        assert_eq!(
+            get(&reloaded, "filter.git-xcrypt.required").as_deref(),
+            Some("true"),
+            "unsetting an absent key took the safety flag with it"
+        );
+        assert!(get(&reloaded, "diff.git-xcrypt.textconv").is_none());
     }
 
     #[test]
