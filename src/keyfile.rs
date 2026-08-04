@@ -42,9 +42,41 @@ const KEY_FILE_LEN: usize = KEY_FILE_MAGIC.len() + 1 + MASTER_KEY_LEN;
 /// it in the working tree, one `git add -A` from a commit. Deciding on the
 /// content rather than on the location is what makes the refusal hold for an
 /// exported copy, for a hard link and whatever the current directory is.
+///
+/// **It has to recognise exactly what [`decode_portable`] accepts**, which is
+/// why both go through [`significant_lines`] rather than each having their own
+/// idea of where the file starts. Measured before that: one `# my laptop` line
+/// above the header — the annotation a key picks up in a password manager, and
+/// a shape this module has a test for — made the header stop being the first
+/// byte, so the check missed it and `git-xcrypt diff` printed the repository's
+/// master key in base64 with exit code 0. A leading blank line and leading
+/// spaces did the same. All three still imported as a working key.
+///
+/// Content that is not UTF-8 cannot be a portable key at all: [`read_portable`]
+/// reads the file as text, so such a file would never be accepted as one.
 #[must_use]
 pub fn holds_a_key(content: &[u8]) -> bool {
-    content.starts_with(KEY_FILE_MAGIC) || content.starts_with(EXPORT_PREFIX.as_bytes())
+    if content.starts_with(KEY_FILE_MAGIC) {
+        return true;
+    }
+    std::str::from_utf8(content).is_ok_and(|text| {
+        significant_lines(text)
+            .next()
+            .is_some_and(|line| line.starts_with(EXPORT_PREFIX))
+    })
+}
+
+/// The lines of a portable key file that carry anything.
+///
+/// Blank lines and `#` comments are skipped and surrounding whitespace comes
+/// off, because a key travelling through a password manager or an email body
+/// picks all three up. Shared with [`holds_a_key`] deliberately: the parser and
+/// the refusal disagreeing about where the file begins is a hole through which
+/// the key reaches `stdout`.
+fn significant_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
 }
 
 /// Serialises a key into the bytes stored on disk.
@@ -177,10 +209,7 @@ pub fn encode_portable(key: &MasterKey) -> Zeroizing<String> {
 ///
 /// [`Error::Format`] for anything this build cannot read as a key.
 pub fn decode_portable(text: &str) -> Result<MasterKey> {
-    let mut lines = text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'));
+    let mut lines = significant_lines(text);
 
     let header = lines
         .next()
@@ -460,6 +489,65 @@ mod tests {
         let first = encode_portable(&MasterKey::from_bytes([26u8; MASTER_KEY_LEN]));
         let text = format!("{}{}", *first, BASE64.encode([27u8; MASTER_KEY_LEN]));
         assert!(decode_portable(&text).is_err());
+    }
+
+    #[test]
+    fn every_shape_decode_portable_accepts_is_recognised_as_a_key() {
+        // The refusal in the diff driver is content-based, so it has to cover
+        // exactly what the parser accepts. It did not: one `#` line above the
+        // header moved the header off byte zero, `holds_a_key` said no and
+        // `git-xcrypt diff` printed the master key in base64 with exit code 0.
+        // Measured, on all three paddings below, each of which still imported.
+        let key = MasterKey::from_bytes([41u8; MASTER_KEY_LEN]);
+        let exported = encode_portable(&key);
+        let mut lines = exported.lines();
+        let (header, material) = (lines.next().expect("header"), lines.next().expect("key"));
+
+        for (name, text) in [
+            ("as written", exported.to_string()),
+            (
+                "annotated in a password manager",
+                format!("# my laptop, 2026-08-04\n{header}\n{material}\n"),
+            ),
+            ("a leading blank line", format!("\n{header}\n{material}\n")),
+            ("indented by a paste", format!("  {header}\n  {material}\n")),
+            (
+                "CRLF from an email body",
+                format!("{header}\r\n{material}\r\n"),
+            ),
+        ] {
+            assert!(
+                decode_portable(&text).is_ok(),
+                "`{name}` stopped being a key file, so this test proves nothing"
+            );
+            assert!(
+                holds_a_key(text.as_bytes()),
+                "`{name}` is a usable key file that the diff driver would have printed"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_content_is_not_mistaken_for_a_key_file() {
+        // The other direction: this refusal stops `git diff` working on whatever
+        // it matches, so a false positive costs a user their diff.
+        for content in [
+            &b""[..],
+            b"api_key = do-not-commit-me\n",
+            b"# a comment and nothing else\n",
+            b"\n\n\n",
+            b"the git-xcrypt-key-v1 format is described below\n",
+            b"\x00\x01\x02not text at all\xff",
+            // Only the *first* significant line names the format; a mention
+            // further down is prose.
+            b"notes\ngit-xcrypt-key-v1 0123456789abcdef\n",
+        ] {
+            assert!(
+                !holds_a_key(content),
+                "{} was refused as a key file",
+                String::from_utf8_lossy(content)
+            );
+        }
     }
 
     #[test]

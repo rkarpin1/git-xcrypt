@@ -141,6 +141,14 @@ impl TestRepo {
     /// `required = true` aborts the operation instead of letting the content
     /// through. The product no longer ships a way to fail on purpose, and it
     /// should not.
+    ///
+    /// **It deliberately does not set `filter.git-xcrypt.required` itself.** It
+    /// used to, and that made the two tests AGENTS.md names as the guard on that
+    /// flag guard nothing at all: they set up the very condition they were meant
+    /// to observe `init` establishing. Measured — with the `required` line
+    /// removed from `init::register_driver`, both still passed. They fail now,
+    /// which is the point: the only thing standing between a failing filter and
+    /// a stored plaintext here is what `init` wrote.
     pub fn break_filter(&self) {
         let missing = self.path.join("no-such-binary");
         self.git_ok([
@@ -148,7 +156,6 @@ impl TestRepo {
             "filter.git-xcrypt.process",
             &format!("'{}' process", missing.display()),
         ]);
-        self.git_ok(["config", "filter.git-xcrypt.required", "true"]);
     }
 
     /// What git itself says one attribute resolves to for `relative_path`.

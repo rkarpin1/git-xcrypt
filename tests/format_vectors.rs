@@ -9,6 +9,14 @@
 //! The RFC 5297 vector lives in `src/crypto.rs`, because it needs the cipher
 //! crate directly; it pins `aes-siv` against the specification, while these
 //! pin our own wrapping of it.
+//!
+//! **Three formats are frozen here, not one.** `zalozenia.md` §Zarządzanie
+//! kluczami says the key file is frozen "as hard as the data format, because it
+//! sits in users' backups", and until these vectors existed nothing held it to
+//! that. Measured against the whole suite: bumping `KEY_FILE_VERSION` from 1 to
+//! 2 — which makes every key file already on disk unreadable — and swapping the
+//! export's base64 alphabet for the URL-safe one — which makes every key in a
+//! password manager fail to import — both left all 392 tests green.
 
 use git_xcrypt::config::Config;
 use git_xcrypt::crypto::{decrypt, encrypt};
@@ -16,8 +24,13 @@ use git_xcrypt::decide;
 use git_xcrypt::eol::looks_binary;
 use git_xcrypt::format::{FLAG_LF_NORMALIZED, OVERHEAD, looks_encrypted};
 use git_xcrypt::key::{MASTER_KEY_LEN, MasterKey};
+use git_xcrypt::keyfile;
 
 /// The key every vector below was produced with.
+///
+/// A published constant, not a secret: it is spelled out in this file, the
+/// ciphertext vectors below are its output, and the same value already sits in
+/// `src/crypto.rs`. "Never commit a key" is about keys that open something.
 fn vector_key() -> MasterKey {
     MasterKey::from_bytes([0x2au8; MASTER_KEY_LEN])
 }
@@ -241,6 +254,112 @@ fn the_recorded_normalisation_flag_follows_the_frozen_verdict() {
             );
         }
     }
+}
+
+/// The key file in `.git/git-xcrypt/keys/`, byte for byte.
+///
+/// `MAGIC || version || 32-byte master key`. Frozen because it is what a user's
+/// existing repository holds: change any of it and `unlock` on a machine that
+/// never upgraded stops working, or — worse — a key file written by a newer
+/// build reads as "not a git-xcrypt key file" and `init` offers to make a
+/// second key.
+const KEY_FILE_HEX: &str = "004749545843525950544b455900 01 \
+                            2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a\
+                            2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a";
+
+/// The portable form `export-key` writes.
+///
+/// Frozen for a reason the binary form does not have: this file leaves the
+/// machine. It lives in password managers, in backups and in email bodies, and
+/// the build that reads it back may be years older or newer than the one that
+/// wrote it. The base64 alphabet is part of the contract, not an implementation
+/// detail — the URL-safe one produces a file no shipped build can import.
+const EXPORT_TEXT: &str = "git-xcrypt-key-v1 fd2f0a5c2d19a55b\n\
+                           KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=\n";
+
+/// A second export, whose base64 uses the two characters the alphabets disagree
+/// about.
+///
+/// [`vector_key`] is every byte `0x2a`, and its base64 happens to contain
+/// neither `+` nor `/` — so the vector above is blind to the alphabet, and
+/// swapping in the URL-safe engine left it green. This key exercises both, which
+/// is the only part of the export a careless dependency bump can change without
+/// touching a line of our own code.
+const ALPHABET_KEY: [u8; MASTER_KEY_LEN] = [
+    0xe0, 0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xeb, 0xec, 0xed, 0xee, 0xef,
+    0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff,
+];
+
+/// What [`ALPHABET_KEY`] must always export as.
+const ALPHABET_EXPORT: &str = "git-xcrypt-key-v1 4964bf31d42512be\n\
+                               4OHi4+Tl5ufo6err7O3u7/Dx8vP09fb3+Pn6+/z9/v8=\n";
+
+#[test]
+fn the_key_file_still_holds_the_frozen_bytes() {
+    let dir = tempfile::TempDir::new().expect("temporary directory");
+    let path = dir.path().join("default");
+    keyfile::write(&path, &vector_key()).expect("writing the key must succeed");
+
+    assert_eq!(
+        to_hex(&std::fs::read(&path).expect("reading the key")),
+        normalise(KEY_FILE_HEX),
+        "the key file format changed — every key file already on disk, and every \
+         backup of one, stops being readable by this build"
+    );
+}
+
+#[test]
+fn the_frozen_key_file_still_reads_back() {
+    // The direction that matters to a user who upgrades: a key file written by
+    // an older build has to keep opening.
+    let dir = tempfile::TempDir::new().expect("temporary directory");
+    let path = dir.path().join("default");
+    std::fs::write(&path, from_hex(&normalise(KEY_FILE_HEX))).expect("writing");
+
+    let key = keyfile::read(&path).expect("a frozen key file must still read");
+    assert_eq!(key.expose_bytes(), vector_key().expose_bytes());
+    assert_eq!(key.key_id(), vector_key().key_id());
+}
+
+#[test]
+fn the_portable_export_still_holds_the_frozen_text() {
+    assert_eq!(
+        *keyfile::encode_portable(&vector_key()),
+        EXPORT_TEXT,
+        "the portable key format changed — every key a user carried to another \
+         machine, or filed in a password manager, stops importing"
+    );
+}
+
+#[test]
+fn the_frozen_portable_export_still_imports() {
+    let key = keyfile::decode_portable(EXPORT_TEXT).expect("a frozen export must still import");
+    assert_eq!(key.expose_bytes(), vector_key().expose_bytes());
+}
+
+#[test]
+fn the_export_still_uses_the_frozen_base64_alphabet() {
+    let key = MasterKey::from_bytes(ALPHABET_KEY);
+    assert_eq!(
+        *keyfile::encode_portable(&key),
+        ALPHABET_EXPORT,
+        "the export's base64 alphabet changed — every key already in a password \
+         manager stops importing, and nothing else in this suite notices"
+    );
+    let back =
+        keyfile::decode_portable(ALPHABET_EXPORT).expect("a frozen export must still import");
+    assert_eq!(back.expose_bytes(), &ALPHABET_KEY);
+}
+
+#[test]
+fn the_key_id_in_a_file_header_is_the_one_the_key_file_names() {
+    // The two formats meet here: `export-key` prints this fingerprint for a
+    // human to match against, and every encrypted file carries it at offset 14.
+    // A change to either derivation that left both self-consistent would still
+    // be caught by the vectors, but this says out loud that they are one value.
+    let blob = from_hex(&normalise(vectors()[0].blob_hex));
+    assert_eq!(&blob[14..22], &vector_key().key_id());
+    assert!(EXPORT_TEXT.contains(&git_xcrypt::format_key_id(&vector_key().key_id())));
 }
 
 #[test]
