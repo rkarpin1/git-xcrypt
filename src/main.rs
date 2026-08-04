@@ -99,6 +99,11 @@ fn run_init() -> Result<()> {
 /// It has its own exit path rather than going through [`report`] because a
 /// stale section is an answer, not a failure — the command did exactly what it
 /// was asked to.
+///
+/// Code `1` is shared with "usage error or unclassified failure" from the frozen
+/// table, so a CI gate cannot tell a stale section from an unreadable file by
+/// the code alone; the message says which it is. The table has no spare code and
+/// `5` means an exposure, which a cosmetic section is not.
 fn run_sync(check: bool) -> ExitCode {
     match sync_and_describe(check) {
         Ok(code) => code,

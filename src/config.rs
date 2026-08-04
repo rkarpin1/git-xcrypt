@@ -183,10 +183,24 @@ impl Config {
         }
     }
 
+    /// The patterns a negation takes back out, in file order, without the `!`.
+    ///
+    /// Rendered into `.gitattributes` as `!text !diff`, which restores git's
+    /// defaults for those paths. Leaving them out instead would keep `-text` on
+    /// a file that is stored in the clear, so git would stop managing its line
+    /// endings — the very direction the attributes exist to control.
+    #[must_use]
+    pub fn negated_patterns(&self) -> Vec<&str> {
+        self.rules
+            .iter()
+            .filter(|rule| rule.pattern.is_negative())
+            .filter_map(|rule| rule.source.strip_prefix('!'))
+            .collect()
+    }
+
     /// The patterns that select paths, in file order.
     ///
-    /// Used by S-02 to render the cosmetic `.gitattributes` lines. Negations are
-    /// left out: `.gitattributes` has no useful counterpart for them.
+    /// Used to render the per-pattern `.gitattributes` lines.
     #[must_use]
     pub fn selecting_patterns(&self) -> Vec<(&str, Decision)> {
         self.rules

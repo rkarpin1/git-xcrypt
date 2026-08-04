@@ -9,6 +9,7 @@
 
 use thiserror::Error;
 
+pub mod atomic;
 pub mod commands;
 pub mod config;
 pub mod crypto;

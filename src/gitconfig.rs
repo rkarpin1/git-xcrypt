@@ -46,14 +46,16 @@ pub fn open_full(git_dir: &Path) -> Result<File> {
         .map_err(|err| Error::Config(format!("could not read git configuration: {err}")))
 }
 
-/// Writes a configuration file back to disk.
+/// Writes a configuration file back to disk, replacing it in one step.
+///
+/// This file carries the driver registration, so a half-written one leaves git
+/// with no filter and the next `git add` storing plaintext with exit code 0.
 ///
 /// # Errors
 ///
 /// [`Error::Io`] when the file cannot be written.
 pub fn save_local(path: &Path, config: &File) -> Result<()> {
-    std::fs::write(path, config.to_bstring())?;
-    Ok(())
+    crate::atomic::write(path, &config.to_bstring())
 }
 
 /// Sets a dotted key such as `filter.git-xcrypt.required`, creating what is missing.

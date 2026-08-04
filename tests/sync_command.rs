@@ -53,6 +53,101 @@ fn git_honours_the_generated_lines() {
 }
 
 #[test]
+fn a_directory_pattern_reaches_the_subtree_at_any_depth() {
+    // `.gitignore` floats a pattern that carries no slash of its own, so
+    // `secrets/` selects `app/secrets/x` too and the filter encrypts it. The
+    // rendered line has to reach exactly as far, or that file is encrypted
+    // without `-text` — see the round-trip test below for what that costs.
+    let repo = synced("secrets/\n*.env\n");
+
+    for path in [
+        "secrets/a.txt",
+        "app/secrets/a.txt",
+        "a/b/secrets/c/d.txt",
+        "deep/one.env",
+        "config.env/inner.txt",
+    ] {
+        assert_eq!(
+            repo.check_attr("text", path),
+            "unset",
+            "{path}: the filter encrypts this path, so git must see -text on it"
+        );
+    }
+    assert_eq!(
+        repo.check_attr("text", "notsecrets/a.txt"),
+        "unspecified",
+        "the line must not reach past what the filter encrypts"
+    );
+}
+
+#[test]
+fn an_encrypted_file_survives_a_users_own_text_attribute() {
+    // The failure this guards against, reproduced against git 2.55 before the
+    // fix: git applies its CRLF conversion to the *output* of the clean filter,
+    // so a path the user marked `text` has the CR bytes eaten out of its
+    // ciphertext. `git add` still exits 0, the damaged blob is committed, and
+    // the loss surfaces only at the next checkout, as `authentication failed`
+    // with the plaintext already gone. `-text` on every encrypted path is what
+    // prevents it, and it only lands there if the rendered pattern reaches as
+    // far as `.git-xcrypt` does — `app/secrets/…` here, not just `secrets/…`.
+    //
+    // The file is 2 MiB because the damage needs a `CR LF` pair to appear
+    // somewhere in the ciphertext. Ciphertext is uniform, so that is one pair
+    // per 64 KiB on average: at this size the expected count is around 32 and
+    // the chance of seeing none is far below any other cause of a red build.
+    let secret: Vec<u8> = (0..2 * 1024 * 1024u32)
+        .map(|index| u8::try_from(index % 251).expect("a byte"))
+        .collect();
+
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.xcrypt_ok(["sync"]);
+
+    // An ordinary line in a user's own attributes file, above our section.
+    let attributes = repo.worktree_bytes(".gitattributes");
+    let mut with_user_line = b"*.env text\n".to_vec();
+    with_user_line.extend_from_slice(&attributes);
+    repo.write_file(".gitattributes", &with_user_line);
+
+    repo.write_file("app/secrets/deep.env", &secret);
+    repo.commit_all("add a secret in a nested directory");
+
+    assert_eq!(
+        repo.blob_bytes("app/secrets/deep.env").len(),
+        38 + secret.len(),
+        "the stored blob is not the exact size of header plus content, \
+         so git's line-ending conversion has eaten bytes out of the ciphertext"
+    );
+
+    std::fs::remove_file(repo.path().join("app/secrets/deep.env")).expect("could not remove");
+    repo.git_ok(["checkout", "--", "app/secrets/deep.env"]);
+    repo.assert_worktree_eq("app/secrets/deep.env", &secret);
+    repo.assert_status_clean();
+}
+
+#[test]
+fn a_negated_path_gets_gits_defaults_back() {
+    // The file is stored in the clear, so leaving `-text` on it would stop git
+    // managing its line endings, and `diff=git-xcrypt` would point the diff
+    // driver at plaintext once S-05 registers one.
+    let repo = synced("secrets/\n!secrets/README.md\n");
+
+    assert_eq!(repo.check_attr("text", "secrets/README.md"), "unspecified");
+    assert_eq!(repo.check_attr("diff", "secrets/README.md"), "unspecified");
+    assert_eq!(
+        repo.check_attr("filter", "secrets/README.md"),
+        "git-xcrypt",
+        "the catch-all must still reach it; only the cosmetic attributes go"
+    );
+    assert_eq!(
+        repo.check_attr("text", "secrets/other.md"),
+        "unset",
+        "the negation must not spill onto its neighbours"
+    );
+}
+
+#[test]
 fn a_pattern_with_a_space_survives_the_trip_through_git() {
     // `.gitattributes` ends a pattern at the first blank unless the whole
     // pattern is C-quoted; the `\ ` escape `.git-xcrypt` inherits from
