@@ -565,3 +565,23 @@ Brak. Nic nie jest wydane, żadne istniejące repozytorium nie używa tego forma
 
 - [x] 4.10 `git add` na kilkuset plikach nie jest odczuwalnie wolniejszy
 - [x] 4.11 Komunikaty `stderr` czytelne w oknie Git w IDE
+
+### Przegląd implementacji (2026-08-04)
+
+Dwa przebiegi `/10x-impl-review`; pełny raport w `reviews/impl-review.md`.
+
+#### Automatyczne
+
+- [x] 5.1 Cztery drogi do jawnego sekretu w bazie obiektów zamknięte (ścieżka z białym
+      znakiem na końcu, ścieżka spoza UTF-8, brak `.git-xcrypt`, niezweryfikowany tag)
+- [x] 5.2 `text=auto` zgodne z gitem na samotnym `CR`; round-trip stabilny, `git status` czysty
+- [x] 5.3 Determinizm potwierdzony empirycznie: identyczny blob przy `core.autocrlf`
+      `false`/`true`/`input`; ścieżka clean nie czyta konfiguracji gita
+- [x] 5.4 Zamrożone wektory formatu niezmienione
+- [x] 5.5 `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` (130)
+
+#### Ręczne
+
+- [ ] 5.6 Ścieżka spoza UTF-8 zweryfikowana na Linuksie — nie do odtworzenia na macOS
+      (APFS wymusza UTF-8); czeka na nogę CI
+- [ ] 5.7 Scenariusz regresyjny `core.autocrlf=true` na Windows
