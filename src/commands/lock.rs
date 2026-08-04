@@ -538,14 +538,7 @@ fn refuse_if_the_tree_moved(
 /// already deleted the key.
 fn write_catch_all_if_missing(repo: &Repo, config: &Config) -> Result<bool> {
     let path = repo.attributes_path();
-    let present = match crate::gitattributes::read(&path) {
-        Ok(text) => text
-            .lines()
-            .any(|line| line.trim_end() == crate::gitattributes::CATCH_ALL),
-        Err(Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => false,
-        Err(err) => return Err(err),
-    };
-    if present {
+    if crate::gitattributes::catch_all_present(&path)? {
         return Ok(false);
     }
     crate::gitattributes::write_section(&path, &crate::gitattributes::render_lines(config))

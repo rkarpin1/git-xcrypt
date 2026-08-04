@@ -187,10 +187,10 @@ niezerowy. Sprawdzenie musi być tanie: pojedynczy odczyt, żadnego przejścia p
 
 #### Automatyczne
 
-- [ ] 1.1 Świeży klon bez `unlock` daje kod `5` i wskazuje braki
-- [ ] 1.2 Repozytorium po `init` daje kod `0`
-- [ ] 1.3 Usunięcie `required = true` jest wykrywane
-- [ ] 1.4 `cargo clippy --all-targets -- -D warnings`
+- [x] 1.1 Świeży klon bez `unlock` daje kod `5` i wskazuje braki
+- [x] 1.2 Repozytorium po `init` daje kod `0`
+- [x] 1.3 Usunięcie `required = true` jest wykrywane
+- [x] 1.4 `cargo clippy --all-targets -- -D warnings`
 
 ### Faza 2: Skan historii
 

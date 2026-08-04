@@ -397,6 +397,21 @@ pub fn write_section(path: &Path, extra_lines: &[String]) -> Result<bool> {
     Ok(true)
 }
 
+/// Whether the attributes file at `path` carries the catch-all line.
+///
+/// The one question that decides whether git invokes the filter at all, so both
+/// `lock` and `status` ask it — through the same function, because two spellings
+/// of "is the guarantee in place" is one too many. An absent file answers `false`
+/// rather than failing: it is missing the line as surely as an empty one is.
+///
+/// # Errors
+///
+/// [`Error::Io`] when the file exists but cannot be read, [`Error::Config`] when
+/// it is not text.
+pub fn catch_all_present(path: &Path) -> Result<bool> {
+    Ok(read(path)?.lines().any(|line| line.trim_end() == CATCH_ALL))
+}
+
 /// The configuration keys `init` writes, for `status` to check for completeness.
 ///
 /// A clone that never ran `init` or `unlock` carries the catch-all attribute

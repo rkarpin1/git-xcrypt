@@ -10,5 +10,6 @@ pub mod import_key;
 pub mod init;
 pub mod lock;
 pub mod process;
+pub mod status;
 pub mod sync;
 pub mod unlock;

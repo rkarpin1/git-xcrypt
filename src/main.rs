@@ -78,6 +78,13 @@ enum Command {
         yes: bool,
     },
 
+    /// Report whether this repository's declarations are actually enforced.
+    ///
+    /// Exits `5` on a finding, so it works as a CI gate. It answers "are my
+    /// declarations enforced", not "are there secrets here": a file that never
+    /// matched a pattern is invisible to it.
+    Status,
+
     /// Serve git's long-running filter protocol. Registered by `init`.
     ///
     /// Not meant to be run by hand: everything it writes to stdout is protocol.
@@ -118,6 +125,7 @@ fn main() -> ExitCode {
         Command::ImportKey { path } => report(run_import_key(&path)),
         Command::Unlock { key } => report(run_unlock(key.as_deref())),
         Command::Lock { yes } => run_lock(yes),
+        Command::Status => run_status(),
         Command::Process => report(commands::process::run()),
         Command::Diff { path } => report(run_diff(&path)),
     }
@@ -379,6 +387,47 @@ fn lock_and_describe(assume_yes: bool) -> Result<ExitCode> {
          to open it again"
     );
     Ok(ExitCode::SUCCESS)
+}
+
+/// Runs `status`, whose findings are an answer rather than a failure.
+///
+/// Its own exit path rather than [`report`], because a repository with a problem
+/// is not a broken tool: the frozen table gives that its own code, `5`, so a CI
+/// gate can tell the two apart without reading the message.
+///
+/// The report goes to `stdout` — this is not the filter path, where git reads
+/// `stdout` as file content, and a gate that has to be scraped off `stderr` is a
+/// gate nobody pipes. Diagnostics that are *about* the run rather than part of
+/// the answer still go to `stderr`.
+fn run_status() -> ExitCode {
+    match status_and_describe() {
+        Ok(code) => code,
+        Err(err) => {
+            eprintln!("git-xcrypt: {err}");
+            ExitCode::from(err.exit_code())
+        }
+    }
+}
+
+fn status_and_describe() -> Result<ExitCode> {
+    use std::io::Write as _;
+
+    let repo = Repo::discover_from_cwd()?;
+    let report = commands::status::run(&repo)?;
+
+    for warning in &report.warnings {
+        eprintln!("git-xcrypt: {warning}");
+    }
+
+    let mut out = std::io::stdout().lock();
+    write!(out, "{report}")?;
+    out.flush()?;
+
+    Ok(if report.exposed() {
+        ExitCode::from(exit::EXPOSED)
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 /// Runs `sync`, whose `--check` mode reports staleness through the exit code.

@@ -111,6 +111,20 @@ pub fn get(config: &File, key: &str) -> Option<String> {
     present.then(String::new)
 }
 
+/// Whether a value is one of git's spellings of true.
+///
+/// Git accepts `1`, `yes` and `on` beside `true`, and a key written with no
+/// value at all — which [`get`] reports as `Some("")` — is true as well. Every
+/// caller that branches on a git boolean has to accept the same set, or a
+/// perfectly ordinary `required = 1` reads as "off".
+#[must_use]
+pub fn is_true(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "true" | "yes" | "on" | "1" | ""
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

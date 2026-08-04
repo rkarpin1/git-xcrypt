@@ -161,10 +161,10 @@ pub fn resolve_output(
 
 /// Whether a configuration value is one of git's spellings of true.
 ///
-/// A key present with no value at all is true as well, which is why the empty
-/// string counts.
+/// Shared with `status`, which has to read `filter.git-xcrypt.required` by the
+/// same rule: two answers to "is this git boolean true" is one answer too many.
 fn is_git_true(value: &str) -> bool {
-    matches!(value, "true" | "yes" | "on" | "1" | "")
+    crate::gitconfig::is_true(value)
 }
 
 /// Applies a resolved line-ending mode to content that was normalised to LF.
