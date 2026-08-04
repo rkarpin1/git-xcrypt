@@ -64,6 +64,20 @@ pub fn forget_stat(index_path: &Path, hash: gix_hash::Kind, paths: &[Vec<u8>]) -
         return Ok(Outcome::Cleared(0));
     }
 
+    // The lock comes before the read, not between the read and the write. Git's
+    // own protocol is lock-then-read for a reason: anything git writes to the
+    // index in the meantime — a `git add` in another terminal, an IDE refreshing
+    // in the background — would be silently reverted by our stale buffer, taking
+    // the staged changes with it.
+    let Some(lock) = Lock::acquire(index_path)? else {
+        return Ok(Outcome::Skipped(format!(
+            "{}.lock is held by another git process, so the stat cache was left \
+             alone. The files are decrypted correctly; if `git status` shows them \
+             as modified, `git add --renormalize .` settles it.",
+            index_path.display()
+        )));
+    };
+
     let mut data = match fs::read(index_path) {
         Ok(data) => data,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -86,7 +100,10 @@ pub fn forget_stat(index_path: &Path, hash: gix_hash::Kind, paths: &[Vec<u8>]) -
     let body_len = data.len() - hash_len;
     let recorded = &data[body_len..];
     // `index.skipHash` writes zeroes here and tells git not to verify. Keeping
-    // that promise means writing zeroes back rather than filling it in.
+    // that promise means writing zeroes back rather than filling it in. A tail
+    // zeroed by a bad write rather than by that setting is not covered by this
+    // check, but is by the structural one below: the entry and extension walk
+    // has to land exactly on the end of the data or nothing is written.
     let skip_hash = recorded.iter().all(|byte| *byte == 0);
     if !skip_hash {
         let Some(digest) = checksum(&data[..body_len], hash) else {
@@ -109,14 +126,30 @@ pub fn forget_stat(index_path: &Path, hash: gix_hash::Kind, paths: &[Vec<u8>]) -
         ));
     }
 
-    let Some(fields) = size_fields(&data[..body_len], version, count, hash_len, paths) else {
+    let Some(scan) = scan(&data[..body_len], version, count, hash_len, paths) else {
         return Ok(skipped(index_path, "its entries did not parse"));
     };
-    if fields.is_empty() {
+    if scan.split_index {
+        // The entries live in `.git/sharedindex.<oid>` and this file holds only
+        // the differences, so there is nothing here to patch. Measured on git
+        // 2.55 with `core.splitIndex=true`: without this branch the walk matched
+        // nothing, reported success and left `git status` permanently dirty —
+        // the exact failure this module exists to prevent, arriving silently.
+        // `features.manyFiles=true` turns split index on wholesale.
+        return Ok(skipped(
+            index_path,
+            "this repository uses a split index, whose entries live in a shared \
+             file this build does not patch",
+        ));
+    }
+    if scan.size_fields.is_empty() {
+        // None of the rewritten files is tracked — an encrypted file a user
+        // keeps in the working tree without committing it, for instance. There
+        // is no cached stat to forget.
         return Ok(Outcome::Cleared(0));
     }
 
-    for offset in &fields {
+    for offset in &scan.size_fields {
         data[*offset..*offset + 4].fill(0);
     }
     if !skip_hash {
@@ -126,11 +159,8 @@ pub fn forget_stat(index_path: &Path, hash: gix_hash::Kind, paths: &[Vec<u8>]) -
         data[body_len..].copy_from_slice(&digest);
     }
 
-    match replace_under_lock(index_path, &data) {
-        Ok(()) => Ok(Outcome::Cleared(fields.len())),
-        Err(Error::Config(message)) => Ok(Outcome::Skipped(message)),
-        Err(other) => Err(other),
-    }
+    lock.commit(&data)?;
+    Ok(Outcome::Cleared(scan.size_fields.len()))
 }
 
 /// The usual shape of a refusal, with an instruction the user can act on.
@@ -152,24 +182,36 @@ fn checksum(body: &[u8], hash: gix_hash::Kind) -> Option<Vec<u8>> {
         .map(|digest| digest.as_slice().to_vec())
 }
 
-/// Offsets of the `size` field of every entry naming one of `paths`.
+/// What one pass over the index found.
+#[derive(Debug)]
+struct Scan {
+    /// Offsets of the `size` field of every entry naming one of `paths`.
+    size_fields: Vec<usize>,
+    /// The index carries a `link` extension, so its entries are elsewhere.
+    split_index: bool,
+}
+
+/// Walks the entries and then the extensions, or gives up entirely.
 ///
 /// Returns `None` for anything that does not parse exactly, which is what keeps
-/// a misread from turning into a patched byte in the wrong place.
+/// a misread from turning into a patched byte in the wrong place. The extension
+/// walk is not only there to spot a split index: it has to consume the file to
+/// its last byte, which is what proves the entry walk ended where it should
+/// rather than somewhere plausible.
 ///
-/// The layout, identical in every index version: `ctime` (8), `mtime` (8),
-/// `dev`, `ino`, `mode`, `uid`, `gid`, `size` (4 each), the object id, then a
-/// 16-bit flags word. Only the name differs — versions 2 and 3 store it
+/// The entry layout is identical in every index version: `ctime` (8), `mtime`
+/// (8), `dev`, `ino`, `mode`, `uid`, `gid`, `size` (4 each), the object id, then
+/// a 16-bit flags word. Only the name differs — versions 2 and 3 store it
 /// NUL-terminated and pad the entry to a multiple of eight, version 4 stores it
 /// as "strip this many bytes off the previous name, then append this" with no
 /// padding at all.
-fn size_fields(
+fn scan(
     body: &[u8],
     version: u32,
     count: usize,
     hash_len: usize,
     paths: &[Vec<u8>],
-) -> Option<Vec<usize>> {
+) -> Option<Scan> {
     /// Offset of the `size` field from the start of an entry.
     const SIZE_FIELD: usize = 36;
     // Everything before the name: the stat block, the object id, the flags.
@@ -235,7 +277,35 @@ fn size_fields(
         previous = name;
     }
 
-    Some(fields)
+    // The extension section: a four-byte signature and a length each, back to
+    // back, until the data runs out. Walking it has to land exactly on the last
+    // byte — anything else means the entry walk went wrong somewhere earlier and
+    // the offsets above are not `size` fields at all.
+    let mut split_index = false;
+    while cursor < body.len() {
+        let header_end = cursor.checked_add(8)?;
+        if header_end > body.len() {
+            return None;
+        }
+        if &body[cursor..cursor + 4] == b"link" {
+            split_index = true;
+        }
+        let length = u32::from_be_bytes([
+            body[cursor + 4],
+            body[cursor + 5],
+            body[cursor + 6],
+            body[cursor + 7],
+        ]) as usize;
+        cursor = header_end.checked_add(length)?;
+        if cursor > body.len() {
+            return None;
+        }
+    }
+
+    Some(Scan {
+        size_fields: fields,
+        split_index,
+    })
 }
 
 /// Git's variable-width integer, as version 4 uses it for the prefix length.
@@ -265,53 +335,80 @@ fn varint(bytes: &[u8]) -> Option<(usize, usize)> {
     Some((value, index))
 }
 
-/// Replaces the index through `index.lock`, the way git itself does.
+/// `index.lock`, held for the whole read-modify-write.
 ///
 /// Using git's own lock name rather than a private temporary file is what makes
 /// this safe next to a concurrent git: whoever creates the lock first wins, and
-/// the other backs off.
-///
-/// # Errors
-///
-/// [`Error::Config`] when the lock is already held — a refusal, not a failure —
-/// and [`Error::Io`] when the write itself fails.
-fn replace_under_lock(index_path: &Path, data: &[u8]) -> Result<()> {
-    use std::io::Write as _;
+/// the other backs off. Dropping the guard without committing removes the lock,
+/// so every early return in [`forget_stat`] releases it.
+struct Lock {
+    path: std::path::PathBuf,
+    target: std::path::PathBuf,
+    file: Option<fs::File>,
+}
 
-    let lock = index_path.with_extension("lock");
-    let mut options = fs::OpenOptions::new();
-    let mut file = match options.write(true).create_new(true).open(&lock) {
-        Ok(file) => file,
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err(Error::Config(format!(
-                "{} is held by another git process, so the stat cache was left alone. \
-                 The files are decrypted correctly; if `git status` shows them as \
-                 modified, `git add --renormalize .` settles it.",
-                lock.display()
-            )));
+impl Lock {
+    /// Takes the lock, or reports that someone else has it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] when the lock file cannot be created for any other reason.
+    fn acquire(index_path: &Path) -> Result<Option<Self>> {
+        let path = index_path.with_extension("lock");
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => Ok(Some(Self {
+                path,
+                target: index_path.to_path_buf(),
+                file: Some(file),
+            })),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+            Err(err) => Err(Error::Io(err)),
         }
-        Err(err) => return Err(Error::Io(err)),
-    };
+    }
 
-    let result = (|| -> std::io::Result<()> {
-        if let Ok(existing) = fs::metadata(index_path) {
-            file.set_permissions(existing.permissions())?;
+    /// Writes `data` and renames the lock into place.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] when the write or the rename fails; the index is then left
+    /// exactly as it was and the lock is released.
+    fn commit(mut self, data: &[u8]) -> Result<()> {
+        use std::io::Write as _;
+
+        let mut file = self.file.take().ok_or_else(|| {
+            Error::Io(std::io::Error::other("the index lock was already released"))
+        })?;
+
+        let result = (|| -> std::io::Result<()> {
+            if let Ok(existing) = fs::metadata(&self.target) {
+                file.set_permissions(existing.permissions())?;
+            }
+            file.write_all(data)?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        drop(file);
+
+        if let Err(err) = result.and_then(|()| fs::rename(&self.path, &self.target)) {
+            let _ = fs::remove_file(&self.path);
+            return Err(Error::Io(err));
         }
-        file.write_all(data)?;
-        file.sync_all()?;
         Ok(())
-    })();
-    drop(file);
+    }
+}
 
-    if let Err(err) = result {
-        let _ = fs::remove_file(&lock);
-        return Err(Error::Io(err));
+impl Drop for Lock {
+    fn drop(&mut self) {
+        if self.file.take().is_some() {
+            // Not committed: release the lock rather than leave a repository
+            // that no git command can write to.
+            let _ = fs::remove_file(&self.path);
+        }
     }
-    if let Err(err) = fs::rename(&lock, index_path) {
-        let _ = fs::remove_file(&lock);
-        return Err(Error::Io(err));
-    }
-    Ok(())
 }
 
 /// The hash a repository's index is checksummed with.
@@ -433,6 +530,35 @@ mod tests {
                 "index version {version}: git saw a change that is not there"
             );
         }
+    }
+
+    #[test]
+    fn a_split_index_is_refused_out_loud_instead_of_quietly_doing_nothing() {
+        // With `core.splitIndex` the entries live in `.git/sharedindex.<oid>`
+        // and this file holds only the differences, so the walk matches nothing.
+        // Reporting that as success left `git status` permanently dirty with no
+        // message — measured on git 2.55, and the reason this branch exists.
+        // `features.manyFiles=true` turns split index on wholesale.
+        let dir = repo_with_index(2);
+        let ok = Command::new("git")
+            .args(["update-index", "--split-index"])
+            .current_dir(dir.path())
+            .status()
+            .expect("git must be on PATH")
+            .success();
+        assert!(ok, "git could not split the index");
+
+        let outcome = forget_stat(&index_of(&dir), gix_hash::Kind::Sha1, &[b"a.txt".to_vec()])
+            .expect("a split index is not our failure");
+
+        match outcome {
+            Outcome::Skipped(message) => assert!(
+                message.contains("split index"),
+                "the user must be told which limitation they hit: {message}"
+            ),
+            other => panic!("a split index must not be reported as done: {other:?}"),
+        }
+        assert_eq!(git_status(&dir), "", "the index was left unusable");
     }
 
     #[test]

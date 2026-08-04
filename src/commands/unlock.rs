@@ -16,7 +16,11 @@
 //! 38 bytes each, no decryption — before a single byte is written, and before
 //! the key is even installed. Discovering the mismatch on the fourth file out of
 //! ten would leave a working tree that is half readable and a repository holding
-//! a key that does not belong to it.
+//! a key that does not belong to it. The limit of that promise is worth naming:
+//! the check can only object to a key it has evidence against, so a working tree
+//! with no encrypted file in it accepts any key. That case gets a warning rather
+//! than a refusal, because proving it would mean scanning history, which is
+//! `status`'s job in S-06.
 //!
 //! **Interrupting it is survivable.** The files are converted in place, one at a
 //! time, so a run cut short leaves some plain and some not. That is recoverable
@@ -60,10 +64,13 @@ pub struct Report {
 ///
 /// # Errors
 ///
-/// [`Error::NoKey`] when no key is given and none is present,
-/// [`Error::Config`] when the repository holds a different key or `.git-xcrypt`
-/// cannot be understood, [`Error::Format`] when a file in the working tree
-/// belongs to another key, [`Error::Io`] on a read or write failure.
+/// [`Error::NoKey`] when no key is given and none is present. [`Error::Config`]
+/// when `.git-xcrypt` cannot be understood, or when the repository already holds
+/// a key other than the one offered — note that this second case is code `2`
+/// rather than the `4` a file-level mismatch reports, because the refusal comes
+/// from the repository's own key file and not from anything a header said.
+/// [`Error::Format`] when a file in the working tree belongs to another key.
+/// [`Error::Io`] on a read or write failure.
 pub fn run(repo: &Repo, key_source: Option<&Path>) -> Result<Report> {
     let key = match key_source {
         Some(path) => {
@@ -77,19 +84,23 @@ pub fn run(repo: &Repo, key_source: Option<&Path>) -> Result<Report> {
     };
     let key_id = key.key_id();
 
+    // Everything that must be readable before anything is written. `.git-xcrypt`
+    // is loaded here rather than after the key is installed, so a typo in it
+    // cannot leave a key behind on its way out.
+    let config = Config::load(&repo.xcrypt_config_path())?;
+    let git_config = gitconfig::open_full(repo.common_dir())?;
+    let autocrlf = gitconfig::get(&git_config, "core.autocrlf");
+    let core_eol = gitconfig::get(&git_config, "core.eol");
+
     // Everything carrying our magic, and the key each one asks for. Gathered
     // before the first write, so a mismatch costs nothing.
-    let encrypted = collect_encrypted(repo.work_tree())?;
+    let mut walk_warnings = Vec::new();
+    let encrypted = collect_encrypted(repo, &mut walk_warnings)?;
     refuse_foreign_keys(repo, &encrypted, &key_id)?;
 
     let key_imported = super::import_key::install(repo, &key)?;
     // Before the decryption, never after — see the module comment.
     let config_written = super::init::register_driver(repo)?;
-
-    let config = Config::load(&repo.xcrypt_config_path())?;
-    let git_config = gitconfig::open_full(repo.common_dir())?;
-    let autocrlf = gitconfig::get(&git_config, "core.autocrlf");
-    let core_eol = gitconfig::get(&git_config, "core.eol");
 
     let mut report = Report {
         key_id,
@@ -98,6 +109,21 @@ pub fn run(repo: &Repo, key_source: Option<&Path>) -> Result<Report> {
         decrypted: Vec::new(),
         warnings: config.pointless_eol.clone(),
     };
+    report.warnings.append(&mut walk_warnings);
+
+    if key_imported && encrypted.is_empty() {
+        // The check above can only object to a key it has evidence against, and
+        // an empty working tree offers none. Saying so is the honest version of
+        // "a wrong key changes nothing": nothing was changed, but nothing
+        // confirmed the key either, and committing under the wrong one would
+        // split the repository's history across two keys.
+        report.warnings.push(format!(
+            "no encrypted file was found here, so nothing confirmed that key {} \
+             is this repository's. Run `git-xcrypt status` once the secrets are \
+             checked out.",
+            crate::format_key_id(&key_id)
+        ));
+    }
     // The same paths, spelled the way the index stores them.
     let mut rewritten: Vec<Vec<u8>> = Vec::new();
 
@@ -130,6 +156,10 @@ pub fn run(repo: &Repo, key_source: Option<&Path>) -> Result<Report> {
         // Zeroizing: this is the secret, now in the clear on the heap.
         let plaintext = Zeroizing::new(outcome.content);
         if *plaintext == content {
+            // Unreachable for anything `collect_encrypted` yields — ciphertext
+            // is 38 bytes longer than its plaintext, so the two can never be
+            // equal. Skipping what is already plain happens one level up, in the
+            // walk; this is only here so a write can never be a no-op.
             continue;
         }
         // Atomic, and inheriting the file's own mode, so an interruption cannot
@@ -168,25 +198,55 @@ struct Encrypted {
 ///
 /// Only the first 38 bytes of each file are read, so the cost is one open per
 /// file rather than one full read — the same reasoning that lets `status` scan a
-/// whole history cheaply.
+/// whole history cheaply. The walk is otherwise exhaustive: it has no notion of
+/// `.gitignore`, so it does descend `target/` and `node_modules/`. That is the
+/// price of deciding by header, and it buys the case that matters — an encrypted
+/// file that no current pattern selects still gets decrypted, exactly as a
+/// checkout would decrypt it.
+///
+/// Untracked files are included for the same reason, and the bootstrap
+/// exclusions (`.gitattributes`, `.git-xcrypt`) are not consulted: a file
+/// carrying our magic is one of ours whatever its name, and leaving it as
+/// ciphertext would be the surprise.
+///
+/// A path that cannot be read becomes a warning rather than a failure. One
+/// root-owned build artefact must not be able to stop a user recovering their
+/// secrets, and skipping a file only ever means leaving it encrypted.
 ///
 /// Symbolic links are left alone: following one would write outside the
 /// repository, and replacing it would destroy the link. `.git` is skipped at
 /// every level, which also skips submodules — they have their own configuration
 /// and their own key, and are documented as needing their own `unlock`.
-fn collect_encrypted(root: &Path) -> Result<Vec<Encrypted>> {
+fn collect_encrypted(repo: &Repo, warnings: &mut Vec<String>) -> Result<Vec<Encrypted>> {
     let mut found = Vec::new();
-    let mut pending = vec![root.to_path_buf()];
+    let mut pending = vec![repo.work_tree().to_path_buf()];
 
     while let Some(directory) = pending.pop() {
-        for entry in fs::read_dir(&directory)? {
-            let entry = entry?;
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(err) => {
+                warnings.push(format!("{}: not searched ({err})", directory.display()));
+                continue;
+            }
+        };
+
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    warnings.push(format!("{}: not searched ({err})", directory.display()));
+                    continue;
+                }
+            };
             if entry.file_name() == ".git" {
                 continue;
             }
 
             let path = entry.path();
-            let metadata = fs::symlink_metadata(&path)?;
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                warnings.push(format!("{}: skipped, it could not be read", path.display()));
+                continue;
+            };
             if metadata.is_symlink() {
                 continue;
             }
@@ -197,8 +257,16 @@ fn collect_encrypted(root: &Path) -> Result<Vec<Encrypted>> {
             if !metadata.is_file() {
                 continue;
             }
-            if let Some(header) = peek_header(&path)? {
-                found.push(Encrypted { path, header });
+
+            match peek_header(&path) {
+                // A file whose header will not parse is one of ours and broken;
+                // that has to stop the run, unlike a file we simply cannot open.
+                Ok(Some(header)) => found.push(Encrypted { path, header }),
+                Ok(None) => {}
+                Err(Error::Io(err)) => {
+                    warnings.push(format!("{}: skipped ({err})", path.display()));
+                }
+                Err(err) => return Err(err),
             }
         }
     }
@@ -228,12 +296,18 @@ fn peek_header(path: &Path) -> Result<Option<Header>> {
 }
 
 /// Reads until `buffer` is full or the file ends, returning how much arrived.
+///
+/// `Interrupted` is retried rather than reported, the way `std`'s own readers
+/// do: a signal arriving during a 38-byte read is not a reason to abandon a
+/// user's repository half unlocked.
 fn fill(file: &mut fs::File, buffer: &mut [u8]) -> std::io::Result<usize> {
     let mut filled = 0;
     while filled < buffer.len() {
-        match file.read(&mut buffer[filled..])? {
-            0 => break,
-            read => filled += read,
+        match file.read(&mut buffer[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
         }
     }
     Ok(filled)
@@ -384,6 +458,64 @@ mod tests {
             fs::read(repo.work_tree().join("secrets/mine.env")).expect("reading"),
             mine_before,
             "a file was decrypted before the mismatch was found"
+        );
+    }
+
+    #[test]
+    fn a_key_nothing_can_vouch_for_is_taken_but_said_out_loud() {
+        // The pre-flight check can only object to a key it has evidence
+        // against. With no encrypted file in the working tree there is none, so
+        // any key is accepted — and the user has to be told, or a wrong one
+        // silently splits the repository's history across two keys.
+        let dir = init_repo();
+        let repo = Repo::discover(dir.path()).expect("discovery");
+        let holder = tempfile::TempDir::new().expect("temporary directory");
+        let path = holder.path().join("repo.key");
+        crate::keyfile::write_portable(&path, &MasterKey::from_bytes([77u8; MASTER_KEY_LEN]))
+            .expect("writing the export");
+
+        let report = run(&repo, Some(&path)).expect("unlock must succeed");
+
+        assert!(report.key_imported);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("nothing confirmed")),
+            "the user was told nothing: {:?}",
+            report.warnings
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_unreadable_directory_does_not_stop_the_whole_unlock() {
+        // A root-owned build artefact must not be able to stand between a user
+        // and their secrets.
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (_dir, repo) = prepared();
+        let key = repo.load_key().expect("key");
+        write_encrypted(&repo, "secrets/db.env", &key, b"hunter2\n");
+        let closed = repo.work_tree().join("closed");
+        fs::create_dir(&closed).expect("directories");
+        fs::write(closed.join("something"), b"x").expect("writing");
+        fs::set_permissions(&closed, fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        let report = run(&repo, None);
+
+        // Restore before asserting, or the temporary directory cannot be removed.
+        fs::set_permissions(&closed, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let report = report.expect("one closed directory must not fail the command");
+
+        assert_eq!(report.decrypted.len(), 1, "the readable secret was skipped");
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("closed")),
+            "the skipped directory went unmentioned: {:?}",
+            report.warnings
         );
     }
 

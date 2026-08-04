@@ -19,7 +19,17 @@
 //! the same half-written failure — a truncated key file is a repository nobody
 //! can decrypt again — but the opposite permission rule, since inheriting a
 //! loose mode from whatever was there before is exactly what a key must not do.
+//!
+//! The temporary file is created with `O_EXCL` and an unguessable name, which is
+//! not tidiness. Without `O_EXCL` the name is merely a name: anyone able to
+//! write the destination directory could pre-create it as a symlink, and
+//! `File::create` would follow the link, write the master key wherever it points
+//! and then rename the link over the destination. `export-key ~/keys/repo.key`
+//! is a private directory, but `export-key /tmp/repo.key` is not, and the
+//! command whose whole job is to hand over a key is the wrong place to rely on
+//! the user picking a safe directory.
 
+use std::ffi::OsString;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -42,11 +52,22 @@ enum Mode {
 /// The temporary file lives beside the target, because `rename` across
 /// filesystems is not a rename at all and would fall back to a copy.
 ///
-/// Two limits worth knowing rather than discovering. A target that is a symlink
-/// is replaced by a regular file, where `fs::write` would have followed the link
-/// — `.gitattributes` under a dotfile manager is the case where that shows. And
-/// the temporary file is only cleaned up on a returned error, so a process
-/// killed outright can leave one behind; it is attribute text, never a secret.
+/// Three limits worth knowing rather than discovering.
+///
+/// A target that is a symlink is replaced by a regular file, where `fs::write`
+/// would have followed the link — `.gitattributes` under a dotfile manager is
+/// the case where that shows. A target that is one of several hard links to the
+/// same inode loses the link for the same reason. And the temporary file is only
+/// cleaned up on a returned error, so a process killed outright can leave one
+/// behind.
+///
+/// That last one is not always harmless. `unlock` replaces working-tree files
+/// through here, so on that path the leftover holds a **decrypted secret** under
+/// a name no `.git-xcrypt` pattern was written for — `secrets/` still covers it,
+/// `*.env` does not. It inherits the target's permissions, which for a file git
+/// checked out means it is no more readable than the file it replaces, but a
+/// later `git add -A` could store it in the clear. There is no portable way to
+/// clean up after `SIGKILL`; the residue is recorded here rather than hidden.
 ///
 /// # Errors
 ///
@@ -59,9 +80,9 @@ pub fn write(path: &Path, contents: &[u8]) -> Result<()> {
 /// Writes `contents` to `path` with owner-only permissions, in one step.
 ///
 /// The same replacement as [`write`], with two differences that matter only for
-/// key material: the file is narrowed to `0600` before a single byte reaches it,
-/// and the target's permissions are **not** inherited — a key file that was
-/// somehow left world readable must not stay that way.
+/// key material: the file is created `0600` before a single byte reaches it, and
+/// the target's permissions are **not** inherited — a key file that was somehow
+/// left world readable must not stay that way.
 ///
 /// On Windows there is no mode to set, so the file inherits the directory ACL.
 /// That is the protection git gives `.git/config`, and `.git/` is where the
@@ -76,28 +97,18 @@ pub fn write_owner_only(path: &Path, contents: &[u8]) -> Result<()> {
 }
 
 fn replace(path: &Path, contents: &[u8], mode: Mode) -> Result<()> {
-    let temporary = temporary_sibling(path)?;
+    let (temporary, mut file) = create_temporary(path, mode)?;
 
     let result = (|| -> std::io::Result<()> {
-        let mut file = fs::File::create(&temporary)?;
         // A fresh file gets 0666 minus the umask, so without this a deliberately
         // narrowed `.git/config` — the one that holds credential helpers and
-        // remote URLs — would come back world readable. Either way this happens
-        // before the first write, so there is no window in which the content is
-        // on disk under looser permissions than it asked for.
-        match mode {
-            Mode::InheritTarget => {
-                if let Ok(existing) = fs::metadata(path) {
-                    file.set_permissions(existing.permissions())?;
-                }
-            }
-            Mode::OwnerOnly => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt as _;
-                    file.set_permissions(fs::Permissions::from_mode(0o600))?;
-                }
-            }
+        // remote URLs — would come back world readable. It happens before the
+        // first write, so there is no window in which the content is on disk
+        // under looser permissions than the file it replaces.
+        if matches!(mode, Mode::InheritTarget)
+            && let Ok(existing) = fs::metadata(path)
+        {
+            file.set_permissions(existing.permissions())?;
         }
         file.write_all(contents)?;
         // Without this the rename can land before the content does, which on a
@@ -131,8 +142,18 @@ fn sync_directory(path: &Path) {
     }
 }
 
-/// A path next to `path` that no concurrent run of this tool will pick.
-fn temporary_sibling(path: &Path) -> Result<PathBuf> {
+/// Creates a fresh file next to `path`, and only ever a fresh one.
+///
+/// `create_new` is `O_EXCL`: it fails rather than opening anything that is
+/// already there, symlink included, which is what keeps a pre-created link from
+/// redirecting the write. The name is random rather than derived from the
+/// process id, so it cannot be predicted and pre-created in the first place;
+/// `O_EXCL` alone would then turn the attack into a denial of service, hence the
+/// retries.
+///
+/// A key file is created at `0600` from the outset, so its content is never on
+/// disk under a wider mode even for an instant.
+fn create_temporary(path: &Path, mode: Mode) -> Result<(PathBuf, fs::File)> {
     let name = path.file_name().ok_or_else(|| {
         Error::Io(std::io::Error::other(format!(
             "{} does not name a file",
@@ -140,9 +161,41 @@ fn temporary_sibling(path: &Path) -> Result<PathBuf> {
         )))
     })?;
 
+    #[cfg(not(unix))]
+    let _ = mode;
+
+    let mut last = None;
+    for _ in 0..8 {
+        let candidate = path.with_file_name(temporary_name(name)?);
+
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        if matches!(mode, Mode::OwnerOnly) {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+
+        match options.open(&candidate) {
+            Ok(file) => return Ok((candidate, file)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => last = Some(err),
+            Err(err) => return Err(Error::Io(err)),
+        }
+    }
+
+    Err(Error::Io(last.unwrap_or_else(|| {
+        std::io::Error::other("could not create a temporary file")
+    })))
+}
+
+/// A sibling name no one can guess and therefore no one can pre-create.
+fn temporary_name(name: &std::ffi::OsStr) -> Result<OsString> {
+    let mut random = [0u8; 8];
+    getrandom::fill(&mut random).map_err(|err| Error::Entropy(err.to_string()))?;
+
     let mut temporary = name.to_os_string();
-    temporary.push(format!(".git-xcrypt-{}.tmp", std::process::id()));
-    Ok(path.with_file_name(temporary))
+    temporary.push(format!(".git-xcrypt-{}.tmp", crate::hex(&random)));
+    Ok(temporary)
 }
 
 #[cfg(test)]
@@ -215,6 +268,41 @@ mod tests {
 
         let mode = fs::metadata(&path).expect("metadata").permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "a key file kept loose permissions");
+    }
+
+    #[test]
+    fn a_temporary_file_never_reuses_a_name_and_never_opens_an_existing_one() {
+        // The name used to be `<target>.git-xcrypt-<pid>.tmp`: predictable, and
+        // opened without `O_EXCL`, so anyone able to write the directory could
+        // pre-create it as a symlink and have the master key written through it.
+        let dir = TempDir::new().expect("temporary directory");
+        let target = dir.path().join("repo.key");
+
+        let (first, _held) = create_temporary(&target, Mode::OwnerOnly).expect("first");
+        let (second, _also) = create_temporary(&target, Mode::OwnerOnly).expect("second");
+
+        assert_ne!(first, second, "two runs picked the same temporary name");
+        assert!(
+            create_temporary(&first, Mode::OwnerOnly).is_ok(),
+            "a name in use must simply be skipped"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_key_temporary_is_owner_only_before_any_content_reaches_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = TempDir::new().expect("temporary directory");
+        let (path, _held) =
+            create_temporary(&dir.path().join("repo.key"), Mode::OwnerOnly).expect("creating");
+
+        let mode = fs::metadata(&path).expect("metadata").permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "the key would have been world readable while it was being written"
+        );
     }
 
     #[test]

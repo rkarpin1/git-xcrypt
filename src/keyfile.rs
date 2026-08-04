@@ -68,11 +68,10 @@ fn decode(bytes: &[u8]) -> Result<MasterKey> {
 
 /// Writes `key` to `path`, creating parent directories.
 ///
-/// The file is owner-only before any key material reaches it: on Unix it is
-/// created with mode `0600`, and an already existing file — where the creation
-/// mode would be ignored — is narrowed straight after opening and before the
-/// first write. Either way there is no window in which the key is world
-/// readable.
+/// The file is owner-only before any key material reaches it: on Unix the
+/// replacement is created with mode `0600` and renamed into place, so neither a
+/// fresh file nor one that already existed with looser permissions has a moment
+/// in which the key is world readable.
 ///
 /// # Errors
 ///
@@ -136,7 +135,11 @@ pub fn encode_portable(key: &MasterKey) -> Zeroizing<String> {
     text.push(' ');
     text.push_str(&crate::format_key_id(&key.key_id()));
     text.push('\n');
-    text.push_str(&BASE64.encode(key.expose_bytes()));
+    // `encode` allocates a buffer of its own holding the whole key; wrapping the
+    // outer string and leaving that one on the heap would protect one copy of
+    // two.
+    let encoded = Zeroizing::new(BASE64.encode(key.expose_bytes()));
+    text.push_str(&encoded);
     text.push('\n');
     Zeroizing::new(text)
 }

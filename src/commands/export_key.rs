@@ -48,7 +48,7 @@ pub fn run(repo: &Repo, destination: &Path, force: bool) -> Result<Report> {
     if let Some(parent) = destination.parent()
         && !parent.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(parent)?;
+        create_key_directory(parent)?;
     }
     keyfile::write_portable(destination, &key)?;
 
@@ -88,6 +88,28 @@ fn refuse_bad_destination(repo: &Repo, destination: &Path, force: bool) -> Resul
     }
 
     Ok(resolved)
+}
+
+/// Creates the directory the key is about to land in, owner-only.
+///
+/// A directory this command creates exists to hold keys, so `0700` rather than
+/// the usual `0755` — the file itself is `0600` either way, but a directory
+/// anyone can list is one more thing a user did not ask for. Directories that
+/// already exist keep whatever permissions their owner chose.
+fn create_key_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)?;
+    }
+    Ok(())
 }
 
 /// An absolute, symlink-resolved form of `path`, which need not exist yet.
