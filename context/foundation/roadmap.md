@@ -109,7 +109,7 @@ Fundament poniżej zakłada ten stan i nie tworzy ponownie niczego, co jest zgł
 - **Unknowns:**
   - Jak nie dopuścić do rozjazdu pliku konfiguracyjnego i konfiguracji czytanej przez gita? — Właściciel: użytkownik. Blokuje: tak.
   - Jak przetłumaczyć wzorzec katalogowy `katalog/` i negacje na semantykę, którą git faktycznie honoruje? — Właściciel: użytkownik. Blokuje: nie.
-  - Jakie zachowanie domyślne przy braku deklaracji EOL — binarny czy `text=auto`? Rozstrzygnięte, że `.git-crypt` przejmuje semantykę `text`/`-text`/`eol=lf`/`eol=crlf`, bo `-text` odbiera te atrybuty na plikach szyfrowanych; otwarte zostaje samo domyślne. Patrz `zalozenia.md` §Końce linii. — Właściciel: użytkownik. Blokuje: nie.
+  - Jakie zachowanie domyślne przy braku deklaracji EOL — binarny czy `text=auto`? Rozstrzygnięte, że `.git-xcrypt` przejmuje semantykę `text`/`-text`/`eol=lf`/`eol=crlf`, bo `-text` odbiera te atrybuty na plikach szyfrowanych; otwarte zostaje samo domyślne. Patrz `zalozenia.md` §Końce linii. — Właściciel: użytkownik. Blokuje: nie.
 - **Risk:** rozjazd konfiguracji daje ciche nieszyfrowanie — sekret wygląda na chroniony, a trafia do repozytorium jawnie. To najgroźniejszy tryb awarii w całym produkcie i dlatego element nie nadaje się do planowania przed zapadnięciem decyzji.
 - **Status:** blocked
 

@@ -1,5 +1,5 @@
 ---
-project: "git-crypt"
+project: "git-xcrypt"
 context_type: greenfield
 created: 2026-08-03
 updated: 2026-08-03
@@ -69,16 +69,16 @@ Zarządzanie odbiorcami (`add-user` / `list-users`, koperty kluczy per odbiorca)
 
 Pełny przepływ przechodzi od początku do końca:
 
-1. `git init` + `git-crypt init` w nowym repozytorium.
-2. Wpisanie wzorców (`sekrety/`, `*.env`) do `.git-crypt`.
+1. `git init` + `git-xcrypt init` w nowym repozytorium.
+2. Wpisanie wzorców (`sekrety/`, `*.env`) do `.git-xcrypt`.
 3. Commit i push pliku zawierającego sekret.
-4. Bloby w zdalnym repozytorium są zaszyfrowane; `.git-crypt` pozostaje jawny.
+4. Bloby w zdalnym repozytorium są zaszyfrowane; `.git-xcrypt` pozostaje jawny.
 5. Klon na drugiej maszynie → `export-key` / `unlock` → treść identyczna z oryginałem.
 6. `git status` po `unlock` jest czysty.
 
 ### Secondary
 
-- Generator `.git-crypt` → `.gitattributes` działa — konfiguracja w składni `.gitignore` zamiast ręcznej edycji `.gitattributes`.
+- Generator `.git-xcrypt` → `.gitattributes` działa — konfiguracja w składni `.gitignore` zamiast ręcznej edycji `.gitattributes`.
 
 ### Guardrails
 
@@ -178,7 +178,7 @@ Brak luk bramkowych. Nierozstrzygnięte kwestie zebrane niżej — cztery z nich
 
 ## Open Questions
 
-1. **Jak nie dopuścić do rozjazdu `.git-crypt` i `.gitattributes`?** — git czyta wyłącznie `.gitattributes`; edycja jednego pliku bez synchronizacji daje ciche nieszyfrowanie. Kontrargument przyjęty przy FR-002, rozwiązanie nierozstrzygnięte. Owner: użytkownik. Blokuje: tak (dotyka rdzenia bezpieczeństwa).
+1. **Jak nie dopuścić do rozjazdu `.git-xcrypt` i `.gitattributes`?** — git czyta wyłącznie `.gitattributes`; edycja jednego pliku bez synchronizacji daje ciche nieszyfrowanie. Kontrargument przyjęty przy FR-002, rozwiązanie nierozstrzygnięte. Owner: użytkownik. Blokuje: tak (dotyka rdzenia bezpieczeństwa).
 2. **Co chroni użytkownika przed utratą jedynego pliku klucza?** — kontrargument przyjęty przy FR-008; brak kopii zapasowej klucza oznacza utratę całej historii sekretów. Owner: użytkownik.
 3. **Co chroni przed `lock` wykonanym bez wcześniejszego `export-key`?** — kontrargument przyjęty przy FR-009; jedna komenda może odciąć dostęp do własnych danych. Owner: użytkownik.
 4. **Jak głęboko `status` sprawdza repozytorium — HEAD czy cała historia?** — kontrargument przyjęty przy FR-010; płytkie sprawdzenie daje fałszywe poczucie bezpieczeństwa, głębokie może być zbyt wolne. Owner: użytkownik.

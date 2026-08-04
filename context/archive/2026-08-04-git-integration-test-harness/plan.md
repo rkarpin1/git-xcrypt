@@ -52,7 +52,7 @@ Weryfikacja: `cargo test` zielone, `cargo clippy --all-targets -- -D warnings` b
   Potwierdzone sondą. To czyni kryterium 5 z `prd.md` §Success Criteria sprawdzalnym wprost.
 - **Git uruchamia polecenie filtra przez powłokę**, więc ścieżka do binarki wymaga cytowania —
   ścieżki `target/` z odstępami w nazwie inaczej rozpadną się na argumenty.
-- **`env!("CARGO_BIN_EXE_git-crypt")`** daje testowi integracyjnemu ścieżkę do zbudowanej
+- **`env!("CARGO_BIN_EXE_git-xcrypt")`** daje testowi integracyjnemu ścieżkę do zbudowanej
   binarki bez zgadywania układu `target/`. Nazwa celu binarnego jest równa nazwie pakietu.
 - **Odwrócenie bajtów jest inwolucją** (`rev(rev(x)) == x`), więc jedna komenda pełni rolę
   zarówno `clean`, jak i `smudge`. Wymaga zbuforowania całego wejścia — tak samo jak AES-SIV,
@@ -64,8 +64,8 @@ Weryfikacja: `cargo test` zielone, `cargo clippy --all-targets -- -D warnings` b
 - **Żadnego formatu pliku** — brak magic, wersji formatu, identyfikatora klucza. To zapada w `S-01`.
 - **Żadnych prawdziwych komend CLI** — `init`, `status`, `lock`, `unlock`, `export-key` nie powstają.
   Nie wprowadzamy też biblioteki do parsowania argumentów; wybór `clap` vs alternatywa należy do `S-01`.
-- **Żadnego zarządzania kluczem** — katalog `.git/git-crypt/keys/` nie powstaje.
-- **Żadnego pliku `.git-crypt`** ani generowania `.gitattributes` — to `S-02`.
+- **Żadnego zarządzania kluczem** — katalog `.git/git-xcrypt/keys/` nie powstaje.
+- **Żadnego pliku `.git-xcrypt`** ani generowania `.gitattributes` — to `S-02`.
 - **Żadnego CI** — workflow GitHub Actions należy do `S-07`. Kod ma być przenośny, ale
   przenośność nie jest w tym elemencie dowodzona empirycznie na trzech platformach.
 - **Żadnej poprawki `zalozenia.md`** — błąd opisany w Key Discoveries jest odnotowany,
@@ -119,8 +119,8 @@ Crate zyskuje strukturę `lib` + cienki `bin` i pierwszy obiekt, który git moż
 automatycznie z obecności `src/lib.rs` i `src/main.rs` — nie deklarujemy ich jawnie.
 
 **Kontrakt**: sekcja `[dependencies]` zawiera `thiserror`; nowa sekcja `[dev-dependencies]`
-zawiera `tempfile`. Nazwa pakietu pozostaje `git-crypt`, bo od niej zależy
-`CARGO_BIN_EXE_git-crypt` używane w fazie 2.
+zawiera `tempfile`. Nazwa pakietu to `git-xcrypt`, bo od niej zależy
+`CARGO_BIN_EXE_git-xcrypt` używane w fazie 2.
 
 #### 2. Biblioteka
 
@@ -144,8 +144,8 @@ przez odwracanie i zgodne z dwuprzebiegową naturą SIV.
 **Cel**: sprowadzić `main` do parsowania argumentu i mapowania błędu na kod wyjścia.
 Rozpoznaje ukrytą komendę `__test-filter` (oraz jej wariant wymuszający awarię) i nic więcej.
 
-**Kontrakt**: `git-crypt __test-filter` czyta `stdin`, pisze przetworzone bajty na `stdout`,
-kończy się kodem `0`. `git-crypt __test-filter --fail` nie pisze nic na `stdout` i kończy się
+**Kontrakt**: `git-xcrypt __test-filter` czyta `stdin`, pisze przetworzone bajty na `stdout`,
+kończy się kodem `0`. `git-xcrypt __test-filter --fail` nie pisze nic na `stdout` i kończy się
 ustalonym niezerowym kodem. Każde inne wywołanie kończy się niezerowym kodem i komunikatem
 na `stderr`. Parsowanie przez `std::env::args_os` — bez biblioteki do argumentów, bo pełne
 CLI projektuje `S-01`.
@@ -155,15 +155,15 @@ CLI projektuje `S-01`.
 #### Automated Verification:
 
 - Projekt buduje się z obydwoma celami: `cargo build`
-- Transformacja działa i jest odwracalna: `printf 'abc' | ./target/debug/git-crypt __test-filter` daje `cba`
-- Wariant awaryjny zwraca niezerowy kod: `printf 'abc' | ./target/debug/git-crypt __test-filter --fail; echo $?`
+- Transformacja działa i jest odwracalna: `printf 'abc' | ./target/debug/git-xcrypt __test-filter` daje `cba`
+- Wariant awaryjny zwraca niezerowy kod: `printf 'abc' | ./target/debug/git-xcrypt __test-filter --fail; echo $?`
 - Testy jednostkowe biblioteki przechodzą: `cargo test --lib`
 - Linting przechodzi: `cargo clippy --all-targets -- -D warnings`
 - Formatowanie zgodne: `cargo fmt --check`
 
 #### Manual Verification:
 
-- `git-crypt __test-filter` nie wypisuje niczego poza danymi na `stdout` — sprawdzone
+- `git-xcrypt __test-filter` nie wypisuje niczego poza danymi na `stdout` — sprawdzone
   przekierowaniem `stdout` do pliku i porównaniem rozmiaru z wejściem.
 
 ---
@@ -191,7 +191,7 @@ go przez `mod harness;`.
   **Świadomie nie izolujemy globalnej konfiguracji gita** — decyzja użytkownika, konsekwencje
   w Open Risks.
 - rejestracja filtra pod podaną nazwą: ustawia `clean`, `smudge` **oraz `required = true`**;
-  polecenie to zacytowana ścieżka `env!("CARGO_BIN_EXE_git-crypt")` z argumentem `__test-filter`.
+  polecenie to zacytowana ścieżka `env!("CARGO_BIN_EXE_git-xcrypt")` z argumentem `__test-filter`.
 - zapis pliku z bajtów, zapis `.gitattributes`, uruchomienie dowolnego polecenia gita
   ze zwrotem pełnego `Output`, wykonanie commita.
 - odczyt bloba: `git cat-file blob HEAD:<ścieżka>` ze zwrotem `Vec<u8>`.
@@ -399,7 +399,7 @@ Nie dotyczy — brak istniejących danych i brak wydanego formatu.
 #### Automated
 
 - [x] 1.1 Projekt buduje się z obydwoma celami: `cargo build`
-- [x] 1.2 Transformacja działa i jest odwracalna: `printf 'abc' | ./target/debug/git-crypt __test-filter` daje `cba`
+- [x] 1.2 Transformacja działa i jest odwracalna: `printf 'abc' | ./target/debug/git-xcrypt __test-filter` daje `cba`
 - [x] 1.3 Wariant awaryjny zwraca niezerowy kod — `exit=70`, `stdout` pusty
 - [x] 1.4 Testy jednostkowe biblioteki przechodzą: `cargo test --lib` (4 testy)
 - [x] 1.5 Linting przechodzi: `cargo clippy --all-targets -- -D warnings`

@@ -134,4 +134,4 @@ Przydatne kroki ręczne w międzyczasie:
 - Repozytorium git już istnieje, ale nie ma jeszcze żadnego commita — warto zacommitować stan wyjściowy razem z katalogiem `context/`.
 - Brak plików `.scaffold` do przejrzenia — polityka konfliktów nie została uruchomiona.
 - Brak znalezisk audytu do rozpatrzenia. Powtórzyć `cargo audit` po dodaniu pierwszych zależności.
-- Przed planowaniem implementacji rozstrzygnąć otwarte pytanie nr 1 z PRD (rozjazd `.git-crypt` ↔ `.gitattributes`), oznaczone jako blokujące.
+- Przed planowaniem implementacji rozstrzygnąć otwarte pytanie nr 1 z PRD (rozjazd `.git-xcrypt` ↔ `.gitattributes`), oznaczone jako blokujące.

@@ -21,8 +21,8 @@ Tworzony jest nowy projekt ze względów edukacyjnych oraz dlatego, że projekty
 - W katalogu roboczym użytkownika pliki są **odszyfrowane**; w repozytorium zdalnym (GitHub) te same pliki są **zaszyfrowane**.
 - Inicjacja projektu ma być prosta — wystarcza `git-xcrypt init`. Nie powstają żadne dodatkowe skrypty pomocnicze ani pliki, których użytkownik musi pilnować ręcznie.
 - Wymagany klucz repozytorium jest generowany automatycznie przy inicjacji.
-- Konfiguracja plików i katalogów do szyfrowania opiera się na **własnym pliku konfiguracyjnym o składni podobnej do `.gitignore`** (roboczo `.git-crypt`). Jest to świadome odejście od oryginału, który wymaga ręcznej edycji `.gitattributes`.
-  - Plik `.git-crypt` jest wersjonowany w repozytorium.
+- Konfiguracja plików i katalogów do szyfrowania opiera się na **własnym pliku konfiguracyjnym o składni podobnej do `.gitignore`**, nazwanym `.git-xcrypt`. Jest to świadome odejście od oryginału, który wymaga ręcznej edycji `.gitattributes`.
+  - Plik `.git-xcrypt` jest wersjonowany w repozytorium.
   - Aplikacja generuje z niego wpisy w `.gitattributes` (git nie potrafi czytać naszego formatu bezpośrednio) — wygenerowana sekcja jest oznaczona markerami i **zarządzana wyłącznie przez narzędzie**.
   - Wzorzec katalogowy `sekrety/` musi zostać przetłumaczony na działający w git wzorzec `sekrety/**` — obsługa tego przypadku jest wymogiem, nie detalem.
   - Negacje (`!plik`) muszą być obsłużone lub jawnie odrzucone z czytelnym błędem.
@@ -32,12 +32,12 @@ Tworzony jest nowy projekt ze względów edukacyjnych oraz dlatego, że projekty
 
 **W zakresie v0.1:**
 
-- `git-xcrypt init` — generuje klucz repozytorium, rejestruje filtry w `.git/config`, tworzy `.git-crypt` (jeśli brak) i synchronizuje `.gitattributes`.
+- `git-xcrypt init` — generuje klucz repozytorium, rejestruje filtry w `.git/config`, tworzy `.git-xcrypt` (jeśli brak) i synchronizuje `.gitattributes`.
 - `git-xcrypt status` — wypisuje, które pliki są szyfrowane, a które **powinny być, a nie są** (np. zacommitowane przed konfiguracją).
 - `git-xcrypt lock` — usuwa klucz z repo i zaszyfrowuje pliki w katalogu roboczym.
 - `git-xcrypt unlock` — wczytuje klucz i odszyfrowuje pliki w katalogu roboczym.
 - `git-xcrypt export-key` / `import-key` — eksport i import klucza symetrycznego do przenoszenia między maszynami.
-- `git-xcrypt sync` — regeneruje sekcję w `.gitattributes` na podstawie `.git-crypt`.
+- `git-xcrypt sync` — regeneruje sekcję w `.gitattributes` na podstawie `.git-xcrypt`.
 - `git-xcrypt add-user` / `list-users` — zarządzanie odbiorcami (patrz „Zarządzanie kluczami i użytkownikami").
 
 **Poza zakresem v0.1** (do świadomego odłożenia, nie do cichego pominięcia):
@@ -78,7 +78,7 @@ Przyjęte rozwiązanie:
 - Uprawnienia pliku klucza: `0600` na systemach uniksowych; na Windows odpowiednie ACL ograniczone do właściciela.
 - Klucz nigdy nie jest wypisywany na `stdout` poza jawną komendą `export-key`.
 - **Odbiorcy natywnie w Rust, bez zewnętrznego `gpg`.** Rekomendacja: format **age** (crate `age`, odbiorcy X25519, opcjonalnie passphrase przez scrypt) — mały, nowoczesny, w pełni rustowy, nie ciągnie zależności systemowych. Sequoia (OpenPGP) daje zgodność z istniejącymi kluczami GPG kosztem znacznie większego nakładu i rozmiaru binarki. **Wybór do potwierdzenia** — patrz „Otwarte decyzje".
-- Klucz repozytorium jest zaszyfrowany osobno dla każdego odbiorcy; koperty przechowywane w repozytorium (np. `.git-crypt/keys/`), więc każdy uprawniony może wykonać `unlock` po sklonowaniu.
+- Klucz repozytorium jest zaszyfrowany osobno dla każdego odbiorcy; koperty przechowywane w repozytorium w katalogu `.git-xcrypt-keys/`, więc każdy uprawniony może wykonać `unlock` po sklonowaniu. Katalog **nie** może nazywać się `.git-xcrypt/` — tę nazwę zajmuje plik konfiguracyjny, a plik i katalog o tej samej nazwie nie mogą współistnieć.
 - Dodanie odbiorcy daje mu dostęp do **całej historii**, nie tylko do commitów od momentu dodania — klucz repozytorium jest jeden i niezmienny. Analogicznie usunięcie odbiorcy nie odbiera dostępu do tego, co już sklonował; wymaga rotacji klucza. Obie własności muszą być jasno opisane w dokumentacji użytkownika.
 
 # Integracja z git
@@ -121,7 +121,7 @@ Reguła do odtworzenia na wyjściu smudge (zmierzona, przy ustawionym `text`):
 
 Niezmiennik, który spina asymetrię: na Windows z `autocrlf=true` smudge zapisuje CRLF, w katalogu roboczym leży CRLF, a następny clean normalizuje z powrotem do LF → ten sam ciphertext co przed checkoutem → `git status` czysty. To ten sam model, którym git obsługuje indeks, przesunięty o jeden krok, przed AEAD.
 
-**Deklaracja trybu należy do `.git-crypt`, nie do gita.** Skoro `-text` odbiera użytkownikowi atrybuty `text`/`eol` na plikach szyfrowanych, `.git-crypt` musi przejąć tę samą semantykę per wzorzec: `text`, `-text`, `eol=lf`, `eol=crlf` oraz zachowanie domyślne przy braku deklaracji. Nie wymyślamy własnego modelu — odtwarzamy ten, który użytkownik zna z `.gitattributes`, z tą różnicą, że `eol=*` działa u nas na wyjściu smudge, a nie w gicie. Deklaracja jest wersjonowana, więc jest jednakowa na wszystkich maszynach — i to jest warunek, pod którym powyższy niezmiennik trzyma.
+**Deklaracja trybu należy do `.git-xcrypt`, nie do gita.** Skoro `-text` odbiera użytkownikowi atrybuty `text`/`eol` na plikach szyfrowanych, `.git-xcrypt` musi przejąć tę samą semantykę per wzorzec: `text`, `-text`, `eol=lf`, `eol=crlf` oraz zachowanie domyślne przy braku deklaracji. Nie wymyślamy własnego modelu — odtwarzamy ten, który użytkownik zna z `.gitattributes`, z tą różnicą, że `eol=*` działa u nas na wyjściu smudge, a nie w gicie. Deklaracja jest wersjonowana, więc jest jednakowa na wszystkich maszynach — i to jest warunek, pod którym powyższy niezmiennik trzyma.
 
 **Konfigurację czytamy biblioteką, nie procesem potomnym.** `gix-config` (gitoxide) daje pełną precedencję system/global/repo/worktree wraz z `include`/`includeIf`, kompiluje się do środka binarki i nie łamie wymogu samowystarczalności z „Założeń technicznych". Wywoływanie `git config` odpada: git uruchamia nowy proces filtra na każdy plik, więc byłoby to N spawnów na ścieżce gorącej, najdroższych akurat na Windows. Pozostaje jedna binarka `git-xcrypt` w kilku trybach (`clean`, `smudge`, `diff` rejestrowane przez `init`; reszta wywoływana przez użytkownika); żadnego osobnego programu pomocniczego ani demona.
 
@@ -159,9 +159,9 @@ Wszystkie poniższe są **akceptowanymi kompromisami** konstrukcji, nie błędam
 Projekt uznajemy za działający, gdy poniższy scenariusz przechodzi automatycznie na trzech platformach:
 
 1. `git init` + `git-xcrypt init` w nowym repo.
-2. Dodanie do `.git-crypt` wpisów `sekrety/` i `*.env`.
+2. Dodanie do `.git-xcrypt` wpisów `sekrety/` i `*.env`.
 3. Commit pliku `sekrety/haslo.txt` i `.env`, push do zdalnego repo.
-4. Zawartość blobów w zdalnym repo jest zaszyfrowana; `.git-crypt` i `.gitattributes` pozostają jawne.
+4. Zawartość blobów w zdalnym repo jest zaszyfrowana; `.git-xcrypt` i `.gitattributes` pozostają jawne.
 5. `git clone` na drugiej maszynie pokazuje pliki zaszyfrowane; po `git-xcrypt unlock` treść jest identyczna z oryginałem.
 6. Powtórny `git status` po unlock jest czysty (dowód determinizmu).
 
@@ -170,8 +170,8 @@ Projekt uznajemy za działający, gdy poniższy scenariusz przechodzi automatycz
 1. **Format odbiorców: age czy OpenPGP (sequoia)?** Rekomendacja: age dla v0.1.
 2. ~~**Nazwa crate'a i binarki** wobec kolizji z oryginalnym `git-crypt`.~~ Rozstrzygnięte 2026-08-04: `git-xcrypt` dla obu — patrz „Dystrybucja, licencja i nazewnictwo".
 3. **Licencja projektu** po weryfikacji licencji projektów inspirujących.
-4. Nazwa pliku konfiguracyjnego: `.git-crypt` (kolizja z ewentualnym katalogiem na koperty kluczy) czy `.gitcrypt` / `.git-crypt-attributes`.
+4. ~~Nazwa pliku konfiguracyjnego.~~ Rozstrzygnięte 2026-08-04: plik nazywa się `.git-xcrypt`, a koperty kluczy — gdyby kiedykolwiek powstały — trafiają do `.git-xcrypt-keys/`. To usuwa kolizję, która była istotą tego pytania: plik i katalog o identycznej nazwie nie mogą współistnieć.
 5. Próg rozmiaru pliku, powyżej którego przechodzimy na buforowanie dyskowe zamiast RAM.
 6. Które komendy z oryginału poza listą MVP faktycznie chcemy odtworzyć.
-7. **Zachowanie domyślne przy braku deklaracji EOL w `.git-crypt`**: traktować plik jako binarny (żadnej konwersji, bezpieczne) czy jako `text=auto` z heurystyką gita (NUL w pierwszych 8000 bajtach)? Heurystyka nie łamie determinizmu — ta sama treść daje tę samą decyzję — ale jest cicha: dopisanie bajtu zerowego przełącza tryb i zmienia cały ciphertext. Patrz „Końce linii (LF/CRLF)".
+7. **Zachowanie domyślne przy braku deklaracji EOL w `.git-xcrypt`**: traktować plik jako binarny (żadnej konwersji, bezpieczne) czy jako `text=auto` z heurystyką gita (NUL w pierwszych 8000 bajtach)? Heurystyka nie łamie determinizmu — ta sama treść daje tę samą decyzję — ale jest cicha: dopisanie bajtu zerowego przełącza tryb i zmienia cały ciphertext. Patrz „Końce linii (LF/CRLF)".
 8. **Czy odtwarzamy ostrzeżenie `core.safecrlf`** dla plików o mieszanych końcach linii, które nie przetrwają round-tripu.

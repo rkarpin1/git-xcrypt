@@ -42,7 +42,7 @@ testy: różnica blob/plik roboczy, round-trip, czysty `status`, plik pusty, pli
 awaria filtra.
 
 **Poza zakresem:** kryptografia, format pliku, prawdziwe komendy CLI, biblioteka do argumentów,
-zarządzanie kluczem, plik `.git-crypt`, generowanie `.gitattributes`, CI, poprawka `zalozenia.md`.
+zarządzanie kluczem, plik `.git-xcrypt`, generowanie `.gitattributes`, CI, poprawka `zalozenia.md`.
 
 ## Approach
 
