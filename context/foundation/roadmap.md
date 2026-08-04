@@ -93,9 +93,9 @@ Fundament poniżej zakłada ten stan i nie tworzy ponownie niczego, co jest zgł
 - **Parallel with:** —
 - **Blockers:** —
 - **Unknowns:**
-  - Który szyfr i jaki układ nagłówka formatu? `zalozenia.md` rekomenduje AES-256-SIV z wersją formatu w nagłówku — Właściciel: użytkownik. Blokuje: nie.
-  - Jak `init` wykrywa, że repozytorium jest już skonfigurowane, żeby nie nadpisać klucza? — Właściciel: użytkownik. Blokuje: nie.
-- **Risk:** tu zapada format pliku — po tym elemencie każda zmiana formatu psuje istniejące repozytoria, dlatego wersja formatu musi trafić do nagłówka już w pierwszym commicie. Kryptografia świadomie nie jest osobnym fundamentem: ląduje w pierwszym elemencie, który jej faktycznie potrzebuje, żeby nie budować warstwy przed jej użyciem.
+  - ~~Który szyfr i jaki układ nagłówka formatu?~~ Rozstrzygnięte 2026-08-04: AES-256-SIV (RFC 5297, `aes-siv`), nagłówek 22 B jako AAD — magic, `format_version`, `suite`, `flags`, `key_id` — plus 16 B SIV; klucz główny 32 B z wyprowadzaniem per suite przez HKDF-SHA-256. Patrz `zalozenia.md` §Kryptografia i format pliku. — Właściciel: użytkownik. Blokuje: nie.
+  - ~~Jak `init` wykrywa, że repozytorium jest już skonfigurowane, żeby nie nadpisać klucza?~~ Rozstrzygnięte 2026-08-04: trzy reguły — klucz istnieje → nigdy nie nadpisuj, tylko napraw resztę; klucza brak przy śladach wcześniejszej konfiguracji → odmowa z kodem `2`; klucza brak bez śladów → świeża inicjacja. Bez `--force`. Patrz `zalozenia.md` §Integracja z git. — Właściciel: użytkownik. Blokuje: nie.
+- **Risk:** tu zapada format pliku — po tym elemencie każda zmiana formatu psuje istniejące repozytoria, dlatego wersja formatu musi trafić do nagłówka już w pierwszym commicie. Ryzyko zredukowane przed planowaniem: format przepuszczono 2026-08-04 przez listę 16 przyszłych funkcjonalności (odbiorcy, klucze per stanowisko, rotacja, wiele kluczy, tryb blokowy, kompresja, dopełnianie, zmiana szyfru); 13 pozycji obsługuje bez zmian, pozostałe trzy wymusiły bajt `flags` i regułę „od offsetu 22 decyduje `suite`". Kryptografia świadomie nie jest osobnym fundamentem: ląduje w pierwszym elemencie, który jej faktycznie potrzebuje.
 - **Status:** proposed
 
 ### S-02: Konfiguracja w składni .gitignore
@@ -183,7 +183,7 @@ Fundament poniżej zakłada ten stan i nie tworzy ponownie niczego, co jest zgł
 | Roadmap ID | Change ID                    | Sugerowany tytuł zadania                            | Gotowe do `/10x-plan` | Uwagi                                       |
 | ---------- | ---------------------------- | --------------------------------------------------- | --------------------- | ------------------------------------------- |
 | F-01       | git-integration-test-harness | Harness testów na prawdziwym repozytorium git       | tak                   | Uruchom `/10x-plan git-integration-test-harness` |
-| S-01       | transparent-encrypt-decrypt  | Przezroczyste szyfrowanie w jednym repozytorium     | nie                   | Czeka na F-01                               |
+| S-01       | transparent-encrypt-decrypt  | Przezroczyste szyfrowanie w jednym repozytorium     | tak                   | F-01 zamknięty, obie niewiadome rozstrzygnięte 2026-08-04. Uruchom `/10x-plan transparent-encrypt-decrypt` |
 | S-02       | gitignore-style-config       | Konfiguracja w składni .gitignore                   | nie                   | Zablokowane: rozjazd konfiguracji           |
 | S-03       | key-export-and-unlock        | Eksport klucza i odblokowanie po klonie             | nie                   | Czeka na S-01                               |
 | S-04       | lock-repository              | Zamknięcie repozytorium                             | nie                   | Zablokowane: zabezpieczenie przed utratą klucza |
