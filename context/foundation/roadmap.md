@@ -36,9 +36,9 @@ Produkt rozstrzyga na podstawie wzorców ścieżek, które pliki opuszczają mas
 | S-01  | transparent-encrypt-decrypt  | commitować plik i dostać ciphertext w repo, plaintext w katalogu roboczym | F-01          | FR-001, FR-004, FR-005 | proposed |
 | S-02  | gitignore-style-config       | wskazać pliki do szyfrowania w składni `.gitignore`                      | S-01          | FR-002, FR-003         | proposed |
 | S-03  | key-export-and-unlock        | odzyskać sekrety po klonie na drugiej maszynie                           | S-01          | US-01, FR-007, FR-008  | proposed |
-| S-04  | lock-repository              | zamknąć odblokowane repozytorium z powrotem                              | S-03          | FR-009                 | blocked  |
+| S-04  | lock-repository              | zamknąć odblokowane repozytorium z powrotem                              | S-03          | FR-009                 | proposed |
 | S-05  | decrypted-diff               | oglądać różnice na treści jawnej                                         | S-01          | FR-006                 | proposed |
-| S-06  | encryption-status-check      | sprawdzić, co jest szyfrowane, a co powinno być                          | S-02          | FR-010                 | blocked  |
+| S-06  | encryption-status-check      | sprawdzić, co jest szyfrowane, a co powinno być                          | S-02          | FR-010                 | proposed |
 | S-07  | cross-platform-binaries      | pobrać gotową binarkę dla swojej platformy                               | S-01          | FR-011                 | proposed |
 
 ## Streams
@@ -136,9 +136,9 @@ Fundament poniżej zakłada ten stan i nie tworzy ponownie niczego, co jest zgł
 - **Parallel with:** —
 - **Blockers:** —
 - **Unknowns:**
-  - Co chroni przed zamknięciem repozytorium bez wcześniejszego wyeksportowania klucza? — Właściciel: użytkownik. Blokuje: tak.
-- **Risk:** jedna komenda może odciąć użytkownika od całej historii własnych sekretów. Rzadko używana ścieżka o wysokim koszcie błędu jest jednocześnie tą najsłabiej przetestowaną w praktyce.
-- **Status:** blocked
+  - ~~Co chroni przed zamknięciem repozytorium bez wcześniejszego wyeksportowania klucza?~~ Rozstrzygnięte 2026-08-04: `lock` domyślnie interaktywny z potwierdzeniem `yes`, flaga `--yes` na tryb nieinteraktywny, ostrzeżenie w obu trybach z `key_id` (nigdy z kluczem), plus odmowa przy niezacommitowanych zmianach, której `--yes` nie obchodzi. Patrz `zalozenia.md` §Zarządzanie kluczami → „Zabezpieczenia `lock`". — Właściciel: użytkownik. Blokuje: nie.
+- **Risk:** jedna komenda może odciąć użytkownika od całej historii własnych sekretów. Rzadko używana ścieżka o wysokim koszcie błędu jest jednocześnie tą najsłabiej przetestowaną w praktyce — stąd zabezpieczenia są dwa i osobne, bo utrata klucza i utrata niezacommitowanych zmian to różne ryzyka.
+- **Status:** proposed
 
 ### S-05: Różnice na treści odszyfrowanej
 
@@ -154,16 +154,19 @@ Fundament poniżej zakłada ten stan i nie tworzy ponownie niczego, co jest zgł
 
 ### S-06: Widoczność stanu szyfrowania
 
-- **Outcome:** użytkownik sprawdza jedną komendą, które pliki są szyfrowane i które pasują do wzorca, a mimo to trafiły do repozytorium jawnie.
+- **Outcome:** użytkownik sprawdza jedną komendą, czy konfiguracja jest kompletna i czy pliki dziś szyfrowane nie występowały kiedyś w repozytorium jawnie — a to, co da się naprawić bezpiecznie, naprawia flagą `--fix`.
 - **Change ID:** encryption-status-check
 - **PRD refs:** FR-010
 - **Prerequisites:** S-02
 - **Parallel with:** —
 - **Blockers:** —
+- **Zakres doprecyzowany 2026-08-04:** cztery zadania — kompletność `filter.git-xcrypt.*` w `.git/config`, skan całej osiągalnej historii po 11 bajtach magic, `--fix` ponownie dodający pliki leżące jawnie w `HEAD`/indeksie oraz ostrzeżenie na ścieżce filtra przy pierwszym szyfrowaniu pliku, który już leży w `HEAD` jawnie (implementowane w filtrze, ale należy do tego elementu). Kod wyjścia `5` przy znalezisku, do użycia jako bramka CI. Czyszczenie historii **nie wchodzi** — komenda raportuje ekspozycję i wypisuje procedurę, w której rotacja sekretu wyprzedza przepisanie historii.
 - **Unknowns:**
-  - Jak głęboko sprawdzać repozytorium — tylko bieżący stan czy całą historię? — Właściciel: użytkownik. Blokuje: tak.
-- **Risk:** płytkie sprawdzenie daje fałszywe poczucie bezpieczeństwa i jest gorsze niż brak komendy; głębokie może być na tyle wolne, że nikt go nie uruchamia. Element odpowiada na największe realne ryzyko produktu — sekret zacommitowany przed konfiguracją — więc kompromis między głębokością a czasem jest jego istotą, nie detalem.
-- **Status:** blocked
+  - ~~Jak głęboko sprawdzać repozytorium — tylko bieżący stan czy całą historię?~~ Rozstrzygnięte 2026-08-04: **cała osiągalna historia**. Przesłanka o koszcie okazała się słaba — skan nie deszyfruje, czyta 11 bajtów na blob o pasującej ścieżce, więc koszt zależy od liczby obiektów, nie od ich rozmiaru. — Właściciel: użytkownik. Blokuje: nie.
+  - ~~Czy skan historii ma odpalać się automatycznie przy dopisaniu nowego wzorca?~~ Rozstrzygnięte 2026-08-04: pełny skan zostaje ręczny (`status`) i w CI, a automatyczne jest **tanie ostrzeżenie na ścieżce filtra** — przy pierwszym szyfrowaniu pliku jeden odczyt obiektu sprawdza, czy ta sama ścieżka leży w `HEAD` jawnie. Filtr to jedyny mechanizm działający niezależnie od klienta; hak `pre-commit` odpada. — Właściciel: użytkownik. Blokuje: nie.
+  - Czy `stderr` filtra jest wystarczająco widoczny w oknie narzędziowym Git w JetBrains, żeby ostrzeżenie nie ginęło? Do sprawdzenia empirycznie w planie `S-06`, na tym repozytorium otwartym w RustRoverze. — Właściciel: —. Blokuje: nie.
+- **Risk:** płytkie sprawdzenie dawałoby fałszywe poczucie bezpieczeństwa i byłoby gorsze niż brak komendy — dlatego głębokość jest pełna. Zostaje ryzyko komunikacyjne: `--fix` naprawia wyłącznie przyszłość, a użytkownik może odczytać „naprawiono" jako „sekret jest bezpieczny". Treść komunikatów jest tu częścią zabezpieczenia, nie kosmetyką.
+- **Status:** proposed
 
 ### S-07: Gotowa binarka dla trzech platform
 
@@ -187,16 +190,16 @@ Fundament poniżej zakłada ten stan i nie tworzy ponownie niczego, co jest zgł
 | S-01       | transparent-encrypt-decrypt  | Przezroczyste szyfrowanie w jednym repozytorium     | tak                   | F-01 zamknięty, obie niewiadome rozstrzygnięte 2026-08-04. Uruchom `/10x-plan transparent-encrypt-decrypt` |
 | S-02       | gitignore-style-config       | Konfiguracja w składni .gitignore                   | nie                   | Czeka na S-01; wszystkie trzy niewiadome rozstrzygnięte 2026-08-04 |
 | S-03       | key-export-and-unlock        | Eksport klucza i odblokowanie po klonie             | nie                   | Czeka na S-01                               |
-| S-04       | lock-repository              | Zamknięcie repozytorium                             | nie                   | Zablokowane: zabezpieczenie przed utratą klucza |
+| S-04       | lock-repository              | Zamknięcie repozytorium                             | nie                   | Czeka na S-03; zabezpieczenia rozstrzygnięte 2026-08-04 |
 | S-05       | decrypted-diff               | Różnice na treści odszyfrowanej                     | nie                   | Czeka na S-01                               |
-| S-06       | encryption-status-check      | Widoczność stanu szyfrowania                        | nie                   | Zablokowane: głębokość sprawdzenia          |
+| S-06       | encryption-status-check      | Widoczność stanu szyfrowania                        | nie                   | Czeka na S-02; głębokość rozstrzygnięta 2026-08-04 |
 | S-07       | cross-platform-binaries      | Binarki dla Windows, macOS i Linuksa                | nie                   | Czeka na S-01; nazwa i licencja rozstrzygnięte |
 
 ## Open Roadmap Questions
 
 1. ~~**Jak nie dopuścić do rozjazdu pliku konfiguracyjnego i konfiguracji czytanej przez gita?**~~ Rozstrzygnięte 2026-08-04: konstrukcja catch-all, `.git-xcrypt` jedynym źródłem prawdy, filtr długożyjący jako warunek wykonalności. Patrz `prd.md` §Open Questions poz. 1 i `zalozenia.md` §Integracja z git. — Właściciel: użytkownik. Blokuje: nic.
-2. **Co chroni przed zamknięciem repozytorium bez wcześniejszego wyeksportowania klucza?** — Właściciel: użytkownik. Blokuje: `S-04`.
-3. **Jak głęboko `status` sprawdza repozytorium — bieżący stan czy cała historia?** — Właściciel: użytkownik. Blokuje: `S-06`.
+2. ~~**Co chroni przed zamknięciem repozytorium bez wcześniejszego wyeksportowania klucza?**~~ Rozstrzygnięte 2026-08-04: potwierdzenie interaktywne, ostrzeżenie z `key_id` zamiast klucza, odmowa przy brudnym katalogu roboczym. — Właściciel: użytkownik. Blokuje: nic.
+3. ~~**Jak głęboko `status` sprawdza repozytorium — bieżący stan czy cała historia?**~~ Rozstrzygnięte 2026-08-04: cała osiągalna historia, plus `--fix` na naprawę bezpieczną i kod wyjścia `5` przy znalezisku. — Właściciel: użytkownik. Blokuje: nic.
 4. ~~**Jaka nazwa crate'a i binarki wobec kolizji z oryginalnym `git-crypt`?**~~ Rozstrzygnięte 2026-08-04: `git-xcrypt` dla crate'a i binarki. — Właściciel: użytkownik. Blokuje: nic.
 5. ~~**Jaka licencja projektu wobec GPL-3.0 projektów inspirujących?**~~ Rozstrzygnięte 2026-08-04: `MIT OR Apache-2.0` dla crate'a i binarki. — Właściciel: użytkownik. Blokuje: nic.
 6. **Co chroni użytkownika przed utratą jedynego pliku klucza?** — Właściciel: użytkownik. Blokuje: nic; wpływa na zakres `S-03`.
@@ -211,6 +214,7 @@ Fundament poniżej zakłada ten stan i nie tworzy ponownie niczego, co jest zgł
 - **Kompatybilność z repozytoriami oryginalnego git-crypt** — Dlaczego: PRD §Non-Goals; własny format bez ścieżki migracji.
 - **Ukrywanie metadanych** — Dlaczego: PRD §Non-Goals; nazwy plików, rozmiary i fakt zmiany pozostają jawne z założenia konstrukcji.
 - **Ochrona przed skompromitowaną maszyną** — Dlaczego: PRD §Non-Goals; po odblokowaniu sekrety leżą jawnie na dysku.
+- **Natywne czyszczenie historii (`purge-history`)** — Dlaczego: rozstrzygnięte 2026-08-04. Własny odpowiednik `git-filter-repo` w Ruście to element wielkości `S-01` (wywołanie zewnętrznego narzędzia odpada przez wymóg samowystarczalnej binarki), a operacja i tak nie cofa wycieku — sekret zostaje w forkach, cache'ach i cudzych klonach. W v0.1 `S-06` raportuje ekspozycję i wypisuje procedurę zaczynającą się od rotacji sekretu.
 
 ## Done
 

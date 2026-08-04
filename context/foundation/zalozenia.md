@@ -33,7 +33,12 @@ Tworzony jest nowy projekt ze względów edukacyjnych oraz dlatego, że projekty
 **W zakresie v0.1:**
 
 - `git-xcrypt init` — generuje klucz repozytorium, rejestruje filtry w `.git/config` (w tym `filter.git-xcrypt.process` i `required = true`), tworzy `.git-xcrypt` (jeśli brak) i wpisuje do `.gitattributes` statyczną linię catch-all.
-- `git-xcrypt status` — wypisuje, które pliki są szyfrowane, a które **powinny być, a nie są** (np. zacommitowane przed konfiguracją).
+- `git-xcrypt status` — rozstrzygnięte 2026-08-04, trzy zadania:
+  - **kompletność konfiguracji** — czy `filter.git-xcrypt.*` jest w `.git/config`. Bez tego klon, w którym nie uruchomiono `init`/`unlock`, przepuszcza treść mimo linii catch-all w `.gitattributes`.
+  - **skan całej osiągalnej historii** — czy pliki dziś szyfrowane występowały kiedyś w repozytorium w postaci jawnej. Sprawdzenie płytkie odpada: sekret zacommitowany przed konfiguracją albo później usunięty z `HEAD` jest w `HEAD` niewidoczny, a nadal leży w historii i nadal jest u hostingodawcy. Skan nie wymaga deszyfrowania — wystarczy sprawdzić 11 bajtów magic na początku każdego bloba, którego ścieżka pasuje do wzorca, więc koszt zależy od liczby obiektów, nie od ich rozmiaru.
+  - **`--fix` dla naprawy bezpiecznej** — pliki pasujące do wzorca, a leżące jawnie w `HEAD` lub indeksie, zostają ponownie dodane, więc od następnego commita są szyfrowane. Operacja lokalna, bez przepisywania historii. Flaga siedzi przy `status`, bo diagnoza i naprawa dzielą całą analizę.
+  - Przy znalezisku kod wyjścia `5` — pozwala wpiąć komendę w CI jako bramkę i odróżnia ekspozycję od błędu narzędzia.
+  - **Granica do udokumentowania:** `status` odpowiada na pytanie „czy moje deklaracje są egzekwowane", a nie „czy w repozytorium są sekrety". Plik, który nigdy nie pasował do żadnego wzorca, jest dla tej komendy niewidzialny.
 - `git-xcrypt lock` — usuwa klucz z repo i zaszyfrowuje pliki w katalogu roboczym.
 - `git-xcrypt unlock` — wczytuje klucz i odszyfrowuje pliki w katalogu roboczym.
 - `git-xcrypt export-key` / `import-key` — eksport i import klucza symetrycznego do przenoszenia między maszynami.
@@ -46,6 +51,7 @@ Tworzony jest nowy projekt ze względów edukacyjnych oraz dlatego, że projekty
 - Wiele niezależnych kluczy w jednym repo (`--key-name`).
 - Migracja repozytoriów zaszyfrowanych oryginalnym `git-crypt`.
 - Rotacja klucza i wycofywanie dostępu odbiorcy z przepisaniem historii.
+- **Natywne czyszczenie historii z jawnych wersji plików.** Rozstrzygnięte 2026-08-04. W v0.1 `status` **raportuje** ekspozycję — ścieżki, commity, bloby — wypisuje gotowe polecenie dla zewnętrznego `git-filter-repo` i checklistę zaczynającą się od rotacji sekretu. Sama operacja zostaje poza zakresem z dwóch powodów: przepisanie historii to własny odpowiednik `git-filter-repo` w Ruście, czyli osobny element roadmapy wielkości `S-01` (wywołanie zewnętrznego narzędzia odpada przez wymóg samowystarczalnej binarki), a przede wszystkim **nie jest tym, czym się wydaje** — czyści repozytorium, ale nie cofa wycieku: sekret zostaje w forkach, cache'ach, logach CI i cudzych klonach. Jedyną realną naprawą jest rotacja sekretu. Gdy funkcja powstanie, dostanie własną komendę o nazwie mówiącej, co robi (`purge-history`), a nie „naprawia".
 
 # Założenia techniczne
 
@@ -143,6 +149,34 @@ key_id        = HKDF-SHA-256(ikm = klucz główny,
 
 Powód jest zaporowy: różne szyfry biorą klucze różnej długości (AES-256-SIV 64 B, AES-256-GCM-SIV i XChaCha20 po 32 B), a format pliku klucza jest zamrożony **tak samo mocno** jak format danych, bo leży u użytkowników i w kopiach zapasowych. Przy kluczu głównym każdy przyszły suite dostaje własny materiał z separacją domen, format pliku klucza nie zmienia się nigdy, a `key_id` identyfikuje klucz niezależnie od szyfru — więc `export-key`, `import-key` i `unlock` są odporne na zmianę suite. Plik klucza ma własny nagłówek z wersją, z tego samego powodu co plik danych.
 
+## Zabezpieczenia `lock` — rozstrzygnięte 2026-08-04
+
+`lock` usuwa **jedyną** kopię klucza: `.git/` nie jest wersjonowane ani pushowane, więc po tej komendzie odszyfrowanie całej dotychczasowej historii zależy wyłącznie od kopii spoza repozytorium. Nazwa myli, bo sugeruje symetrię — `unlock` tego nie cofnie. Strata jest przy tym odroczona: nic nie psuje się w momencie wykonania, prawda wychodzi przy próbie odblokowania, może po miesiącach. Stąd trzy zabezpieczenia:
+
+- **Domyślnie interaktywny, z potwierdzeniem przez wpisanie `yes`.** Flaga `--yes` przełącza w tryb nieinteraktywny (konwencja z `apt`/`dnf`; `--force` sugerowałoby obchodzenie zabezpieczenia, a tu chodzi o pominięcie pytania). Ostrzeżenie jest wypisywane **w obu trybach** — w nieinteraktywnym na `stderr`.
+- **Ostrzeżenie podaje `key_id`, nigdy sam klucz.** Rozważano wypisanie klucza jako ostatniej szansy na kopię i **odrzucono**: klucz zostawałby w scrollbacku terminala i buforze multipleksera, `git-xcrypt lock > lock.log` uruchomione wewnątrz repozytorium położyłoby go do drzewa roboczego (scenariusz wycieku opisany przy PRD FR-007), a w trybie nieinteraktywnym trafiałby do logu CI. `key_id` identyfikuje klucz jednoznacznie i jest dla atakującego bezwartościowy, a komunikat kieruje do `export-key`, który zapisuje klucz do pliku z uprawnieniami `0600`. Reguła „klucz nigdy na `stdout` poza `export-key`" zostaje nienaruszona.
+- **Odmowa przy niezacommitowanych zmianach.** `lock` zamienia pliki robocze na zaszyfrowane, więc niezapisane zmiany w plikach objętych wzorcem nie istnieją w żadnym blobie i przepadłyby razem z plaintextem — druga ścieżka utraty danych w tej samej komendzie, niezależna od klucza. `lock` odmawia i wypisuje listę takich plików. **Flaga `--yes` tego nie obchodzi**: to inne ryzyko niż utrata klucza i zasługuje na osobną decyzję użytkownika.
+
+Kody wyjścia: przerwanie przez użytkownika → `1`, nic nie zmienione; brudny katalog roboczy → `2`.
+
+Szkic komunikatu:
+
+```
+WARNING: lock deletes the only copy of this repository's key.
+
+  key_id: 3fa9120b7ec4558a
+  path:   .git/git-xcrypt/keys/default
+
+After this, decrypting anything — including the entire history — will be
+possible only from a copy of the key held outside this directory.
+unlock WILL NOT UNDO THIS.
+
+If you do not have a copy, abort and run:
+  git-xcrypt export-key ~/keys/git-xcrypt-3fa9120b.key
+
+Type `yes` to delete the key:
+```
+
 - Klucz repozytorium leży w `.git/git-xcrypt/keys/` — **nigdy** nie jest commitowany. Katalog `.git/` nie podlega wersjonowaniu, ale aplikacja dodatkowo pilnuje, by klucz nie trafił do drzewa roboczego.
 - Uprawnienia pliku klucza: `0600` na systemach uniksowych; na Windows odpowiednie ACL ograniczone do właściciela.
 - Klucz nigdy nie jest wypisywany na `stdout` poza jawną komendą `export-key`.
@@ -198,7 +232,7 @@ Konsekwencje wiążące:
 **Ryzyko, którego ta konstrukcja nie usuwa:** klon bez uruchomionego `init` / `unlock` ma `.gitattributes` z linią catch-all, ale nie ma wpisów `filter.git-xcrypt.*` w `.git/config`, bo `.git/config` nie jest wersjonowane. Git traktuje wtedy niezdefiniowany filtr jako brak filtra i przepuszcza treść. Commit sekretu z takiego klonu daje plaintext. Przeciwdziałanie: `status` (FR-010) sprawdza kompletność konfiguracji, a dokumentacja mówi wprost, że klon bez `unlock` nie jest bezpieczny do zapisu.
 - **Twarda reguła: na ścieżce clean/smudge nic poza danymi nie może trafić na `stdout`.** Żadnych `println!`, logów, pasków postępu. Diagnostyka wyłącznie na `stderr`. Naruszenie tej reguły cicho uszkadza pliki użytkownika.
 - Filtr musi być odporny na wielokrotne uruchomienie: szyfrowanie już zaszyfrowanej treści i deszyfrowanie plaintextu to przypadki do wykrycia i obsłużenia — tabela zachowań w „Kryptografia i format pliku" → „Idempotencja po nagłówku".
-- **Kody wyjścia — rozstrzygnięte 2026-08-04:** `0` sukces, `1` błąd użycia lub nieznany, `2` błąd konfiguracji (nie jest to repozytorium git, konflikt stanu przy `init`), `3` brak klucza, `4` błąd formatu (magic, `key_id`, nieznany bit `flags`, porażka tagu).
+- **Kody wyjścia — rozstrzygnięte 2026-08-04:** `0` sukces, `1` błąd użycia lub nieznany, `2` błąd konfiguracji lub konfliktu stanu (nie jest to repozytorium git, konflikt przy `init`, brudny katalog roboczy przy `lock`), `3` brak klucza, `4` błąd formatu (magic, `key_id`, nieznany bit `flags`, porażka tagu), `5` znaleziono ekspozycję (`status` wykrył jawne wersje w historii albo pliki niezaszyfrowane mimo wzorca).
 - **Wykrywanie stanu przez `init` — rozstrzygnięte 2026-08-04.** Stan tworzą cztery niezależne elementy: klucz w `.git/git-xcrypt/keys/`, wpisy `filter.git-xcrypt.*` w `.git/config`, plik `.git-xcrypt` i sekcja zarządzana w `.gitattributes`. Zamiast szesnastu przypadków obowiązują trzy reguły:
   - **Klucz istnieje → nigdy go nie ruszamy.** `init` naprawia pozostałe trzy elementy, raportuje co poprawił i kończy zerem. To jest odpowiedź na kontrargument z PRD FR-001: błąd w detekcji stanu nie może nadpisać klucza.
   - **Klucza brak, ale repozytorium nosi ślady wcześniejszej konfiguracji** (sekcja zarządzana w `.gitattributes` albo `.git-xcrypt` w HEAD) → to klon albo repozytorium po `lock`. Wygenerowanie nowego klucza uczyniłoby istniejące bloby nieodszyfrowywalnymi na zawsze, więc `init` **odmawia** z kodem `2` i wskazuje `unlock` / `import-key`.
@@ -207,6 +241,8 @@ Konsekwencje wiążące:
   - Repozytorium wykrywamy biblioteką (`gix-discover`), nie uruchomieniem `git` — wymóg samowystarczalności z „Założeń technicznych".
 - **Twarda reguła: filtr rejestrujemy z `filter.git-xcrypt.required = true`.** Wbrew intuicji sam niezerowy kod filtra **nie** przerywa operacji gita. Zmierzone na git 2.55 (repozytorium tymczasowe, nie na tym projekcie): bez tej flagi filtr `clean` kończący się kodem `3` daje `git add` **kod wyjścia 0**, git traktuje awarię jako nieszkodliwą i przepuszcza treść bez zmian — do indeksu i do bazy obiektów trafia **plaintext**, a użytkownik widzi tylko `error:` w szumie i udany commit. Z flagą: `fatal: <plik>: clean filter 'git-xcrypt' failed`, plik nie wchodzi do indeksu, żaden obiekt nie powstaje. Zabezpieczenie „błąd przerywa operację" jest więc własnością tej flagi, a nie samego gita — jej ustawienie należy do `init` i jest warunkiem gwarantki z PRD §Guardrails, nie detalem konfiguracji. Regresji pilnują dwa testy w `tests/filter_edge_cases.rs`; usunięcie flagi z harnessu wywala oba.
 - `.gitattributes` dla plików szyfrowanych musi zawierać `-text`, żeby `core.autocrlf` na Windows nie modyfikował ciphertextu — patrz „Końce linii (LF/CRLF)", gdzie opisany jest zmierzony mechanizm i jego konsekwencje.
+- **Zakładamy prawdziwego gita — rozstrzygnięte 2026-08-04.** Gwarancje tego narzędzia obowiązują dla klientów, które wywołują plik wykonywalny `git`; dotyczy to również IDE (JetBrains, VS Code) i nakładek graficznych, bo one uruchamiają gita pod spodem. Poza gwarancją są **własne implementacje protokołu** — JGit (Eclipse, Gerrit, część systemów CI) i narzędzia oparte na libgit2. Ryzyko jest konkretne: rejestrujemy filtr jako `filter.git-xcrypt.process`, a implementacja nieznająca protokołu długożyjącego może potraktować plik jako niefiltrowany i wpuścić plaintext do commita. Rozważano rejestrowanie równolegle `clean`/`smudge` jako siatki bezpieczeństwa (git przy ustawionym `process` i tak je ignoruje) i **odrzucono** — założenie o prawdziwym gicie jest jawne i zapisane, więc podtrzymywanie drugiej ścieżki tylko dla implementacji spoza zakresu byłoby kodem bez właściciela. Ograniczenie idzie do dokumentacji użytkownika.
+- **Ostrzeżenie przy pierwszym szyfrowaniu pliku.** Konstrukcja catch-all daje to niemal za darmo: filtr widzi każdy plik przechodzący przez `git add`, więc gdy plik jest szyfrowany po raz pierwszy, sprawdza jednym odczytem obiektu, czy ta sama ścieżka istnieje w `HEAD` jako jawna. Jeśli tak — ostrzeżenie na `stderr` z odesłaniem do `status`. To jedyny mechanizm uruchamiany automatycznie: hak `pre-commit` odpada (przełącznik „Run Git hooks" w JetBrains, `--no-verify` w terminalu, brak wersjonowania), a pełny skan historii w filtrze zatrzymywałby całe `git add`. **Nigdy kod niezerowy** — przy `required = true` przerwałby operację, a to jest ostrzeżenie, nie błąd.
 - Znane ograniczenia do udokumentowania: `git archive` eksportuje treść zaszyfrowaną (filtry nie są stosowane); submoduły mają własną konfigurację i wymagają osobnej inicjacji.
 
 # Końce linii (LF/CRLF)
@@ -329,7 +365,7 @@ Wszystkie poniższe są **akceptowanymi kompromisami** konstrukcji, nie błędam
 
 - Wyciekają **metadane**: nazwy plików, ścieżki, rozmiary, daty commitów i fakt, że plik się zmienił. Rozmiar przecieka **dokładnie**, a nie w przybliżeniu: SIV szyfruje trybem CTR, więc `rozmiar bloba = 38 + rozmiar treści`, co do bajta.
 - Szyfrowanie deterministyczne ujawnia, że dwa pliki mają identyczną treść, oraz że plik wrócił do poprzedniej wersji.
-- **Największe realne ryzyko: sekret zacommitowany zanim wzorzec trafił do konfiguracji.** Zostaje w historii w postaci jawnej na zawsze. Przeciwdziałanie: `git-xcrypt status` wskazuje takie pliki, a dokumentacja opisuje procedurę czyszczenia historii i rotacji sekretu.
+- **Największe realne ryzyko: sekret zacommitowany zanim wzorzec trafił do konfiguracji.** Zostaje w historii w postaci jawnej na zawsze. Przeciwdziałanie: `git-xcrypt status` skanuje całą osiągalną historię i wskazuje takie pliki, a dokumentacja opisuje procedurę czyszczenia historii. **Kolejność w tej procedurze jest wiążąca: najpierw rotacja sekretu, potem historia.** Przepisanie historii czyści repozytorium, ale nie cofa wycieku — sekret zostaje w forkach, cache'ach, logach CI i w każdym klonie, który już powstał.
 - Klucz w `.git/` jest tak bezpieczny jak dysk i konto użytkownika — narzędzie nie chroni przed skompromitowaną maszyną.
 - Poza modelem zagrożeń: atakujący z dostępem do odszyfrowanego katalogu roboczego, ataki side-channel, ochrona przed samym hostingiem po `unlock` na CI.
 - Sekrety nigdy nie trafiają do repozytorium projektu — również w testach i przykładach.
