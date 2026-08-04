@@ -220,6 +220,17 @@ impl TestRepo {
             .success()
     }
 
+    /// Pushes `branch` to a bare repository standing in for the hosting service.
+    ///
+    /// The founding document's acceptance criteria are written about a *remote*
+    /// — "the blobs in the remote repository are encrypted" — and nothing else
+    /// in this suite exercises the transport at all. `receive-pack` re-reads and
+    /// re-packs every object it accepts, so a repository that looks right
+    /// locally has still not been shown to arrive right.
+    pub fn push_to(&self, remote: &BareRemote, branch: &str) {
+        self.git_ok(["push", "-q", &remote.url(), &format!("{branch}:{branch}")]);
+    }
+
     /// Clones this repository into a fresh temporary directory.
     ///
     /// The clone inherits `.gitattributes` through history but not `.git/config`,
@@ -415,6 +426,124 @@ fn assert_bytes_eq(actual: &[u8], expected: &[u8], label: &str) {
         actual.len(),
         expected.len()
     );
+}
+
+/// A bare repository, standing in for the remote a user actually pushes to.
+///
+/// Bare on purpose rather than "another clone": a hosting service has no
+/// working tree, runs no filters, and its object database is the only thing a
+/// user's secrets can be judged by once they have left the machine.
+pub struct BareRemote {
+    _dir: TempDir,
+    path: PathBuf,
+}
+
+impl BareRemote {
+    /// Creates an empty bare repository.
+    pub fn new() -> Self {
+        require_git();
+
+        let dir = TempDir::new().expect("could not create a temporary directory");
+        let path = dir.path().join("remote.git");
+
+        let output = Command::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .arg(&path)
+            .output()
+            .expect("could not run git init --bare");
+        assert!(
+            output.status.success(),
+            "git init --bare failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        Self { _dir: dir, path }
+    }
+
+    /// The URL a push or clone should use.
+    pub fn url(&self) -> String {
+        self.path.display().to_string()
+    }
+
+    /// Raw bytes of the blob this repository stores for `relative_path`.
+    pub fn blob_bytes(&self, revision: &str, relative_path: &str) -> Vec<u8> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.path)
+            .args(["cat-file", "blob", &format!("{revision}:{relative_path}")])
+            .output()
+            .expect("could not run git cat-file");
+        assert!(
+            output.status.success(),
+            "git cat-file blob {revision}:{relative_path} failed in the remote: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    /// Whether the remote's object database holds a blob with exactly `contents`.
+    ///
+    /// The plaintext goes in over stdin, never through a file, for the reason
+    /// [`TestRepo::object_exists_for`] gives.
+    pub fn object_exists_for(&self, contents: &[u8]) -> bool {
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(&self.path)
+            .args(["hash-object", "-t", "blob", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("could not run git hash-object");
+        child
+            .stdin
+            .take()
+            .expect("stdin was piped")
+            .write_all(contents)
+            .expect("could not write to git hash-object");
+        let hashed = child
+            .wait_with_output()
+            .expect("git hash-object never ended");
+        assert!(
+            hashed.status.success(),
+            "git hash-object failed: {}",
+            String::from_utf8_lossy(&hashed.stderr)
+        );
+
+        let hash = String::from_utf8(hashed.stdout).expect("git printed a non-UTF-8 hash");
+        Command::new("git")
+            .arg("-C")
+            .arg(&self.path)
+            .args(["cat-file", "-e", &format!("{}^{{blob}}", hash.trim())])
+            .output()
+            .expect("could not run git cat-file -e")
+            .status
+            .success()
+    }
+
+    /// Clones this remote into a fresh temporary directory, as a second machine
+    /// would.
+    pub fn clone_to(&self) -> TestRepo {
+        let dir = TempDir::new().expect("could not create a temporary directory");
+        let path = dir.path().join("clone");
+
+        let output = Command::new("git")
+            .args(["clone", "-q"])
+            .arg(&self.path)
+            .arg(&path)
+            .output()
+            .expect("could not run git clone");
+        assert!(
+            output.status.success(),
+            "git clone from the bare remote failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let clone = TestRepo { _dir: dir, path };
+        clone.git_ok(["config", "user.name", "git-xcrypt tests"]);
+        clone.git_ok(["config", "user.email", "tests@git-xcrypt.invalid"]);
+        clone
+    }
 }
 
 /// Fails loudly when git is missing.
