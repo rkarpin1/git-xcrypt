@@ -11,9 +11,15 @@ use std::io::{Read, Write};
 
 use thiserror::Error;
 
+pub mod commands;
 pub mod crypto;
+pub mod exit;
 pub mod format;
+pub mod gitattributes;
+pub mod gitconfig;
 pub mod key;
+pub mod keyfile;
+pub mod repo;
 
 /// Errors returned by library operations.
 ///
@@ -49,6 +55,34 @@ pub enum Error {
     /// Authentication failed, or the cipher refused the input.
     #[error("{0}")]
     Crypto(String),
+
+    /// The repository is not in a state this command can act on.
+    #[error("{0}")]
+    Config(String),
+
+    /// No repository key is present.
+    #[error("no repository key; run `git-xcrypt init`, `unlock` or `import-key`")]
+    NoKey,
+
+    /// The command line asked for something impossible.
+    #[error("{0}")]
+    Usage(String),
+}
+
+impl Error {
+    /// The process exit code this error reports.
+    ///
+    /// Callers map errors to codes here rather than at each call site, so the
+    /// set stays consistent across every command.
+    #[must_use]
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Self::Usage(_) | Self::Io(_) | Self::Entropy(_) => exit::USAGE,
+            Self::Config(_) => exit::CONFIG,
+            Self::NoKey => exit::NO_KEY,
+            Self::Format(_) | Self::KeyMismatch { .. } | Self::Crypto(_) => exit::FORMAT,
+        }
+    }
 }
 
 /// Result alias for library operations.

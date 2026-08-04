@@ -516,17 +516,17 @@ Brak. Nic nie jest wydane, żadne istniejące repozytorium nie używa tego forma
 
 #### Automatyczne
 
-- [ ] 2.1 `init` tworzy klucz, wpisy w `.git/config` i sekcję w `.gitattributes`
-- [ ] 2.2 Powtórny `init` nie zmienia bajtów pliku klucza
-- [ ] 2.3 `init` bez klucza, ale ze śladami konfiguracji kończy się kodem `2`
-- [ ] 2.4 `init` poza repozytorium git kończy się kodem `2`
-- [ ] 2.5 Uprawnienia pliku klucza to `0600` (`#[cfg(unix)]`)
-- [ ] 2.6 Sekcja w `.gitattributes` jest idempotentna i nie niszczy treści użytkownika
-- [ ] 2.7 `cargo clippy --all-targets -- -D warnings` przechodzi
+- [x] 2.1 `init` tworzy klucz, wpisy w `.git/config` i sekcję w `.gitattributes`
+- [x] 2.2 Powtórny `init` nie zmienia bajtów pliku klucza
+- [x] 2.3 `init` bez klucza, ale ze śladami konfiguracji kończy się kodem `2`
+- [x] 2.4 `init` poza repozytorium git kończy się kodem `2`
+- [x] 2.5 Uprawnienia pliku klucza to `0600` (`#[cfg(unix)]`)
+- [x] 2.6 Sekcja w `.gitattributes` jest idempotentna i nie niszczy treści użytkownika
+- [x] 2.7 `cargo clippy --all-targets -- -D warnings` przechodzi
 
 #### Ręczne
 
-- [ ] 2.8 Komunikat odmowy kieruje do właściwej komendy
+- [x] 2.8 Komunikat odmowy kieruje do właściwej komendy
 
 ### Faza 3: Konfiguracja, dopasowanie ścieżek i końce linii
 
