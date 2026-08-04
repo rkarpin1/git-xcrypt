@@ -52,6 +52,13 @@ use crate::{Error, Result, atomic, decide, gitconfig, gitindex};
 pub struct Report {
     /// Fingerprint of the key that was removed. Safe to print; the key is not.
     pub key_id: [u8; KEY_ID_LEN],
+    /// How many working-tree files the declaration selected.
+    ///
+    /// Separate from [`Report::encrypted`] so the closing line can tell "nothing
+    /// to do, everything was already closed" from "nothing matched at all". The
+    /// two look identical through a count of files written, and only one of them
+    /// is a repository that is now safe.
+    pub declared: usize,
     /// Paths, relative to the working tree, that were encrypted in place.
     pub encrypted: Vec<PathBuf>,
     /// Leftover temporary files that were deleted on the way through.
@@ -59,6 +66,10 @@ pub struct Report {
     /// Reported rather than swallowed: each one may have held a decrypted
     /// secret, and a user is entitled to know one was lying around.
     pub swept: Vec<PathBuf>,
+    /// The filter registration was written or repaired.
+    pub config_written: bool,
+    /// The managed `.gitattributes` section was written or repaired.
+    pub attributes_written: bool,
     /// The key file is gone.
     pub key_removed: bool,
     /// Anything worth saying once, carried out so the binary owns the messages.
@@ -88,8 +99,16 @@ pub struct Warning {
     pub key_id: [u8; KEY_ID_LEN],
     /// Where that key lives.
     pub key_path: PathBuf,
-    /// How many working-tree files are about to be encrypted in place.
-    pub files: usize,
+    /// How many working-tree files the declaration selects.
+    pub declared: usize,
+    /// How many of those are still plaintext, so will actually change.
+    pub still_open: usize,
+    /// Temporary files this run will delete.
+    ///
+    /// Named here rather than only in the closing report, because deleting an
+    /// untracked file is irreversible and disclosing it afterwards is too late
+    /// to be a disclosure.
+    pub sweeping: Vec<PathBuf>,
 }
 
 impl fmt::Display for Warning {
@@ -101,7 +120,7 @@ impl fmt::Display for Warning {
              \n  \
              key_id: {key_id}\n  \
              path:   {}\n  \
-             files:  {} to be encrypted in place\n\
+             files:  {} declared, {} of them still in the clear\n\
              \n\
              After this, decrypting anything — including the entire history — will be\n\
              possible only from a copy of the key held outside this directory.\n\
@@ -110,9 +129,31 @@ impl fmt::Display for Warning {
              If you do not have a copy, abort and run:\n  \
              git-xcrypt export-key <a path outside this repository>/git-xcrypt-{}.key",
             self.key_path.display(),
-            self.files,
+            self.declared,
+            self.still_open,
             &key_id[..8],
-        )
+        )?;
+
+        if self.declared == 0 {
+            writeln!(
+                f,
+                "\nNothing in this working tree matches {}, so nothing will be encrypted.\n\
+                 If you expected secrets to be closed here, abort and check the declaration.",
+                crate::repo::CONFIG_FILE
+            )?;
+        }
+
+        if !self.sweeping.is_empty() {
+            writeln!(
+                f,
+                "\nThese temporary files, left by an interrupted run, will be deleted.\n\
+                 They are untracked, so deleting them cannot be undone:"
+            )?;
+            for path in &self.sweeping {
+                writeln!(f, "  {}", path.display())?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -162,6 +203,13 @@ impl<W: Write> Confirm for Assumed<W> {
 }
 
 /// The default: shows the warning and waits for the word `yes`.
+///
+/// The streams are whatever the caller hands over, which in the binary means
+/// `stdin` and `stderr` rather than the controlling terminal. Two consequences
+/// worth knowing rather than discovering: `git-xcrypt lock < answers.txt`
+/// proceeds if the first line is `yes`, and `git-xcrypt lock 2>/dev/null` waits
+/// on a prompt nobody can see. Opening `/dev/tty` instead would fix both on Unix
+/// and has no portable equivalent, and this binary ships on Windows too.
 #[derive(Debug)]
 pub struct Ask<R, W> {
     input: R,
@@ -228,18 +276,32 @@ pub fn run(repo: &Repo, confirm: &mut dyn Confirm) -> Result<Outcome> {
         )));
     }
 
+    // Before anything else that costs work: this repository's key is shared by
+    // every checkout, and the walk below only ever sees one of them.
+    refuse_other_worktrees(repo)?;
+
     let git_config = gitconfig::open_full(repo.common_dir())?;
     let hash =
         gitindex::object_hash(gitconfig::get(&git_config, "extensions.objectformat").as_deref());
 
     let mut walk = Walk::default();
-    let selected = collect_selected(repo, &config, &mut walk)?;
-    refuse_unstored(repo, &key, &config, &selected, hash)?;
+    let found = collect(repo, &config, &mut walk)?;
+    let stored = stored_ids(repo, hash, &found.selected, &found.residue)?;
+
+    // The sweep is settled first, because what it takes must not then be
+    // surveyed: residue is untracked by construction, so surveying it would
+    // refuse every lock that has any.
+    let residue = sweepable(&found.residue, &stored.residue, &mut walk);
+    let (selected, stored_selected) = drop_swept(found.selected, stored.selected, &residue);
+
+    let survey = survey(&key, &config, &selected, &stored_selected, hash)?;
 
     let warning = Warning {
         key_id,
         key_path: repo.key_path(),
-        files: selected.len(),
+        declared: selected.len(),
+        still_open: survey.still_open,
+        sweeping: residue.iter().map(|file| file.relative.clone()).collect(),
     };
     if !confirm.confirm(&warning)? {
         return Ok(Outcome::Aborted);
@@ -247,19 +309,47 @@ pub fn run(repo: &Repo, confirm: &mut dyn Confirm) -> Result<Outcome> {
 
     let mut report = Report {
         key_id,
+        declared: selected.len(),
         encrypted: Vec::new(),
         swept: Vec::new(),
+        config_written: false,
+        attributes_written: false,
         key_removed: false,
         warnings: config.pointless_eol.clone(),
     };
     report.warnings.append(&mut walk.warnings);
+    if selected.is_empty() {
+        // Not an error — an empty declaration is legal — but it is also what a
+        // typo in `.git-xcrypt`, or a branch predating it, looks like from here.
+        // Saying "locked" over it would assert a state that does not hold, and
+        // the key is about to be gone, so this is the last chance to notice.
+        report.warnings.push(format!(
+            "no file in the working tree matches {}, so nothing was encrypted. \
+             If you expected secrets to be closed here, check the declaration \
+             before relying on this repository being safe.",
+            crate::repo::CONFIG_FILE
+        ));
+    }
+
+    // The last command run before the key goes is the last chance to notice that
+    // git has no filter behind the catch-all attribute — and a locked repository
+    // needs it more than an unlocked one, because there the clean path is what
+    // turns "no key" into a refused `git add` instead of a stored plaintext.
+    // Measured on git 2.55: with either half missing, `git add` on a secret in a
+    // locked repository exits 0 and stores the plaintext.
+    report.config_written = super::init::register_driver(repo)?;
+    report.attributes_written = crate::gitattributes::write_section(
+        &repo.attributes_path(),
+        &crate::gitattributes::render_lines(&config),
+    )?;
 
     // Before the encryption pass, so nothing we are about to write is mistaken
     // for residue, and so a leftover of a file we then encrypt cannot outlive
     // the command holding that file's plaintext.
-    sweep(repo, &walk.leftovers, &mut report);
+    sweep(&residue, &mut report);
 
-    let rewritten = encrypt_in_place(&key, &config, &selected, &mut report)?;
+    let rewritten = encrypt_in_place(&key, &config, &selected, &survey, hash, &mut report)
+        .map_err(|err| interrupted(&report, err))?;
 
     // Without this git compares the new size against the one it cached for the
     // plaintext, concludes the file changed and never runs the filter to find
@@ -277,9 +367,87 @@ pub fn run(repo: &Repo, confirm: &mut dyn Confirm) -> Result<Outcome> {
     Ok(Outcome::Locked(Box::new(report)))
 }
 
-/// A working-tree file the declaration selects for encryption.
+/// Refuses while another checkout of this repository shares the key.
+///
+/// The key lives in the common directory, so every worktree reads the same one,
+/// but the walk below only ever sees the checkout it was run from. Locking one
+/// and deleting the key leaves the others holding **plaintext with no key left
+/// to close them** — the exact state this module exists to make impossible, and
+/// reached on the success path rather than by interruption. Measured on git
+/// 2.55: `lock` in the main worktree left a linked one readable, and `lock`
+/// there then failed with "no repository key".
+///
+/// Refusing rather than locking them all: each checkout has its own index, its
+/// own `HEAD` and possibly its own `.git-xcrypt`, so proving them clean means
+/// running this whole command per worktree, which the user can do.
+fn refuse_other_worktrees(repo: &Repo) -> Result<()> {
+    let mut others = Vec::new();
+
+    // Linked worktrees. `.git/worktrees/<name>/gitdir` names the `.git` file in
+    // the checkout; a registration whose target is gone is stale, and git would
+    // prune it, so it strands nothing.
+    if let Ok(entries) = fs::read_dir(repo.common_dir().join("worktrees")) {
+        for entry in entries.flatten() {
+            let git_dir = entry.path();
+            if same_path(&git_dir, repo.git_dir()) {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(git_dir.join("gitdir")) else {
+                continue;
+            };
+            let pointer = PathBuf::from(text.trim_end_matches(['\n', '\r']));
+            if !pointer.exists() {
+                continue;
+            }
+            others.push(pointer.parent().unwrap_or(&pointer).to_path_buf());
+        }
+    }
+
+    // And, when this *is* a linked worktree, the main checkout — which is not
+    // listed anywhere under `worktrees/`.
+    if !same_path(repo.git_dir(), repo.common_dir())
+        && repo.common_dir().file_name() == Some(std::ffi::OsStr::new(".git"))
+        && let Some(main) = repo.common_dir().parent()
+        && main.is_dir()
+    {
+        others.push(main.to_path_buf());
+    }
+
+    if others.is_empty() {
+        return Ok(());
+    }
+
+    others.sort();
+    let list = others
+        .iter()
+        .map(|path| format!("  {}", path.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Err(Error::Config(format!(
+        "this repository has {} other checkout(s), and they all share the key lock \
+         would delete:\n\
+         {list}\n\
+         Locking only this one would leave their files in the clear with no key left \
+         to close them. Lock each checkout first, or remove it with \
+         `git worktree remove`. Nothing has been changed.",
+        others.len()
+    )))
+}
+
+/// Whether two paths name the same place, without insisting they exist.
+fn same_path(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// A working-tree file this command has something to say about.
 #[derive(Debug)]
-struct Selected {
+struct Candidate {
     /// Absolute path in the working tree.
     path: PathBuf,
     /// Repository-relative path, as the matcher and the index spell it.
@@ -288,13 +456,20 @@ struct Selected {
     relative: PathBuf,
 }
 
+/// What one walk of the working tree turned up.
+#[derive(Debug, Default)]
+struct Found {
+    /// Files the declaration selects for encryption.
+    selected: Vec<Candidate>,
+    /// Files shaped like the residue of an interrupted run of our own.
+    residue: Vec<Candidate>,
+}
+
 /// What the walk noticed on its way through, besides the files it selected.
 #[derive(Debug, Default)]
 struct Walk {
     /// Messages for the user.
     warnings: Vec<String>,
-    /// Temporary files an earlier, killed run left behind.
-    leftovers: Vec<PathBuf>,
 }
 
 /// Every selected file in the working tree, in a stable order.
@@ -311,8 +486,8 @@ struct Walk {
 /// **A directory holding a `.git` entry is another repository and is not
 /// entered.** A submodule has its own key, its own index and its own
 /// declaration; it needs its own `lock`.
-fn collect_selected(repo: &Repo, config: &Config, walk: &mut Walk) -> Result<Vec<Selected>> {
-    let mut found = Vec::new();
+fn collect(repo: &Repo, config: &Config, walk: &mut Walk) -> Result<Found> {
+    let mut found = Found::default();
     let mut pending = vec![repo.work_tree().to_path_buf()];
 
     while let Some(directory) = pending.pop() {
@@ -344,21 +519,36 @@ fn collect_selected(repo: &Repo, config: &Config, walk: &mut Walk) -> Result<Vec
                 continue;
             }
 
-            // Ahead of the pattern test on purpose. Residue of `secrets/db.env`
-            // is called `secrets/db.env.git-xcrypt-<hex>.tmp`, which `secrets/`
-            // selects — encrypting it would preserve a stale plaintext under a
-            // name nobody will ever look at instead of removing it.
-            if atomic::is_temporary_name(&file_name_bytes(&path)) {
-                walk.leftovers.push(path);
-                continue;
-            }
-
             let relative = relative_to(repo, &path);
             let name = repo_relative_bytes(&relative);
+
+            // Residue of `secrets/db.env` is called
+            // `secrets/db.env.git-xcrypt-<hex>.tmp` and may hold that file's
+            // plaintext, so it is a candidate for deletion — but only a
+            // candidate: `sweepable` adds the condition that makes deleting it
+            // safe. Being a candidate does **not** take it out of the selection
+            // below, because the filter's answer for this path does not change
+            // and lock must not encrypt a different set of files from git.
+            if let Some(target) = atomic::strip_temporary_suffix(&name) {
+                if config.decide(target).encrypt {
+                    found.residue.push(Candidate {
+                        path: path.clone(),
+                        name: name.clone(),
+                        relative: relative.clone(),
+                    });
+                } else {
+                    walk.warnings.push(format!(
+                        "{}: shaped like a temporary file of ours, but nothing \
+                         declares its target, so it was left alone",
+                        relative.display()
+                    ));
+                }
+            }
+
             if !config.decide(&name).encrypt {
                 continue;
             }
-            found.push(Selected {
+            found.selected.push(Candidate {
                 path,
                 name,
                 relative,
@@ -366,7 +556,12 @@ fn collect_selected(repo: &Repo, config: &Config, walk: &mut Walk) -> Result<Vec
         }
     }
 
-    found.sort_by(|left, right| left.path.cmp(&right.path));
+    found
+        .selected
+        .sort_by(|left, right| left.path.cmp(&right.path));
+    found
+        .residue
+        .sort_by(|left, right| left.path.cmp(&right.path));
     Ok(found)
 }
 
@@ -379,79 +574,198 @@ fn unverifiable(path: &Path, err: &std::io::Error) -> Error {
     ))
 }
 
-/// Refuses while any selected file holds content the repository does not store.
+/// The object ids the index records, for everything this command looked at.
+#[derive(Debug, Default)]
+struct Stored {
+    /// One entry per selected file, in the same order.
+    selected: Vec<Option<Vec<u8>>>,
+    /// One entry per residue candidate, in the same order.
+    residue: Vec<Option<Vec<u8>>>,
+}
+
+/// Asks the index about every path at once, or refuses if it cannot be read.
+///
+/// One read rather than two: the index is a snapshot, and asking twice could see
+/// two different ones. An index this build cannot parse is a hard refusal —
+/// "cannot tell" must never be mistaken for "nothing is at risk" by a command
+/// that deletes the key.
+fn stored_ids(
+    repo: &Repo,
+    hash: gix_hash::Kind,
+    selected: &[Candidate],
+    residue: &[Candidate],
+) -> Result<Stored> {
+    if selected.is_empty() && residue.is_empty() {
+        return Ok(Stored::default());
+    }
+
+    let index_path = repo.git_dir().join("index");
+    let names: Vec<Vec<u8>> = selected
+        .iter()
+        .chain(residue)
+        .map(|file| file.name.clone())
+        .collect();
+
+    match gitindex::staged_ids(&index_path, hash, &names)? {
+        gitindex::Staged::Read(mut ids) => {
+            let tail = ids.split_off(selected.len());
+            Ok(Stored {
+                selected: ids,
+                residue: tail,
+            })
+        }
+        gitindex::Staged::Unavailable(why) => Err(Error::Config(format!(
+            "lock cannot tell whether your work is safe: {} could not be used because \
+             {why}. Nothing has been changed.\n\
+             For a split index, `git update-index --no-split-index` converts it back.",
+            index_path.display()
+        ))),
+    }
+}
+
+/// Why a file's content is not stored in this repository.
+///
+/// Three states, because the remedies are three different commands and telling
+/// the user the wrong one wastes the only chance they have to notice.
+#[derive(Debug, Clone, Copy)]
+enum Unstored {
+    /// The index has no stage-0 entry: never added, or mid-merge.
+    Untracked,
+    /// The index holds this content **in the clear** — an exposure, not an edit.
+    InTheClear,
+    /// The index holds something else: an ordinary unsaved change.
+    Modified,
+}
+
+/// What the pre-flight pass learned about the selected files.
+#[derive(Debug, Default)]
+struct Survey {
+    /// The object id each file's ciphertext hashes to, in selection order.
+    ///
+    /// Carried into the encryption pass and compared again there. Without it the
+    /// window between "proved stored" and "written" is the whole length of an
+    /// interactive prompt — an unbounded human-scale wait, during which an
+    /// editor autosave turns proved-safe content into content that exists
+    /// nowhere, and the key is deleted over it anyway.
+    expected: Vec<Vec<u8>>,
+    /// How many selected files are still plaintext and will actually change.
+    still_open: usize,
+}
+
+/// Proves every selected file's content is already a blob, or refuses.
 ///
 /// The test is exact and needs no object database: the index records the object
 /// id of every tracked path's **cleaned** content, encryption is deterministic,
 /// so hashing the ciphertext the clean path would produce and comparing to that
-/// id answers "is this exact content already a blob here". A path with no
-/// stage-0 entry — untracked, or in the middle of a merge — answers no.
+/// id answers "is this exact content already a blob here".
 ///
 /// `--yes` never reaches this function, and that is the point. Losing the key
-/// and losing uncommitted work are different risks; the founding document gives
-/// each its own decision, and only the first has a flag.
-fn refuse_unstored(
-    repo: &Repo,
+/// and losing unsaved work are different risks; the founding document gives each
+/// its own decision, and only the first has a flag.
+fn survey(
     key: &MasterKey,
     config: &Config,
-    selected: &[Selected],
+    selected: &[Candidate],
+    stored: &[Option<Vec<u8>>],
     hash: gix_hash::Kind,
-) -> Result<()> {
-    if selected.is_empty() {
-        return Ok(());
-    }
+) -> Result<Survey> {
+    let mut survey = Survey::default();
+    let mut unstored: Vec<(&Path, Unstored)> = Vec::new();
 
-    let index_path = repo.git_dir().join("index");
-    let names: Vec<Vec<u8>> = selected.iter().map(|file| file.name.clone()).collect();
-    let stored = match gitindex::staged_ids(&index_path, hash, &names)? {
-        gitindex::Staged::Read(ids) => ids,
-        gitindex::Staged::Unavailable(why) => {
-            return Err(Error::Config(format!(
-                "lock cannot tell whether your work is safe: {} could not be used \
-                 because {why}. Nothing has been changed.",
-                index_path.display()
-            )));
-        }
-    };
-
-    let mut unstored = Vec::new();
     for (file, stored) in selected.iter().zip(stored) {
         // Zeroizing: this is the secret, in the clear on the heap.
         let content =
             Zeroizing::new(fs::read(&file.path).map_err(|err| unverifiable(&file.path, &err))?);
         let outcome = decide::clean(Some(key), config, &file.name, &content)
             .map_err(|err| named(&file.relative, err))?;
-        let Some(id) = gitindex::blob_id(hash, &outcome.content) else {
-            return Err(Error::Config(format!(
-                "{}: its object id could not be computed, so lock cannot tell whether \
-                 it is stored. Nothing has been changed.",
-                file.relative.display()
-            )));
-        };
 
-        if stored.as_deref() != Some(id.as_slice()) {
-            unstored.push(file.relative.clone());
+        let closed = outcome.content == *content;
+        if !closed {
+            survey.still_open += 1;
         }
+
+        let id = blob_id(hash, &outcome.content, &file.relative)?;
+        if stored.as_deref() != Some(id.as_slice()) {
+            let reason = match stored {
+                None => Unstored::Untracked,
+                Some(stored)
+                    if !closed
+                        && stored.as_slice()
+                            == blob_id(hash, &content, &file.relative)?.as_slice() =>
+                {
+                    Unstored::InTheClear
+                }
+                Some(_) => Unstored::Modified,
+            };
+            unstored.push((&file.relative, reason));
+        }
+        survey.expected.push(id);
     }
 
     if unstored.is_empty() {
-        return Ok(());
+        return Ok(survey);
+    }
+    Err(refusal(&unstored))
+}
+
+/// The blob id of `content`, or a refusal naming the file it belonged to.
+fn blob_id(hash: gix_hash::Kind, content: &[u8], relative: &Path) -> Result<Vec<u8>> {
+    gitindex::blob_id(hash, content).ok_or_else(|| {
+        Error::Config(format!(
+            "{}: its object id could not be computed, so lock cannot tell whether it \
+             is stored. Nothing has been changed.",
+            relative.display()
+        ))
+    })
+}
+
+/// The refusal, grouped so each group carries the remedy that actually works.
+fn refusal(unstored: &[(&Path, Unstored)]) -> Error {
+    let mut message = format!(
+        "{} file(s) hold content lock cannot prove this repository stores:\n",
+        unstored.len()
+    );
+
+    let groups = [
+        (
+            "not tracked here at all, or in the middle of a merge — `git add` them \
+             (with `-f` if they are ignored), or take them out of the declaration",
+            Unstored::Untracked,
+        ),
+        (
+            "stored in the clear: the repository holds this exact plaintext, from \
+             before the pattern covered it. `git add` re-stages it through the filter; \
+             the plaintext already in history stays there, so rotate the secret",
+            Unstored::InTheClear,
+        ),
+        (
+            "changed since they were last added — commit or stash them",
+            Unstored::Modified,
+        ),
+    ];
+
+    for (explanation, wanted) in groups {
+        let paths: Vec<&Path> = unstored
+            .iter()
+            .filter(|(_, reason)| std::mem::discriminant(reason) == std::mem::discriminant(&wanted))
+            .map(|(path, _)| *path)
+            .collect();
+        if paths.is_empty() {
+            continue;
+        }
+        message.push_str(&format!("\n  {explanation}:\n"));
+        for path in paths {
+            message.push_str(&format!("    {}\n", path.display()));
+        }
     }
 
-    let list = unstored
-        .iter()
-        .map(|path| format!("  {}", path.display()))
-        .collect::<Vec<_>>()
-        .join("\n");
-    Err(Error::Config(format!(
-        "{} file(s) hold content this repository does not store yet:\n\
-         {list}\n\
-         lock would leave that content readable only with the key it is about to \
-         delete. Commit or stash it first, then run lock again.\n\
-         --yes does not waive this check: losing unsaved work is a different risk \
-         from losing the key. Nothing has been changed.",
-        unstored.len()
-    )))
+    message.push_str(
+        "\nlock would leave that content readable only with the key it is about to \
+         delete.\n\
+         --yes does not waive this check: losing unsaved work is a different risk from \
+         losing the key. Nothing has been changed.",
+    );
+    Error::Config(message)
 }
 
 /// Encrypts each selected file in place, returning the paths git must re-examine.
@@ -464,21 +778,36 @@ fn refuse_unstored(
 /// its tag and its `key_id` before saying so — and is skipped, which is what
 /// makes a second `lock` after an interrupted one finish the job rather than
 /// double-encrypt.
+///
+/// Every file is checked against the id [`survey`] recorded before writing it,
+/// and a mismatch stops the run before that write. The file is read twice
+/// because holding every selected file's ciphertext in memory at once is what
+/// turns a repository of large secrets into a failed allocation; re-checking is
+/// what keeps the second read from silently replacing the first.
 fn encrypt_in_place(
     key: &MasterKey,
     config: &Config,
-    selected: &[Selected],
+    selected: &[Candidate],
+    survey: &Survey,
+    hash: gix_hash::Kind,
     report: &mut Report,
 ) -> Result<Vec<Vec<u8>>> {
     let mut rewritten = Vec::new();
 
-    for file in selected {
-        // Read again rather than carried over from the check above: holding
-        // every selected file's ciphertext in memory at once is what turns a
-        // repository of large secrets into a failed allocation.
-        let content = Zeroizing::new(fs::read(&file.path)?);
+    for (file, expected) in selected.iter().zip(&survey.expected) {
+        let content = Zeroizing::new(
+            fs::read(&file.path).map_err(|err| named_io(&file.relative, "read", &err))?,
+        );
         let outcome = decide::clean(Some(key), config, &file.name, &content)
             .map_err(|err| named(&file.relative, err))?;
+
+        if blob_id(hash, &outcome.content, &file.relative)? != *expected {
+            return Err(Error::Config(format!(
+                "{}: it changed while lock was running, so what is in it now is not \
+                 what lock proved this repository stores. The key has been kept.",
+                file.relative.display()
+            )));
+        }
 
         if let Some(warning) = outcome.warning {
             report.warnings.push(warning);
@@ -489,7 +818,7 @@ fn encrypt_in_place(
 
         // Atomic, and inheriting the file's own mode, so an interruption cannot
         // leave a half-written file and an executable stays executable.
-        atomic::write(&file.path, &outcome.content)?;
+        atomic::write(&file.path, &outcome.content).map_err(|err| named(&file.relative, err))?;
         rewritten.push(file.name.clone());
         report.encrypted.push(file.relative.clone());
     }
@@ -497,23 +826,117 @@ fn encrypt_in_place(
     Ok(rewritten)
 }
 
+/// Narrows the residue candidates to the ones it is safe to delete.
+///
+/// Two conditions beyond the name, and both exist because this list is a
+/// **deletion** list. The target has to be a path the declaration selects, which
+/// [`collect`] has already checked; and the file has to be untracked, which it
+/// always is for residue of ours — git never saw it. Anything tracked with that
+/// shape belongs to the user, however unlikely the name, and deleting it would
+/// both destroy their file and leave `git status` reporting a deletion nobody
+/// asked for. Measured: without this, a committed
+/// `build.git-xcrypt-deadbeefcafef00d.tmp` was removed and the tree left dirty.
+fn sweepable<'a>(
+    residue: &'a [Candidate],
+    stored: &[Option<Vec<u8>>],
+    walk: &mut Walk,
+) -> Vec<&'a Candidate> {
+    let mut sweepable = Vec::new();
+    for (file, stored) in residue.iter().zip(stored) {
+        if stored.is_some() {
+            walk.warnings.push(format!(
+                "{}: shaped like a temporary file of ours, but it is tracked, so it \
+                 was left alone",
+                file.relative.display()
+            ));
+            continue;
+        }
+        sweepable.push(file);
+    }
+    sweepable
+}
+
+/// Takes the files the sweep will remove out of the encryption list.
+///
+/// A path cannot be both deleted and encrypted, and residue is untracked by
+/// construction, so leaving it in would make the unstored check refuse every
+/// lock that has any. Anything the sweep declined — a *tracked* file of that
+/// shape — stays, because git's filter still encrypts it and the two must not
+/// disagree about which files are secrets.
+///
+/// The index answers are filtered in the same pass rather than truncated
+/// afterwards: they are positional, so dropping a file anywhere but the end
+/// would leave every later file compared against its neighbour's object id.
+fn drop_swept(
+    selected: Vec<Candidate>,
+    stored: Vec<Option<Vec<u8>>>,
+    residue: &[&Candidate],
+) -> (Vec<Candidate>, Vec<Option<Vec<u8>>>) {
+    let doomed: Vec<&[u8]> = residue.iter().map(|file| file.name.as_slice()).collect();
+    let mut kept = Vec::with_capacity(selected.len());
+    let mut ids = Vec::with_capacity(selected.len());
+
+    for (file, id) in selected.into_iter().zip(stored) {
+        if doomed.contains(&file.name.as_slice()) {
+            continue;
+        }
+        kept.push(file);
+        ids.push(id);
+    }
+    (kept, ids)
+}
+
 /// Deletes the residue of an earlier, killed run.
 ///
 /// Best effort by design: one file that will not delete must not stop a lock
 /// that is otherwise complete, but it does have to be said out loud, because the
 /// thing left behind may be a decrypted secret.
-fn sweep(repo: &Repo, leftovers: &[PathBuf], report: &mut Report) {
-    for path in leftovers {
-        let relative = relative_to(repo, path);
-        match fs::remove_file(path) {
-            Ok(()) => report.swept.push(relative),
+fn sweep(residue: &[&Candidate], report: &mut Report) {
+    for file in residue {
+        match fs::remove_file(&file.path) {
+            Ok(()) => report.swept.push(file.relative.clone()),
             Err(err) => report.warnings.push(format!(
                 "{}: a temporary file left by an interrupted run could not be removed \
                  ({err}); it may hold a decrypted secret",
-                relative.display()
+                file.relative.display()
             )),
         }
     }
+}
+
+/// Adds what was already done to an error that stopped the encryption pass.
+///
+/// Returning the bare error would drop the report, and with it the only record
+/// that some files are now ciphertext and some temporary files are gone. The
+/// key is still here — nothing after this point ran — so the instruction is to
+/// run the command again.
+fn interrupted(report: &Report, err: Error) -> Error {
+    let done = report.encrypted.len();
+    let swept = report.swept.len();
+    let context = format!(
+        "\nlock stopped part way: {done} file(s) were already encrypted and {swept} \
+         temporary file(s) removed. The key has NOT been deleted, so running lock \
+         again finishes the job."
+    );
+    match err {
+        Error::Format(message) => Error::Format(message + &context),
+        Error::Crypto(message) => Error::Crypto(message + &context),
+        Error::Config(message) => Error::Config(message + &context),
+        Error::Io(err) => Error::Io(std::io::Error::other(format!("{err}{context}"))),
+        other => other,
+    }
+}
+
+/// Puts a path and the operation in front of a bare I/O failure.
+///
+/// `Permission denied (os error 13)` on its own names neither the file nor what
+/// was being done to it, which for a command mid-way through rewriting a working
+/// tree is the least useful message it could produce.
+fn named_io(relative: &Path, action: &str, err: &std::io::Error) -> Error {
+    Error::Io(std::io::Error::other(format!(
+        "{}: could not {action} it ({err})",
+        relative.display()
+    )))
 }
 
 /// Removes the key file, which is the irreversible half of the command.
@@ -556,13 +979,6 @@ fn named(relative: &Path, err: Error) -> Error {
 fn relative_to(repo: &Repo, path: &Path) -> PathBuf {
     repo.relative(path)
         .map_or_else(|| path.to_path_buf(), Path::to_path_buf)
-}
-
-/// The bytes of a path's final component, or nothing if it has none.
-fn file_name_bytes(path: &Path) -> Vec<u8> {
-    path.file_name()
-        .map(|name| os_str_bytes(name.as_ref()))
-        .unwrap_or_default()
 }
 
 /// A repository-relative path as the pattern matcher expects it.
@@ -787,6 +1203,41 @@ mod tests {
             "the warning was printed although the command had already refused"
         );
         assert!(repo.has_key());
+    }
+
+    #[test]
+    fn an_edit_made_while_the_prompt_waits_stops_the_run_instead_of_being_locked_in() {
+        // The window between "proved stored" and "written" is the whole length
+        // of an interactive prompt — an unbounded human-scale wait, exactly when
+        // an editor autosave fires. Measured before this check existed: lock
+        // exited 0, encrypted content that was in no git object, and deleted the
+        // key over it.
+        struct Meddling(PathBuf);
+        impl Confirm for Meddling {
+            fn confirm(&mut self, _warning: &Warning) -> Result<bool> {
+                fs::write(&self.0, b"edited while you were reading\n").expect("writing");
+                Ok(true)
+            }
+        }
+
+        let (dir, repo) = prepared();
+        write_and_stage(&repo, &dir, "secrets/db.env", b"hunter2\n");
+        let path = repo.work_tree().join("secrets/db.env");
+
+        let error = run(&repo, &mut Meddling(path.clone()))
+            .expect_err("content nobody stored must not be locked in");
+
+        assert_eq!(error.exit_code(), crate::exit::CONFIG);
+        assert!(
+            error.to_string().contains("changed while lock was running"),
+            "the message must say what happened: {error}"
+        );
+        assert!(repo.has_key(), "the key went over unstored content");
+        assert_eq!(
+            fs::read(&path).expect("reading"),
+            b"edited while you were reading\n",
+            "the edit was encrypted anyway"
+        );
     }
 
     #[test]
@@ -1017,7 +1468,9 @@ mod tests {
         let warning = Warning {
             key_id: [1u8; KEY_ID_LEN],
             key_path: PathBuf::from(".git/git-xcrypt/keys/default"),
-            files: 3,
+            declared: 3,
+            still_open: 3,
+            sweeping: Vec::new(),
         };
 
         for (answer, expected) in [
@@ -1046,7 +1499,9 @@ mod tests {
         let warning = Warning {
             key_id: [2u8; KEY_ID_LEN],
             key_path: PathBuf::from(".git/git-xcrypt/keys/default"),
-            files: 1,
+            declared: 1,
+            still_open: 1,
+            sweeping: Vec::new(),
         };
 
         assert!(assumed.confirm(&warning).expect("--yes must proceed"));

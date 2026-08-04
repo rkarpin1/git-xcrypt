@@ -216,29 +216,36 @@ fn temporary_name(name: &std::ffi::OsStr) -> Result<OsString> {
     Ok(temporary)
 }
 
-/// Whether `name` is one of the temporary files [`replace`] leaves behind.
+/// The target a temporary file was named after, if `name` is one of ours.
 ///
 /// A process killed outright cannot clean up after itself, and on the `unlock`
-/// and `lock` paths the residue holds a **decrypted secret**. `lock` in
-/// particular promises that no plaintext of a selected path survives it, and a
-/// leftover under a name no pattern was written for would break that promise
-/// quietly — so `lock` sweeps them, and this is the predicate it sweeps by.
+/// and `lock` paths the residue holds a **decrypted secret**. `lock` promises
+/// that no plaintext of a selected path survives it, so it has to recognise
+/// residue — and, because it deletes what it recognises, it has to recognise it
+/// *narrowly*. Returning the target rather than a yes/no is what lets the caller
+/// add the second condition that makes deletion safe: only sweep residue whose
+/// target the declaration actually selects.
 ///
-/// Deliberately exact rather than a substring test: the marker must be followed
-/// by exactly [`RANDOM_LEN`] bytes of hex and then `.tmp`, and something must
-/// precede the marker, because these names are always built from a target's own
-/// name. A file a user happens to have called `notes.git-xcrypt-draft.tmp` is
-/// not matched and not deleted.
+/// Deliberately exact. The marker must be followed by exactly [`RANDOM_LEN`]
+/// bytes of **lowercase** hex — the only kind [`temporary_name`] emits — then
+/// `.tmp`, and something must precede the marker, because these names are always
+/// built from a target's own name. A file a user happens to have called
+/// `notes.git-xcrypt-draft.tmp` is not matched, and neither is
+/// `notes.git-xcrypt-DEADBEEFDEADBEEF.tmp`.
 #[must_use]
-pub fn is_temporary_name(name: &[u8]) -> bool {
-    let Some(rest) = name.strip_suffix(b".tmp") else {
-        return false;
-    };
-    let Some(hex_at) = rest.len().checked_sub(RANDOM_LEN * 2) else {
-        return false;
-    };
-    let (head, hex) = rest.split_at(hex_at);
-    head.len() > MARKER.len() && head.ends_with(MARKER) && hex.iter().all(u8::is_ascii_hexdigit)
+pub fn strip_temporary_suffix(name: &[u8]) -> Option<&[u8]> {
+    let rest = name.strip_suffix(b".tmp")?;
+    let head = rest.get(..rest.len().checked_sub(RANDOM_LEN * 2)?)?;
+    let hex = &rest[head.len()..];
+
+    if !hex
+        .iter()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    {
+        return None;
+    }
+    let target = head.strip_suffix(MARKER)?;
+    (!target.is_empty()).then_some(target)
 }
 
 #[cfg(test)]
@@ -346,6 +353,49 @@ mod tests {
             0o600,
             "the key would have been world readable while it was being written"
         );
+    }
+
+    #[test]
+    fn a_temporary_name_is_recognised_by_its_target_and_nothing_else_is() {
+        // What this recognises, `lock` deletes, so the false positives are the
+        // side that costs a user their file.
+        let dir = TempDir::new().expect("temporary directory");
+        let (path, _held) =
+            create_temporary(&dir.path().join("db.env"), Mode::InheritTarget).expect("naming");
+        let produced = path
+            .file_name()
+            .expect("a name")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            strip_temporary_suffix(produced.as_bytes()),
+            Some(&b"db.env"[..]),
+            "a name this module just produced was not recognised: {produced}"
+        );
+
+        assert_eq!(
+            strip_temporary_suffix(b"secrets/db.env.git-xcrypt-0123456789abcdef.tmp"),
+            Some(&b"secrets/db.env"[..]),
+            "a whole relative path must strip to its target"
+        );
+
+        for name in [
+            &b"notes.git-xcrypt-draft.tmp"[..],
+            b"notes.git-xcrypt-0123456789ABCDEF.tmp",
+            b".git-xcrypt-0123456789abcdef.tmp",
+            b"notes.git-xcrypt-0123456789abcdef.tmpx",
+            b"notes.git-xcrypt-0123456789abcde.tmp",
+            b"notes.git-xcrypt-0123456789abcdefa.tmp",
+            b"notes.tmp",
+            b"",
+        ] {
+            assert_eq!(
+                strip_temporary_suffix(name),
+                None,
+                "{} would have been deleted by a sweep",
+                String::from_utf8_lossy(name)
+            );
+        }
     }
 
     #[test]

@@ -285,6 +285,15 @@ fn lock_and_describe(assume_yes: bool) -> Result<ExitCode> {
     for warning in &report.warnings {
         eprintln!("git-xcrypt: {warning}");
     }
+    if report.config_written {
+        eprintln!(
+            "git-xcrypt: repaired the filter registration in {}",
+            repo.config_path().display()
+        );
+    }
+    if report.attributes_written {
+        eprintln!("git-xcrypt: updated {}", repo.attributes_path().display());
+    }
     for path in &report.swept {
         eprintln!(
             "git-xcrypt: removed {}, left behind by an interrupted run",
@@ -295,11 +304,19 @@ fn lock_and_describe(assume_yes: bool) -> Result<ExitCode> {
         eprintln!("git-xcrypt: encrypted {}", path.display());
     }
 
+    // "0 encrypted" has two meanings and only one of them is a repository that
+    // is now closed. A clone that was never unlocked reaches it legitimately; a
+    // typo in `.git-xcrypt` reaches it with the secrets still in the clear.
     let key_id = git_xcrypt::format_key_id(&report.key_id);
+    let already = report.declared - report.encrypted.len();
+    let scope = match (report.declared, report.encrypted.len()) {
+        (0, _) => "no file here is declared for encryption".to_string(),
+        (_, 0) => format!("all {already} declared file(s) were already encrypted"),
+        (_, written) => format!("{written} file(s) are now encrypted"),
+    };
     eprintln!(
-        "git-xcrypt: locked; {} file(s) are now encrypted and key {key_id} has been \
-         deleted from this repository",
-        report.encrypted.len()
+        "git-xcrypt: locked; {scope} and key {key_id} has been deleted from this \
+         repository"
     );
     eprintln!(
         "git-xcrypt: run `git-xcrypt unlock <key-file>` with your copy of key {key_id} \

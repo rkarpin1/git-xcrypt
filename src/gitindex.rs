@@ -201,8 +201,14 @@ pub fn staged_ids(index_path: &Path, hash: gix_hash::Kind, paths: &[Vec<u8>]) ->
             if entry.stage != 0 {
                 return;
             }
-            if let Some(at) = paths.iter().position(|path| path.as_slice() == entry.name) {
-                found[at] = Some(entry.id.to_vec());
+            // Every matching position, not the first: a caller is allowed to ask
+            // about the same path twice, and answering only one of them would
+            // leave the other reading as "not stored" — which for `lock` is the
+            // difference between a file it keeps and a file it deletes.
+            for (at, path) in paths.iter().enumerate() {
+                if path.as_slice() == entry.name {
+                    found[at] = Some(entry.id.to_vec());
+                }
             }
         },
     );
@@ -854,6 +860,25 @@ mod tests {
         let ours = blob_id(gix_hash::Kind::Sha1, content).expect("hashing must succeed");
 
         assert_eq!(hex(&ours), git_staged_id(&dir, "a.txt"));
+    }
+
+    #[test]
+    fn the_same_path_asked_about_twice_is_answered_twice() {
+        // `lock` asks about its selection and its sweep candidates in one query,
+        // and a file can legitimately be in both. Answering only the first
+        // occurrence left the second reading as "not stored", which is the
+        // difference between a tracked file kept and a tracked file deleted.
+        let dir = repo_with_index(2);
+        let paths = vec![b"a.txt".to_vec(), b"a.txt".to_vec()];
+
+        let staged = staged_ids(&index_of(&dir), gix_hash::Kind::Sha1, &paths)
+            .expect("reading must succeed");
+
+        let Staged::Read(ids) = staged else {
+            panic!("the entries could not be read");
+        };
+        assert_eq!(ids[0], ids[1]);
+        assert!(ids[1].is_some(), "the repeated path was answered as absent");
     }
 
     #[test]

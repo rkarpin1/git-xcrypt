@@ -325,6 +325,208 @@ fn residue_from_a_killed_run_does_not_survive_lock() {
 }
 
 #[test]
+fn another_checkout_of_the_same_repository_stops_lock() {
+    // Every worktree reads the key from the common directory, and the walk only
+    // ever sees one checkout. Measured before this refusal existed: `lock` in
+    // the main worktree left the linked one holding plaintext and deleted the
+    // key both depended on, and `lock` there then failed with code 3 — a working
+    // tree in the clear with no key left to close it, reached on the success
+    // path.
+    let (repo, _outside, _key) = repository_with_secrets();
+    let linked = repo.add_worktree("side");
+
+    let output = repo.xcrypt(["lock", "--yes"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "expected a state conflict, stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        repo.path().join(".git/git-xcrypt/keys/default").exists(),
+        "the shared key went while another checkout still needed it"
+    );
+    repo.assert_worktree_eq("secrets/db.env", b"api_key = do-not-commit-me\n");
+
+    // And from the other side, naming the main checkout it would have stranded.
+    let from_linked = linked.xcrypt(["lock", "--yes"]);
+    assert_eq!(from_linked.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&from_linked.stderr).contains("other checkout"),
+        "the message must say why: {}",
+        String::from_utf8_lossy(&from_linked.stderr)
+    );
+
+    // Removing the worktree clears the way, which is what the message says.
+    repo.git_ok([
+        "worktree",
+        "remove",
+        "--force",
+        &linked.path().to_string_lossy(),
+    ]);
+    repo.xcrypt_ok(["lock", "--yes"]);
+    assert!(repo.worktree_bytes("secrets/db.env").starts_with(MAGIC));
+}
+
+#[test]
+fn a_tracked_file_shaped_like_our_residue_is_not_deleted() {
+    // The sweep is a deletion list, so its false positives cost a user their
+    // file. Residue of ours is never tracked; anything that is belongs to them.
+    let (repo, _outside, _key) = repository_with_secrets();
+    repo.write_file(
+        "secrets/db.env.git-xcrypt-deadbeefcafef00d.tmp",
+        b"a file the user committed\n",
+    );
+    repo.commit_all("a file with an unfortunate name");
+
+    let output = repo.xcrypt_ok(["lock", "--yes"]);
+
+    let name = "secrets/db.env.git-xcrypt-deadbeefcafef00d.tmp";
+    assert!(
+        repo.path().join(name).exists(),
+        "lock deleted a tracked file of the user's"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("it is tracked"),
+        "the skip went unmentioned: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Kept means kept in the selection too: `secrets/` covers this path, so
+    // git's filter encrypts it, and lock must agree or the tree comes out dirty.
+    assert_eq!(
+        repo.worktree_bytes(name),
+        repo.blob_bytes(name),
+        "lock and the check-in path disagreed about this file"
+    );
+    repo.assert_status_clean();
+}
+
+#[test]
+fn the_sweep_is_disclosed_before_the_question_not_after_it() {
+    // Deleting an untracked file cannot be undone, so naming it only in the
+    // closing summary is not a disclosure.
+    let (repo, _outside, _key) = repository_with_secrets();
+    repo.write_file(
+        "secrets/db.env.git-xcrypt-a1b2c3d4e5f60718.tmp",
+        b"api_key = do-not-commit-me\n",
+    );
+
+    let refused = repo.xcrypt_with_stdin(["lock"], b"no\n");
+
+    assert_eq!(refused.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("will be deleted")
+            && stderr.contains("db.env.git-xcrypt-a1b2c3d4e5f60718.tmp"),
+        "the prompt did not say what it was about to delete: {stderr}"
+    );
+    assert!(
+        repo.path()
+            .join("secrets/db.env.git-xcrypt-a1b2c3d4e5f60718.tmp")
+            .exists(),
+        "a refused lock deleted it anyway"
+    );
+}
+
+#[test]
+fn lock_repairs_the_registration_it_is_about_to_depend_on() {
+    // It is the last command before the key is gone, and a locked repository
+    // needs the filter more than an unlocked one: there the clean path is what
+    // turns "no key" into a refused `git add` instead of a stored plaintext.
+    // Measured before this: with the catch-all line gone, `git add` on a secret
+    // in a locked repository exited 0 and stored the plaintext.
+    let (repo, _outside, _key) = repository_with_secrets();
+    repo.git_ok(["config", "--remove-section", "filter.git-xcrypt"]);
+    fs::write(repo.path().join(".gitattributes"), b"# nothing of ours\n")
+        .expect("clobbering the attributes");
+
+    repo.xcrypt_ok(["lock", "--yes"]);
+
+    let process = repo.git_ok(["config", "--get", "filter.git-xcrypt.process"]);
+    assert!(
+        !process.stdout.is_empty(),
+        "lock left the repository with no filter registered"
+    );
+    let attributes =
+        fs::read_to_string(repo.path().join(".gitattributes")).expect("reading the attributes");
+    assert!(
+        attributes.contains("* filter=git-xcrypt"),
+        "lock left the repository with no catch-all line: {attributes}"
+    );
+
+    repo.write_file("secrets/fresh.env", b"token = leaked?\n");
+    assert!(!repo.git(["add", "secrets/fresh.env"]).status.success());
+    assert!(!repo.object_exists_for(b"token = leaked?\n"));
+}
+
+#[test]
+fn a_secret_stored_in_the_clear_is_named_as_an_exposure_not_as_an_edit() {
+    // The exact state S-06 exists for: committed before the pattern covered it.
+    // "Commit or stash it" would be useless advice — the file is unmodified.
+    let repo = TestRepo::init();
+    repo.write_file("secrets/db.env", b"api_key = leaked-long-ago\n");
+    repo.commit_all("a secret, in the clear");
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.xcrypt_ok(["sync"]);
+    repo.commit_all("start encrypting");
+    // Pin the index back to the plaintext blob. `git add -A` above may or may
+    // not have re-cleaned the file depending on whether its timestamp landed in
+    // git's racy-clean window, and this test is about the state where it did
+    // not: the exposure still standing.
+    let plain = repo.git_with_stdin(
+        ["hash-object", "-w", "--stdin"],
+        b"api_key = leaked-long-ago\n",
+    );
+    assert!(plain.status.success(), "git hash-object failed");
+    let oid = String::from_utf8(plain.stdout).expect("git printed a hash");
+    repo.git_ok([
+        "update-index",
+        "--cacheinfo",
+        &format!("100644,{},secrets/db.env", oid.trim()),
+    ]);
+
+    let output = repo.xcrypt(["lock", "--yes"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("stored in the clear") && stderr.contains("rotate the secret"),
+        "the refusal misdiagnosed an exposure as an unsaved edit: {stderr}"
+    );
+    assert!(
+        repo.path().join(".git/git-xcrypt/keys/default").exists(),
+        "a refused lock deleted the key"
+    );
+}
+
+#[test]
+fn a_declaration_that_matches_nothing_is_said_out_loud() {
+    // One typo in `.git-xcrypt`, and "locked" would otherwise be reported over a
+    // working tree whose secrets are all still readable.
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("sekrety/\n");
+    repo.xcrypt_ok(["sync"]);
+    repo.write_file("secrets/db.env", b"api_key = still-in-the-clear\n");
+    repo.commit_all("a secret nothing matches");
+
+    let output = repo.xcrypt_ok(["lock", "--yes"]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Nothing in this working tree matches"),
+        "the warning did not say the declaration matches nothing: {stderr}"
+    );
+    assert!(
+        stderr.contains("no file here is declared"),
+        "the closing line claimed a state that does not hold: {stderr}"
+    );
+    repo.assert_worktree_eq("secrets/db.env", b"api_key = still-in-the-clear\n");
+}
+
+#[test]
 fn a_clone_that_never_unlocked_can_still_be_locked_into_shape() {
     // A clone checked out without a key already holds ciphertext, so there is
     // nothing to encrypt — but the command must not invent a reason to fail, and
@@ -335,10 +537,17 @@ fn a_clone_that_never_unlocked_can_still_be_locked_into_shape() {
 
     let output = clone.xcrypt_ok(["lock", "--yes"]);
 
+    // The closing line has to say "already encrypted" rather than a bare zero:
+    // "0 written" also describes a declaration that matches nothing, which is a
+    // repository whose secrets are still in the clear.
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("0 file(s)"),
-        "already-closed files were rewritten: {}",
-        String::from_utf8_lossy(&output.stderr)
+        stderr.contains("were already encrypted"),
+        "already-closed files were rewritten, or reported as nothing: {stderr}"
+    );
+    assert!(
+        !stderr.contains("no file here is declared"),
+        "an already-closed tree was reported as an empty declaration: {stderr}"
     );
     assert!(!clone.path().join(".git/git-xcrypt/keys/default").exists());
     clone.assert_status_clean();
