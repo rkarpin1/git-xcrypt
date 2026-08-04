@@ -1,0 +1,283 @@
+//! Drives a real git repository in a temporary directory.
+//!
+//! Only git's stored objects prove that content left the working tree in the
+//! shape we intended, so every assertion here goes through real `git` calls and
+//! compares raw bytes. Nothing on this path may become a `String`: ciphertext —
+//! and, for now, reversed binary content — is not valid UTF-8.
+
+// Each integration test file compiles its own copy of this module, so helpers
+// used by only one of them would otherwise trip `-D warnings`.
+#![allow(dead_code)]
+
+use std::ffi::OsStr;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+use tempfile::TempDir;
+
+/// The binary under test, as built by cargo for this integration test run.
+const BIN: &str = env!("CARGO_BIN_EXE_git-crypt");
+
+/// A git repository living in a temporary directory that is removed on drop.
+pub struct TestRepo {
+    // Held for its Drop: removing the directory tree when the test ends.
+    _dir: TempDir,
+    path: PathBuf,
+}
+
+impl TestRepo {
+    /// Creates an empty repository with a committer identity set locally.
+    ///
+    /// The rest of the git configuration is deliberately inherited from the
+    /// machine — see the plan's Open Risks.
+    pub fn init() -> Self {
+        require_git();
+
+        let dir = TempDir::new().expect("could not create a temporary directory");
+        let path = dir.path().to_path_buf();
+        let repo = Self { _dir: dir, path };
+
+        repo.git_ok(["init", "-q", "-b", "main"]);
+        repo.git_ok(["config", "user.name", "git-crypt tests"]);
+        repo.git_ok(["config", "user.email", "tests@git-crypt.invalid"]);
+        repo
+    }
+
+    /// The working tree root.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Registers the hidden test filter under `name`.
+    ///
+    /// `required = true` is not optional. Without it git treats a failing clean
+    /// filter as harmless and commits the unfiltered content with exit code 0 —
+    /// which for the real product means a secret landing in the repository in
+    /// the clear.
+    pub fn register_filter(&self, name: &str) {
+        self.register_filter_command(name, &filter_command(None));
+    }
+
+    /// Registers a filter that always fails, for proving git aborts.
+    pub fn register_failing_filter(&self, name: &str) {
+        self.register_filter_command(name, &filter_command(Some("--fail")));
+    }
+
+    fn register_filter_command(&self, name: &str, command: &str) {
+        self.git_ok(["config", &format!("filter.{name}.clean"), command]);
+        self.git_ok(["config", &format!("filter.{name}.smudge"), command]);
+        self.git_ok(["config", &format!("filter.{name}.required"), "true"]);
+    }
+
+    /// Writes `contents` to `relative_path`, creating parent directories.
+    pub fn write_file(&self, relative_path: &str, contents: &[u8]) {
+        let target = self.path.join(relative_path);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).expect("could not create parent directories");
+        }
+        fs::write(&target, contents).expect("could not write the file");
+    }
+
+    /// Writes `.gitattributes` at the repository root.
+    ///
+    /// `-text` keeps `core.autocrlf` from rewriting content that must survive
+    /// byte for byte.
+    pub fn write_attributes(&self, contents: &str) {
+        self.write_file(".gitattributes", contents.as_bytes());
+    }
+
+    /// Stages everything and commits.
+    pub fn commit_all(&self, message: &str) {
+        self.git_ok(["add", "-A"]);
+        self.git_ok(["commit", "-q", "-m", message]);
+    }
+
+    /// Raw bytes of the blob stored for `relative_path` at `HEAD`.
+    pub fn blob_bytes(&self, relative_path: &str) -> Vec<u8> {
+        let output = self.git_ok(["cat-file", "blob", &format!("HEAD:{relative_path}")]);
+        output.stdout
+    }
+
+    /// Raw bytes of `relative_path` in the working tree.
+    pub fn worktree_bytes(&self, relative_path: &str) -> Vec<u8> {
+        fs::read(self.path.join(relative_path)).expect("could not read the working tree file")
+    }
+
+    /// Whether the object database holds a blob with exactly `contents`.
+    ///
+    /// Used to prove that a failed filter left no plaintext behind.
+    pub fn object_exists_for(&self, contents: &[u8]) -> bool {
+        let probe = self.path.join(".git-crypt-plaintext-probe");
+        fs::write(&probe, contents).expect("could not write the probe file");
+        let hashed = self.git_ok([
+            OsStr::new("hash-object"),
+            OsStr::new("-t"),
+            OsStr::new("blob"),
+            OsStr::new("--no-filters"),
+            probe.as_os_str(),
+        ]);
+        fs::remove_file(&probe).expect("could not remove the probe file");
+
+        let hash = String::from_utf8(hashed.stdout).expect("git printed a non-UTF-8 hash");
+        self.git(["cat-file", "-e", &format!("{}^{{blob}}", hash.trim())])
+            .status
+            .success()
+    }
+
+    /// Clones this repository into a fresh temporary directory.
+    ///
+    /// The clone inherits `.gitattributes` through history but not `.git/config`,
+    /// so no filter is registered in it — exactly the state a teammate or a
+    /// second machine sees before unlocking.
+    pub fn clone_without_filter(&self) -> Self {
+        let dir = TempDir::new().expect("could not create a temporary directory");
+        let path = dir.path().join("clone");
+
+        let output = Command::new("git")
+            .arg("clone")
+            .arg("-q")
+            .arg(&self.path)
+            .arg(&path)
+            .output()
+            .expect("could not run git clone");
+        assert!(
+            output.status.success(),
+            "git clone failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let clone = Self { _dir: dir, path };
+        clone.git_ok(["config", "user.name", "git-crypt tests"]);
+        clone.git_ok(["config", "user.email", "tests@git-crypt.invalid"]);
+        clone
+    }
+
+    /// Runs git in this repository and returns the full output, failure included.
+    pub fn git<I, S>(&self, args: I) -> Output
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        Command::new("git")
+            .current_dir(&self.path)
+            .args(args)
+            .output()
+            .expect("could not run git")
+    }
+
+    /// Runs git and panics unless it succeeded.
+    pub fn git_ok<I, S>(&self, args: I) -> Output
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let output = self.git(args);
+        assert!(
+            output.status.success(),
+            "git command failed with {:?}\nstderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    /// Asserts `git status` reports nothing — the proof that a checkout
+    /// reproduced the committed content exactly.
+    pub fn assert_status_clean(&self) {
+        let output = self.git_ok(["status", "--porcelain"]);
+        assert!(
+            output.stdout.is_empty(),
+            "expected a clean working tree, git reported:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    /// Asserts the stored blob differs from the working tree file.
+    pub fn assert_blob_differs_from_worktree(&self, relative_path: &str) {
+        let blob = self.blob_bytes(relative_path);
+        let worktree = self.worktree_bytes(relative_path);
+        assert_ne!(
+            blob, worktree,
+            "{relative_path}: the blob is identical to the working tree file, \
+             so the filter never ran"
+        );
+    }
+
+    /// Asserts the working tree file matches `expected` byte for byte.
+    pub fn assert_worktree_eq(&self, relative_path: &str, expected: &[u8]) {
+        assert_bytes_eq(&self.worktree_bytes(relative_path), expected, relative_path);
+    }
+
+    /// Asserts the stored blob matches `expected` byte for byte.
+    pub fn assert_blob_eq(&self, relative_path: &str, expected: &[u8]) {
+        assert_bytes_eq(&self.blob_bytes(relative_path), expected, relative_path);
+    }
+
+    /// Asserts `relative_path` is absent from the index.
+    pub fn assert_not_staged(&self, relative_path: &str) {
+        let output = self.git_ok(["ls-files", "--stage", "--", relative_path]);
+        assert!(
+            output.stdout.is_empty(),
+            "{relative_path} reached the index although the filter failed"
+        );
+    }
+}
+
+/// Compares byte buffers and reports where they diverge.
+///
+/// Printing whole buffers would be unreadable for binary content, so the
+/// message carries lengths and the first differing offset instead.
+fn assert_bytes_eq(actual: &[u8], expected: &[u8], label: &str) {
+    if actual == expected {
+        return;
+    }
+
+    let divergence = actual
+        .iter()
+        .zip(expected)
+        .position(|(a, b)| a != b)
+        .map_or_else(
+            || {
+                format!(
+                    "one is a prefix of the other at offset {}",
+                    actual.len().min(expected.len())
+                )
+            },
+            |offset| format!("first difference at offset {offset}"),
+        );
+
+    panic!(
+        "{label}: content mismatch — {} bytes vs {} expected, {divergence}",
+        actual.len(),
+        expected.len()
+    );
+}
+
+/// The command git runs as the filter.
+///
+/// The path is quoted because git hands the value to a shell, and backslashes
+/// become forward slashes because git accepts those on Windows while treating
+/// a backslash in a config value as an escape.
+fn filter_command(extra_argument: Option<&str>) -> String {
+    let binary = BIN.replace('\\', "/");
+    match extra_argument {
+        Some(argument) => format!("\"{binary}\" __test-filter {argument}"),
+        None => format!("\"{binary}\" __test-filter"),
+    }
+}
+
+/// Fails loudly when git is missing.
+///
+/// Skipping silently would hide the absence of coverage, and these tests have
+/// no meaning without a real git.
+fn require_git() {
+    let available = Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    assert!(
+        available,
+        "git was not found on PATH; the integration tests cannot run without it"
+    );
+}
