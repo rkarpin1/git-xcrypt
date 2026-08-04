@@ -126,18 +126,18 @@ kod `3`.
 
 #### Automatyczne
 
-- [ ] 1.1 `lock --yes` szyfruje pliki i usuwa klucz
-- [ ] 1.2 Katalog roboczy po `lock` jest identyczny z blobami z `HEAD`
-- [ ] 1.3 Brudny katalog roboczy → kod `2`, brak zmian, także z `--yes`
-- [ ] 1.4 Odmowa potwierdzenia → kod `1` bez zmian
-- [ ] 1.5 Wyjście nie zawiera materiału klucza
-- [ ] 1.6 Ostrzeżenie zawiera `key_id`
-- [ ] 1.7 `lock` bez klucza → kod `3`
-- [ ] 1.8 `lock` + `unlock` przywraca treść bajt w bajt
-- [ ] 1.9 Powtórzony `lock` jest bezpieczny
-- [ ] 1.10 `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`
+- [x] 1.1 `lock --yes` szyfruje pliki i usuwa klucz
+- [x] 1.2 Katalog roboczy po `lock` jest identyczny z blobami z `HEAD`
+- [x] 1.3 Brudny katalog roboczy → kod `2`, brak zmian, także z `--yes`
+- [x] 1.4 Odmowa potwierdzenia → kod `1` bez zmian
+- [x] 1.5 Wyjście nie zawiera materiału klucza
+- [x] 1.6 Ostrzeżenie zawiera `key_id`
+- [x] 1.7 `lock` bez klucza → kod `3`
+- [x] 1.8 `lock` + `unlock` przywraca treść bajt w bajt
+- [x] 1.9 Powtórzony `lock` jest bezpieczny
+- [x] 1.10 `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`
 
 #### Ręczne
 
-- [ ] 1.11 Ostrzeżenie jest zrozumiałe i odstraszające
-- [ ] 1.12 Tryb interaktywny działa w prawdziwym terminalu
+- [x] 1.11 Ostrzeżenie jest zrozumiałe i odstraszające
+- [x] 1.12 Tryb interaktywny działa w prawdziwym terminalu

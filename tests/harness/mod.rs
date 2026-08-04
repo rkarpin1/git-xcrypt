@@ -63,6 +63,35 @@ impl TestRepo {
             .expect("could not run git-xcrypt")
     }
 
+    /// Runs `git-xcrypt` with `input` on stdin and returns the full output.
+    ///
+    /// The only way to drive an interactive confirmation the way a user does,
+    /// which for `lock` is the branch that stands between a mistyped command and
+    /// a deleted key.
+    pub fn xcrypt_with_stdin<I, S>(&self, args: I, input: &[u8]) -> Output
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let mut child = Command::new(BIN)
+            .current_dir(&self.path)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("could not run git-xcrypt");
+        child
+            .stdin
+            .take()
+            .expect("git-xcrypt stdin was not captured")
+            .write_all(input)
+            .expect("could not write to git-xcrypt stdin");
+        child
+            .wait_with_output()
+            .expect("could not collect git-xcrypt output")
+    }
+
     /// Runs `git-xcrypt` and panics unless it succeeded.
     pub fn xcrypt_ok<I, S>(&self, args: I) -> Output
     where

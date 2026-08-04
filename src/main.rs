@@ -66,6 +66,18 @@ enum Command {
         key: Option<PathBuf>,
     },
 
+    /// Encrypt this repository's working tree and delete its key.
+    ///
+    /// Irreversible without a copy of the key: `unlock` cannot undo it, because
+    /// `.git/` is never pushed and the key file it removes is the only one.
+    /// Refuses while any declared file holds content the repository does not
+    /// store yet — `--yes` does not waive that.
+    Lock {
+        /// Do not ask for confirmation. The warning is still printed.
+        #[arg(long)]
+        yes: bool,
+    },
+
     /// Serve git's long-running filter protocol. Registered by `init`.
     ///
     /// Not meant to be run by hand: everything it writes to stdout is protocol.
@@ -81,6 +93,7 @@ fn main() -> ExitCode {
         Command::ExportKey { path, force } => report(run_export_key(&path, force)),
         Command::ImportKey { path } => report(run_import_key(&path)),
         Command::Unlock { key } => report(run_unlock(key.as_deref())),
+        Command::Lock { yes } => run_lock(yes),
         Command::Process => report(commands::process::run()),
     }
 }
@@ -221,6 +234,78 @@ fn run_unlock(key: Option<&std::path::Path>) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Runs `lock`, whose refusal by the user is an answer rather than a failure.
+///
+/// It has its own exit path rather than going through [`report`] because
+/// declining the question is not an error: the command did exactly what it was
+/// asked to and changed nothing, which the frozen table gives code `1`.
+///
+/// Everything the command says goes to `stderr`, the warning included. `stdout`
+/// stays empty, so `git-xcrypt lock > somewhere` captures nothing — the same
+/// rule that keeps a key out of a redirect anywhere else in this binary.
+fn run_lock(assume_yes: bool) -> ExitCode {
+    match lock_and_describe(assume_yes) {
+        Ok(code) => code,
+        Err(err) => {
+            eprintln!("git-xcrypt: {err}");
+            ExitCode::from(err.exit_code())
+        }
+    }
+}
+
+fn lock_and_describe(assume_yes: bool) -> Result<ExitCode> {
+    use commands::lock::Outcome;
+
+    let repo = Repo::discover_from_cwd()?;
+
+    // `std::io::stderr()` rather than a held `StderrLock`: the guard would still
+    // be alive while the eprintln! calls below run.
+    let outcome = if assume_yes {
+        commands::lock::run(&repo, &mut commands::lock::Assumed::new(std::io::stderr()))?
+    } else {
+        commands::lock::run(
+            &repo,
+            &mut commands::lock::Ask::new(std::io::stdin().lock(), std::io::stderr()),
+        )?
+    };
+
+    let report = match outcome {
+        Outcome::Aborted => {
+            eprintln!(
+                "git-xcrypt: aborted. The key is still here and nothing in the working \
+                 tree was changed."
+            );
+            return Ok(ExitCode::from(exit::USAGE));
+        }
+        Outcome::Locked(report) => report,
+    };
+
+    for warning in &report.warnings {
+        eprintln!("git-xcrypt: {warning}");
+    }
+    for path in &report.swept {
+        eprintln!(
+            "git-xcrypt: removed {}, left behind by an interrupted run",
+            path.display()
+        );
+    }
+    for path in &report.encrypted {
+        eprintln!("git-xcrypt: encrypted {}", path.display());
+    }
+
+    let key_id = git_xcrypt::format_key_id(&report.key_id);
+    eprintln!(
+        "git-xcrypt: locked; {} file(s) are now encrypted and key {key_id} has been \
+         deleted from this repository",
+        report.encrypted.len()
+    );
+    eprintln!(
+        "git-xcrypt: run `git-xcrypt unlock <key-file>` with your copy of key {key_id} \
+         to open it again"
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Runs `sync`, whose `--check` mode reports staleness through the exit code.

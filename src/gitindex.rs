@@ -1,4 +1,5 @@
-//! Making git look at a file again after `unlock` rewrote it.
+//! Reading git's index, and making git look at a file again after it was
+//! rewritten in place.
 //!
 //! Rewriting a working-tree file in place is not enough to leave `git status`
 //! clean, and the reason is a shortcut inside git. The index caches the `stat`
@@ -8,7 +9,14 @@
 //! file that shortcut is sound: a different size is a different file. For a
 //! filtered one it is not, and `unlock` hits it head on, because a clone checked
 //! out without a key recorded the size of the *ciphertext*, and the file is now
-//! its plaintext, 38 bytes shorter.
+//! its plaintext, 38 bytes shorter. `lock` hits the same wall going the other
+//! way.
+//!
+//! The object ids the index stores are read here too, by [`staged_ids`]. That is
+//! what lets `lock` answer "is this content already a blob in this repository"
+//! without opening the object database: the index records the id of every
+//! tracked path's *cleaned* content, and encryption is deterministic, so hashing
+//! what the clean path would produce and comparing is exact.
 //!
 //! Measured on git 2.55, in a clone unlocked with the right key:
 //!
@@ -78,7 +86,7 @@ pub fn forget_stat(index_path: &Path, hash: gix_hash::Kind, paths: &[Vec<u8>]) -
         )));
     };
 
-    let mut data = match fs::read(index_path) {
+    let data = match fs::read(index_path) {
         Ok(data) => data,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Ok(Outcome::Skipped(format!(
@@ -90,41 +98,16 @@ pub fn forget_stat(index_path: &Path, hash: gix_hash::Kind, paths: &[Vec<u8>]) -
     };
 
     let hash_len = hash.len_in_bytes();
-    if data.len() < HEADER_LEN + hash_len || !data.starts_with(b"DIRC") {
-        return Ok(skipped(
-            index_path,
-            "it is not an index this build can read",
-        ));
-    }
-
-    let body_len = data.len() - hash_len;
-    let recorded = &data[body_len..];
-    // `index.skipHash` writes zeroes here and tells git not to verify. Keeping
-    // that promise means writing zeroes back rather than filling it in. A tail
-    // zeroed by a bad write rather than by that setting is not covered by this
-    // check, but is by the structural one below: the entry and extension walk
-    // has to land exactly on the end of the data or nothing is written.
-    let skip_hash = recorded.iter().all(|byte| *byte == 0);
-    if !skip_hash {
-        let Some(digest) = checksum(&data[..body_len], hash) else {
-            return Ok(skipped(index_path, "its checksum could not be computed"));
-        };
-        if digest != recorded {
-            return Ok(skipped(
-                index_path,
-                "its checksum does not match its contents",
-            ));
-        }
-    }
-
-    let version = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
-    let count = u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
-    if !(2..=4).contains(&version) {
-        return Ok(skipped(
-            index_path,
-            &format!("it is version {version}, which this build does not know"),
-        ));
-    }
+    let Index {
+        mut data,
+        body_len,
+        version,
+        count,
+        skip_hash,
+    } = match inspect(data, hash) {
+        Ok(index) => index,
+        Err(why) => return Ok(skipped(index_path, &why)),
+    };
 
     let Some(scan) = scan(&data[..body_len], version, count, hash_len, paths) else {
         return Ok(skipped(index_path, "its entries did not parse"));
@@ -163,6 +146,150 @@ pub fn forget_stat(index_path: &Path, hash: gix_hash::Kind, paths: &[Vec<u8>]) -
     Ok(Outcome::Cleared(scan.size_fields.len()))
 }
 
+/// What the index says about a set of paths.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Staged {
+    /// The object id the index records for each requested path, in the order
+    /// they were asked for. `None` where the index has no stage-0 entry for it,
+    /// which covers an untracked path and an unresolved conflict alike — both
+    /// mean "this path's content is not simply stored here".
+    Read(Vec<Option<Vec<u8>>>),
+    /// The index could not be read, and why.
+    ///
+    /// A separate answer from "no entry", because the two must not be confused
+    /// by a caller that refuses on the second: an unreadable index is not
+    /// evidence that anything is unstored.
+    Unavailable(String),
+}
+
+/// The object ids the index records for `paths`.
+///
+/// No lock is taken: git replaces the index by renaming a complete file over
+/// it, so a reader sees one version or the other and never a half-written one.
+/// [`forget_stat`] locks because it writes.
+///
+/// # Errors
+///
+/// [`Error::Io`] when the index exists but cannot be read. An index that does
+/// not exist yet is not an error — nothing is tracked, so every answer is
+/// `None`.
+pub fn staged_ids(index_path: &Path, hash: gix_hash::Kind, paths: &[Vec<u8>]) -> Result<Staged> {
+    let data = match fs::read(index_path) {
+        Ok(data) => data,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Staged::Read(vec![None; paths.len()]));
+        }
+        Err(err) => return Err(Error::Io(err)),
+    };
+
+    let index = match inspect(data, hash) {
+        Ok(index) => index,
+        Err(why) => return Ok(Staged::Unavailable(why)),
+    };
+
+    let mut found: Vec<Option<Vec<u8>>> = vec![None; paths.len()];
+    let body = &index.data[..index.body_len];
+    let walked = walk(
+        body,
+        index.version,
+        index.count,
+        hash.len_in_bytes(),
+        &mut |entry| {
+            // Stage 0 only. A path in the middle of a merge has entries at
+            // stages 1 to 3 and no settled content at all, which has to read as
+            // "not stored" rather than as whichever side happened to come last.
+            if entry.stage != 0 {
+                return;
+            }
+            if let Some(at) = paths.iter().position(|path| path.as_slice() == entry.name) {
+                found[at] = Some(entry.id.to_vec());
+            }
+        },
+    );
+
+    match walked {
+        None => Ok(Staged::Unavailable("its entries did not parse".into())),
+        Some(true) => Ok(Staged::Unavailable(
+            "this repository uses a split index, whose entries live in a shared \
+             file this build does not read"
+                .into(),
+        )),
+        Some(false) => Ok(Staged::Read(found)),
+    }
+}
+
+/// The object id git stores for `content` as a blob.
+///
+/// Git hashes `blob <length>\0` followed by the bytes. Deterministic encryption
+/// is what makes this useful: hashing the ciphertext the clean path would
+/// produce answers "is this working-tree file already stored" exactly, without
+/// opening a single object.
+#[must_use]
+pub fn blob_id(hash: gix_hash::Kind, content: &[u8]) -> Option<Vec<u8>> {
+    let mut hasher = gix_hash::hasher(hash);
+    hasher.update(format!("blob {}\0", content.len()).as_bytes());
+    hasher.update(content);
+    hasher
+        .try_finalize()
+        .ok()
+        .map(|digest| digest.as_slice().to_vec())
+}
+
+/// An index this build is willing to act on.
+struct Index {
+    data: Vec<u8>,
+    /// Everything before the trailing checksum.
+    body_len: usize,
+    version: u32,
+    count: usize,
+    /// The checksum was zeroed, as `index.skipHash` does, and must stay so.
+    skip_hash: bool,
+}
+
+/// Validates the fixed parts of an index, or says why it cannot be used.
+///
+/// Shared by the reader and the writer so the two can never disagree about
+/// which files they understand.
+fn inspect(data: Vec<u8>, hash: gix_hash::Kind) -> std::result::Result<Index, String> {
+    let hash_len = hash.len_in_bytes();
+    if data.len() < HEADER_LEN + hash_len || !data.starts_with(b"DIRC") {
+        return Err("it is not an index this build can read".into());
+    }
+
+    let body_len = data.len() - hash_len;
+    let recorded = &data[body_len..];
+    // `index.skipHash` writes zeroes here and tells git not to verify. Keeping
+    // that promise means writing zeroes back rather than filling it in. A tail
+    // zeroed by a bad write rather than by that setting is not covered by this
+    // check, but is by the structural one in `walk`: the entry and extension
+    // walk has to land exactly on the end of the data or nothing is written.
+    let skip_hash = recorded.iter().all(|byte| *byte == 0);
+    if !skip_hash {
+        let Some(digest) = checksum(&data[..body_len], hash) else {
+            return Err("its checksum could not be computed".into());
+        };
+        if digest != recorded {
+            return Err("its checksum does not match its contents".into());
+        }
+    }
+
+    let version = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+    let count = u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
+    if !(2..=4).contains(&version) {
+        return Err(format!(
+            "it is version {version}, which this build does not know"
+        ));
+    }
+
+    Ok(Index {
+        data,
+        body_len,
+        version,
+        count,
+        skip_hash,
+    })
+}
+
 /// The usual shape of a refusal, with an instruction the user can act on.
 fn skipped(index_path: &Path, why: &str) -> Outcome {
     Outcome::Skipped(format!(
@@ -191,20 +318,25 @@ struct Scan {
     split_index: bool,
 }
 
-/// Walks the entries and then the extensions, or gives up entirely.
-///
-/// Returns `None` for anything that does not parse exactly, which is what keeps
-/// a misread from turning into a patched byte in the wrong place. The extension
-/// walk is not only there to spot a split index: it has to consume the file to
-/// its last byte, which is what proves the entry walk ended where it should
-/// rather than somewhere plausible.
-///
-/// The entry layout is identical in every index version: `ctime` (8), `mtime`
-/// (8), `dev`, `ino`, `mode`, `uid`, `gid`, `size` (4 each), the object id, then
-/// a 16-bit flags word. Only the name differs — versions 2 and 3 store it
-/// NUL-terminated and pad the entry to a multiple of eight, version 4 stores it
-/// as "strip this many bytes off the previous name, then append this" with no
-/// padding at all.
+/// Offset of the `size` field from the start of an entry.
+const SIZE_FIELD: usize = 36;
+
+/// Offset of the object id from the start of an entry, after the stat block.
+const ID_FIELD: usize = 40;
+
+/// One index entry, as [`walk`] hands it over.
+struct Entry<'a> {
+    /// Offset of the entry from the start of the index.
+    start: usize,
+    /// The path, spelled exactly as the index spells it.
+    name: &'a [u8],
+    /// Object id of the entry's cleaned content.
+    id: &'a [u8],
+    /// Merge stage; anything but 0 is an unresolved conflict.
+    stage: u8,
+}
+
+/// Finds the entries the caller asked about, if the whole index parses.
 fn scan(
     body: &[u8],
     version: u32,
@@ -212,23 +344,60 @@ fn scan(
     hash_len: usize,
     paths: &[Vec<u8>],
 ) -> Option<Scan> {
-    /// Offset of the `size` field from the start of an entry.
-    const SIZE_FIELD: usize = 36;
-    // Everything before the name: the stat block, the object id, the flags.
-    let fixed = 40 + hash_len + 2;
-
     let mut fields = Vec::new();
+    let split_index = walk(body, version, count, hash_len, &mut |entry| {
+        if paths.iter().any(|path| path.as_slice() == entry.name) {
+            fields.push(entry.start + SIZE_FIELD);
+        }
+    })?;
+
+    Some(Scan {
+        size_fields: fields,
+        split_index,
+    })
+}
+
+/// Walks the entries and then the extensions, or gives up entirely.
+///
+/// Returns `None` for anything that does not parse exactly, which is what keeps
+/// a misread from turning into a patched byte in the wrong place. The extension
+/// walk is not only there to spot a split index: it has to consume the file to
+/// its last byte, which is what proves the entry walk ended where it should
+/// rather than somewhere plausible. `true` means the index carries a `link`
+/// extension, so its entries live in a shared file this build does not open.
+///
+/// The entry layout is identical in every index version: `ctime` (8), `mtime`
+/// (8), `dev`, `ino`, `mode`, `uid`, `gid`, `size` (4 each), the object id, then
+/// a 16-bit flags word. Only the name differs — versions 2 and 3 store it
+/// NUL-terminated and pad the entry to a multiple of eight, version 4 stores it
+/// as "strip this many bytes off the previous name, then append this" with no
+/// padding at all.
+///
+/// `visit` is called once per entry, in file order. It is a callback rather than
+/// a returned list because two callers want different fields out of the same
+/// walk, and a second copy of this parser is the last thing this module needs.
+fn walk(
+    body: &[u8],
+    version: u32,
+    count: usize,
+    hash_len: usize,
+    visit: &mut dyn FnMut(&Entry<'_>),
+) -> Option<bool> {
+    // Everything before the name: the stat block, the object id, the flags.
+    let fixed = ID_FIELD + hash_len + 2;
+
     let mut cursor = HEADER_LEN;
     let mut previous: Vec<u8> = Vec::new();
 
     for _ in 0..count {
         let start = cursor;
-        let flags_at = start.checked_add(40 + hash_len)?;
+        let flags_at = start.checked_add(ID_FIELD + hash_len)?;
         if body.len() < flags_at + 2 {
             return None;
         }
         let flags = u16::from_be_bytes([body[flags_at], body[flags_at + 1]]);
         let extended = flags & 0x4000 != 0;
+        let stage = ((flags >> 12) & 0x3) as u8;
         let declared = usize::from(flags & 0x0fff);
 
         let mut at = start + fixed;
@@ -271,9 +440,12 @@ fn scan(
         if cursor > body.len() {
             return None;
         }
-        if paths.iter().any(|path| path.as_slice() == name.as_slice()) {
-            fields.push(start + SIZE_FIELD);
-        }
+        visit(&Entry {
+            start,
+            name: &name,
+            id: &body[start + ID_FIELD..flags_at],
+            stage,
+        });
         previous = name;
     }
 
@@ -302,10 +474,7 @@ fn scan(
         }
     }
 
-    Some(Scan {
-        size_fields: fields,
-        split_index,
-    })
+    Some(split_index)
 }
 
 /// Git's variable-width integer, as version 4 uses it for the prefix length.
@@ -628,6 +797,148 @@ mod tests {
         )
         .expect("an absent index is not our failure");
         assert!(matches!(outcome, Outcome::Skipped(_)), "{outcome:?}");
+    }
+
+    /// What git itself records for `path`, so the reader is checked against git.
+    fn git_staged_id(dir: &TempDir, path: &str) -> String {
+        let output = Command::new("git")
+            .args(["rev-parse", &format!(":{path}")])
+            .current_dir(dir.path())
+            .output()
+            .expect("git must be on PATH");
+        String::from_utf8(output.stdout)
+            .expect("git printed non-UTF-8")
+            .trim()
+            .to_string()
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[test]
+    fn the_object_ids_read_back_are_the_ones_git_recorded() {
+        for version in [2u32, 3, 4] {
+            let dir = repo_with_index(version);
+            let paths = vec![
+                b"a.txt".to_vec(),
+                b"deep/nested/c-with-a-long-name.txt".to_vec(),
+                b"never-existed".to_vec(),
+            ];
+
+            let staged = staged_ids(&index_of(&dir), gix_hash::Kind::Sha1, &paths)
+                .expect("reading must succeed");
+
+            let Staged::Read(ids) = staged else {
+                panic!("index version {version}: the entries could not be read");
+            };
+            assert_eq!(
+                ids[0].as_deref().map(hex),
+                Some(git_staged_id(&dir, "a.txt")),
+                "index version {version}"
+            );
+            assert_eq!(
+                ids[1].as_deref().map(hex),
+                Some(git_staged_id(&dir, "deep/nested/c-with-a-long-name.txt")),
+                "index version {version}"
+            );
+            assert_eq!(ids[2], None, "index version {version}: an invented path");
+        }
+    }
+
+    #[test]
+    fn a_blob_id_matches_what_git_would_store() {
+        let dir = repo_with_index(2);
+        let content = b"content of a.txt\n";
+
+        let ours = blob_id(gix_hash::Kind::Sha1, content).expect("hashing must succeed");
+
+        assert_eq!(hex(&ours), git_staged_id(&dir, "a.txt"));
+    }
+
+    #[test]
+    fn an_index_with_no_file_behind_it_reports_nothing_stored() {
+        let dir = TempDir::new().expect("temporary directory");
+        let staged = staged_ids(
+            &dir.path().join("index"),
+            gix_hash::Kind::Sha1,
+            &[b"a.txt".to_vec()],
+        )
+        .expect("an absent index is not our failure");
+        assert_eq!(staged, Staged::Read(vec![None]));
+    }
+
+    #[test]
+    fn a_damaged_index_is_unavailable_rather_than_read_as_empty() {
+        // The distinction `lock` rests on: "no entry" means unsaved work and is
+        // a refusal to lock, while "cannot read" must not be mistaken for it.
+        let dir = repo_with_index(2);
+        let path = index_of(&dir);
+        let mut data = fs::read(&path).expect("reading the index");
+        let middle = data.len() / 2;
+        data[middle] ^= 0xff;
+        fs::write(&path, &data).expect("writing");
+
+        let staged = staged_ids(&path, gix_hash::Kind::Sha1, &[b"a.txt".to_vec()])
+            .expect("a damaged index is not our failure");
+
+        assert!(matches!(staged, Staged::Unavailable(_)), "{staged:?}");
+    }
+
+    #[test]
+    fn a_split_index_is_unavailable_rather_than_read_as_empty() {
+        let dir = repo_with_index(2);
+        let ok = Command::new("git")
+            .args(["update-index", "--split-index"])
+            .current_dir(dir.path())
+            .status()
+            .expect("git must be on PATH")
+            .success();
+        assert!(ok, "git could not split the index");
+
+        let staged = staged_ids(&index_of(&dir), gix_hash::Kind::Sha1, &[b"a.txt".to_vec()])
+            .expect("a split index is not our failure");
+
+        match staged {
+            Staged::Unavailable(message) => assert!(message.contains("split index")),
+            other => panic!("a split index must not read as an empty index: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unresolved_conflict_reads_as_nothing_stored() {
+        // Stages 1 to 3 hold the two sides and their base, and none of them is
+        // the file's settled content — so `lock` has to see "not stored".
+        let dir = repo_with_index(2);
+        let run = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .expect("git must be on PATH");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["checkout", "-q", "-b", "other"]);
+        fs::write(dir.path().join("a.txt"), "theirs\n").expect("writing");
+        run(&["commit", "-q", "-am", "theirs"]);
+        run(&["checkout", "-q", "-"]);
+        fs::write(dir.path().join("a.txt"), "mine\n").expect("writing");
+        run(&["commit", "-q", "-am", "mine"]);
+        let merged = Command::new("git")
+            .args(["merge", "other"])
+            .current_dir(dir.path())
+            .output()
+            .expect("git must be on PATH");
+        assert!(!merged.status.success(), "the merge was meant to conflict");
+
+        let staged = staged_ids(&index_of(&dir), gix_hash::Kind::Sha1, &[b"a.txt".to_vec()])
+            .expect("reading must succeed");
+
+        assert_eq!(staged, Staged::Read(vec![None]));
     }
 
     #[test]

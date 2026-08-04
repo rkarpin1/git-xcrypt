@@ -68,8 +68,10 @@ enum Mode {
 /// checked out means it is no more readable than the file it replaces, but a
 /// later `git add -A` could store it in the clear. There is no portable way to
 /// clean up after `SIGKILL`; the residue is recorded here rather than hidden.
-/// Every such file matches `*.git-xcrypt-*.tmp`, which is what the user
-/// documentation has to tell people to look for after a killed `unlock`.
+/// Every such file is recognised by [`is_temporary_name`], which is what the
+/// user documentation has to tell people to look for after a killed `unlock` —
+/// and what `lock` sweeps before it encrypts, since a plaintext leftover would
+/// otherwise survive the one command whose job is to leave none.
 ///
 /// # Errors
 ///
@@ -194,14 +196,49 @@ fn create_temporary(path: &Path, mode: Mode) -> Result<(PathBuf, fs::File)> {
     ))))
 }
 
+/// What every temporary name carries between the target's name and `.tmp`.
+const MARKER: &[u8] = b".git-xcrypt-";
+
+/// How many random bytes go into a temporary name.
+const RANDOM_LEN: usize = 8;
+
 /// A sibling name no one can guess and therefore no one can pre-create.
 fn temporary_name(name: &std::ffi::OsStr) -> Result<OsString> {
-    let mut random = [0u8; 8];
+    let mut random = [0u8; RANDOM_LEN];
     getrandom::fill(&mut random).map_err(|err| Error::Entropy(err.to_string()))?;
 
     let mut temporary = name.to_os_string();
-    temporary.push(format!(".git-xcrypt-{}.tmp", crate::hex(&random)));
+    temporary.push(format!(
+        "{}{}.tmp",
+        String::from_utf8_lossy(MARKER),
+        crate::hex(&random)
+    ));
     Ok(temporary)
+}
+
+/// Whether `name` is one of the temporary files [`replace`] leaves behind.
+///
+/// A process killed outright cannot clean up after itself, and on the `unlock`
+/// and `lock` paths the residue holds a **decrypted secret**. `lock` in
+/// particular promises that no plaintext of a selected path survives it, and a
+/// leftover under a name no pattern was written for would break that promise
+/// quietly — so `lock` sweeps them, and this is the predicate it sweeps by.
+///
+/// Deliberately exact rather than a substring test: the marker must be followed
+/// by exactly [`RANDOM_LEN`] bytes of hex and then `.tmp`, and something must
+/// precede the marker, because these names are always built from a target's own
+/// name. A file a user happens to have called `notes.git-xcrypt-draft.tmp` is
+/// not matched and not deleted.
+#[must_use]
+pub fn is_temporary_name(name: &[u8]) -> bool {
+    let Some(rest) = name.strip_suffix(b".tmp") else {
+        return false;
+    };
+    let Some(hex_at) = rest.len().checked_sub(RANDOM_LEN * 2) else {
+        return false;
+    };
+    let (head, hex) = rest.split_at(hex_at);
+    head.len() > MARKER.len() && head.ends_with(MARKER) && hex.iter().all(u8::is_ascii_hexdigit)
 }
 
 #[cfg(test)]
