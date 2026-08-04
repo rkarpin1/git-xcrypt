@@ -35,10 +35,13 @@ const CATCH_ALL: &str = "* filter=git-xcrypt";
 /// Renders the cosmetic per-pattern lines for `config`, in file order.
 ///
 /// One line per selecting pattern: `<pattern> -text diff=git-xcrypt`, or
-/// `<pattern> -text` when the pattern was declared `binary` — git's own `binary`
-/// macro means `-text -diff`, and we reproduce it. Negations are left out
-/// entirely: git ignores a leading `!` in `.gitattributes` and says so on
-/// stderr, so rendering one would be noise at best.
+/// `<pattern> -text -diff` when the pattern was declared `binary` — git's own
+/// `binary` macro means `-text -diff`, and we reproduce it. `-diff` has to be
+/// written out rather than merely left off: git resolves attributes by last
+/// match and a later line overrides only what it names, so omitting it would
+/// leave `diff=git-xcrypt` standing from a broader pattern above. Negations are
+/// left out entirely: git ignores a leading `!` in `.gitattributes` and says so
+/// on stderr, so rendering one would be noise at best.
 ///
 /// The order is the order of `.git-xcrypt`, so the output is a pure function of
 /// the input and two runs produce the same file.
@@ -66,7 +69,7 @@ pub fn render_lines(config: &Config) -> Vec<String> {
         .into_iter()
         .map(|(pattern, suppress_diff)| {
             if suppress_diff {
-                format!("{pattern} -text")
+                format!("{pattern} -text -diff")
             } else {
                 format!("{pattern} -text diff={DRIVER}")
             }
@@ -219,6 +222,35 @@ pub fn upsert(contents: &str, section: &str) -> Result<String> {
     Ok(out)
 }
 
+/// Reads the attributes file at `path`, treating an absent one as empty.
+///
+/// # Errors
+///
+/// [`Error::Io`] when the file exists but cannot be read. An unreadable file is
+/// never silently treated as an empty one: that would replace the user's own
+/// attributes with a bare managed section.
+pub fn read(path: &Path) -> Result<String> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(err) => Err(Error::Io(err)),
+    }
+}
+
+/// What the attributes file at `path` should contain for `extra_lines`.
+///
+/// Split out from [`write_section`] so `sync --check` can compare without
+/// writing — the check and the write must never answer differently.
+///
+/// # Errors
+///
+/// [`Error::Io`] on a read failure, [`Error::Config`] on unbalanced markers.
+pub fn desired(path: &Path, extra_lines: &[String]) -> Result<(String, String)> {
+    let existing = read(path)?;
+    let updated = upsert(&existing, &render_section(extra_lines))?;
+    Ok((existing, updated))
+}
+
 /// Writes the managed section into the attributes file at `path`.
 ///
 /// # Errors
@@ -226,13 +258,7 @@ pub fn upsert(contents: &str, section: &str) -> Result<String> {
 /// [`Error::Io`] on a read or write failure, [`Error::Config`] on unbalanced
 /// markers.
 pub fn write_section(path: &Path, extra_lines: &[String]) -> Result<bool> {
-    let existing = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(err) => return Err(Error::Io(err)),
-    };
-
-    let updated = upsert(&existing, &render_section(extra_lines))?;
+    let (existing, updated) = desired(path, extra_lines)?;
     if updated == existing {
         return Ok(false);
     }
@@ -323,7 +349,14 @@ mod tests {
 
     #[test]
     fn binary_drops_the_diff_driver() {
-        assert_eq!(lines("secrets/key.p12 binary\n"), ["secrets/key.p12 -text"]);
+        // `-diff` is written out, not merely left off: measured on git 2.55, a
+        // later line overrides only the attributes it names, so a bare
+        // `secrets/key.p12 -text` under a `secrets/**` line would keep the diff
+        // driver the broader line set.
+        assert_eq!(
+            lines("secrets/key.p12 binary\n"),
+            ["secrets/key.p12 -text -diff"]
+        );
         assert_eq!(
             lines("secrets/key.p12 -text\n"),
             ["secrets/key.p12 -text diff=git-xcrypt"],
@@ -383,7 +416,7 @@ mod tests {
         // two lines for one pattern would disagree with the filter's own answer.
         assert_eq!(
             lines("secrets/key.p12 binary\nsecrets/key.p12 eol=lf\n"),
-            ["secrets/key.p12 -text"]
+            ["secrets/key.p12 -text -diff"]
         );
     }
 

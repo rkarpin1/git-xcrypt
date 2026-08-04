@@ -1,6 +1,6 @@
 # Repository Guidelines
 
-`git-xcrypt` is a Rust CLI that transparently encrypts selected files on commit and decrypts them on checkout. The crate is split into `src/lib.rs` (logic) and a thin `src/main.rs` (arguments, exit codes). S-01 has shipped, so the real path exists end to end: `init` sets the repository up and `process` serves git's long-running filter protocol. Everything else — `status`, `lock`, `unlock`, `export-key`, `import-key`, `sync`, `diff` — is still unbuilt, so do not register or reference a subcommand before it exists. The decisions live under `context/foundation/`.
+`git-xcrypt` is a Rust CLI that transparently encrypts selected files on commit and decrypts them on checkout. The crate is split into `src/lib.rs` (logic) and a thin `src/main.rs` (arguments, exit codes). S-01 and S-02 have shipped, so the real path exists end to end: `init` sets the repository up, `process` serves git's long-running filter protocol, and `sync` regenerates the cosmetic `.gitattributes` lines. Everything else — `status`, `lock`, `unlock`, `export-key`, `import-key`, `diff` — is still unbuilt, so do not register or reference a subcommand before it exists. The decisions live under `context/foundation/`.
 
 ## Hard rules
 

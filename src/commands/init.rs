@@ -12,6 +12,7 @@
 
 use std::fs;
 
+use crate::config::Config;
 use crate::key::MasterKey;
 use crate::repo::{DRIVER, Repo};
 use crate::{Error, Result, gitattributes, gitconfig, keyfile};
@@ -27,6 +28,10 @@ pub struct Report {
     pub attributes_written: bool,
     /// The `.git-xcrypt` file was created.
     pub config_file_created: bool,
+    /// Lines of `.git-xcrypt` that declare something pointless.
+    ///
+    /// Carried out rather than printed here so the binary owns every message.
+    pub warnings: Vec<String>,
 }
 
 impl Report {
@@ -73,7 +78,19 @@ pub fn run(repo: &Repo) -> Result<Report> {
 
     report.config_written = register_driver(repo)?;
     report.config_file_created = create_config_file(repo)?;
-    report.attributes_written = gitattributes::write_section(&repo.attributes_path(), &[])?;
+
+    // The managed section is rendered by the same code `sync` runs, so a fresh
+    // repository and a synchronised one are byte-identical. Doing it here rather
+    // than leaving it to a later `sync` is what keeps "run one command" true.
+    //
+    // A `.git-xcrypt` that cannot be parsed stops `init` at this point, on
+    // purpose: the same file stops every `git add` too, and the registration
+    // above has already been saved, so the repair still lands and the message
+    // names the offending line.
+    let config = Config::load(&repo.xcrypt_config_path())?;
+    let lines = gitattributes::render_lines(&config);
+    report.warnings = config.pointless_eol;
+    report.attributes_written = gitattributes::write_section(&repo.attributes_path(), &lines)?;
 
     Ok(report)
 }

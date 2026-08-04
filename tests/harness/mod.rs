@@ -105,6 +105,21 @@ impl TestRepo {
         self.git_ok(["config", "filter.git-xcrypt.required", "true"]);
     }
 
+    /// What git itself says one attribute resolves to for `relative_path`.
+    ///
+    /// The generated lines are only worth anything if git agrees with them, and
+    /// git is the only authority on its own pattern syntax — the two files do
+    /// not spell patterns the same way.
+    pub fn check_attr(&self, attribute: &str, relative_path: &str) -> String {
+        let output = self.git_ok(["check-attr", attribute, "--", relative_path]);
+        let text = String::from_utf8(output.stdout).expect("git printed non-UTF-8 attributes");
+        text.rsplit(": ")
+            .next()
+            .expect("check-attr always prints a value")
+            .trim()
+            .to_string()
+    }
+
     /// Writes `contents` to `relative_path`, creating parent directories.
     pub fn write_file(&self, relative_path: &str, contents: &[u8]) {
         let target = self.path.join(relative_path);

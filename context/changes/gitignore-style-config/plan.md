@@ -156,24 +156,24 @@ kodem co `sync`, zamiast wypisywać samą linię catch-all.
 
 #### Automatyczne
 
-- [x] 1.1 `sekrety/` renderuje się jako `sekrety/**`
-- [x] 1.2 `binary` daje linię bez `diff=git-xcrypt`
-- [x] 1.3 Negacje nie trafiają do sekcji
-- [x] 1.4 Treść poza markerami nietknięta
-- [x] 1.5 Renderowanie jest idempotentne
-- [x] 1.6 Uszkodzone markery kończą się kodem `2`
-- [x] 1.7 `cargo clippy --all-targets -- -D warnings`
+- [x] 1.1 `sekrety/` renderuje się jako `sekrety/**` — bc36b6d
+- [x] 1.2 `binary` daje linię bez `diff=git-xcrypt` — bc36b6d
+- [x] 1.3 Negacje nie trafiają do sekcji — bc36b6d
+- [x] 1.4 Treść poza markerami nietknięta — bc36b6d
+- [x] 1.5 Renderowanie jest idempotentne — bc36b6d
+- [x] 1.6 Uszkodzone markery kończą się kodem `2` — bc36b6d
+- [x] 1.7 `cargo clippy --all-targets -- -D warnings` — bc36b6d
 
 ### Faza 2: Komenda `sync`
 
 #### Automatyczne
 
-- [ ] 2.1 `sync` aktualizuje sekcję po dopisaniu wzorca
-- [ ] 2.2 Drugi `sync` nic nie zmienia
-- [ ] 2.3 `sync --check` zwraca `1` przy nieaktualnej sekcji
-- [ ] 2.4 `init` generuje sekcję identyczną z `sync`
-- [ ] 2.5 `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`
+- [x] 2.1 `sync` aktualizuje sekcję po dopisaniu wzorca
+- [x] 2.2 Drugi `sync` nic nie zmienia
+- [x] 2.3 `sync --check` zwraca `1` przy nieaktualnej sekcji
+- [x] 2.4 `init` generuje sekcję identyczną z `sync`
+- [x] 2.5 `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`
 
 #### Ręczne
 
-- [ ] 2.6 Komunikat `sync` jasno mówi, czy plik został zmieniony
+- [x] 2.6 Komunikat `sync` jasno mówi, czy plik został zmieniony

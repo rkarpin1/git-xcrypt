@@ -130,6 +130,13 @@ fn a_failing_filter_leaves_no_plaintext_object_behind() {
 #[test]
 fn a_second_init_never_replaces_the_key() {
     let repo = repo_with_secret();
+    // `init` renders the cosmetic section from `.git-xcrypt`, so a repository
+    // whose declarations were written after the first `init` legitimately gains
+    // a line here. Settle that first, or the dirty file at the end of this test
+    // would be the section catching up rather than the key changing.
+    repo.xcrypt_ok(["sync"]);
+    repo.commit_all("bring the attributes up to date");
+
     let before = std::fs::read(repo.path().join(".git/git-xcrypt/keys/default"))
         .expect("the key must exist");
 
