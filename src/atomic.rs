@@ -68,6 +68,8 @@ enum Mode {
 /// checked out means it is no more readable than the file it replaces, but a
 /// later `git add -A` could store it in the clear. There is no portable way to
 /// clean up after `SIGKILL`; the residue is recorded here rather than hidden.
+/// Every such file matches `*.git-xcrypt-*.tmp`, which is what the user
+/// documentation has to tell people to look for after a killed `unlock`.
 ///
 /// # Errors
 ///
@@ -164,8 +166,8 @@ fn create_temporary(path: &Path, mode: Mode) -> Result<(PathBuf, fs::File)> {
     #[cfg(not(unix))]
     let _ = mode;
 
-    let mut last = None;
-    for _ in 0..8 {
+    const ATTEMPTS: usize = 8;
+    for _ in 0..ATTEMPTS {
         let candidate = path.with_file_name(temporary_name(name)?);
 
         let mut options = fs::OpenOptions::new();
@@ -178,14 +180,18 @@ fn create_temporary(path: &Path, mode: Mode) -> Result<(PathBuf, fs::File)> {
 
         match options.open(&candidate) {
             Ok(file) => return Ok((candidate, file)),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => last = Some(err),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(err) => return Err(Error::Io(err)),
         }
     }
 
-    Err(Error::Io(last.unwrap_or_else(|| {
-        std::io::Error::other("could not create a temporary file")
-    })))
+    // Eight random names taken in a row is not luck. Reporting the last
+    // `AlreadyExists` would name a file the user never chose and read as "the
+    // destination is in the way", which is the opposite of what happened.
+    Err(Error::Io(std::io::Error::other(format!(
+        "could not write {}: {ATTEMPTS} temporary names beside it were all taken",
+        path.display()
+    ))))
 }
 
 /// A sibling name no one can guess and therefore no one can pre-create.

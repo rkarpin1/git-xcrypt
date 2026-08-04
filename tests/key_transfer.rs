@@ -330,6 +330,50 @@ fn a_real_edit_after_unlock_is_still_reported_as_a_change() {
 }
 
 #[test]
+fn a_clone_whose_origin_never_committed_gitattributes_still_gets_the_catch_all() {
+    // `init` writes `.gitattributes` but does not commit it, so a repository set
+    // up with `git add .git-xcrypt secrets/` reaches its clones without the
+    // `* filter=git-xcrypt` line. Registering the driver there is not enough:
+    // git treats a missing attribute exactly like a missing driver, so the next
+    // commit stored the plaintext `unlock` had just written, with exit code 0
+    // and no warning. Measured on git 2.55.
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    // Keep `.gitattributes` out of the commit without deleting it, the way a
+    // user's own ignore rules or a selective `git add` would.
+    fs::write(
+        repo.path().join(".git").join("info").join("exclude"),
+        b".gitattributes\n",
+    )
+    .expect("writing the exclude file");
+    repo.write_file("secrets/db.env", b"api_key = mine\n");
+    repo.commit_all("a secret, with no attributes file behind it");
+    assert!(repo.blob_bytes("secrets/db.env").starts_with(MAGIC));
+
+    let outside = elsewhere();
+    let key = outside.path().join("repo.key");
+    repo.xcrypt_ok(["export-key", &key.to_string_lossy()]);
+
+    let clone = repo.clone_without_filter();
+    assert!(
+        !clone.path().join(".gitattributes").exists(),
+        "the fixture is wrong: the clone inherited the attributes file"
+    );
+
+    clone.xcrypt_ok(["unlock", &key.to_string_lossy()]);
+
+    clone.assert_worktree_eq("secrets/db.env", b"api_key = mine\n");
+    clone.write_file("secrets/db.env", b"api_key = changed\n");
+    clone.commit_all("a second secret from the clone");
+
+    assert!(
+        clone.blob_bytes("secrets/db.env").starts_with(MAGIC),
+        "the clone committed the secret in the clear"
+    );
+}
+
+#[test]
 fn unlock_without_a_key_anywhere_reports_a_missing_key() {
     let (origin, _outside, _key) = repository_with_a_secret(b"api_key = mine\n");
     let clone = origin.clone_without_filter();

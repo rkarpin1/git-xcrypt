@@ -129,7 +129,11 @@ const EXPORT_VERSION: u32 = 1;
 /// the key, hence [`Zeroizing`].
 #[must_use]
 pub fn encode_portable(key: &MasterKey) -> Zeroizing<String> {
-    let mut text = String::with_capacity(96);
+    // Sized from the constants rather than guessed: the `Zeroizing` below only
+    // protects this buffer if it is never reallocated, and a reallocation would
+    // leave the half-built text — key included — behind on the heap.
+    let capacity = EXPORT_PREFIX.len() + 4 + KEY_ID_LEN * 2 + MASTER_KEY_LEN.div_ceil(3) * 4 + 3;
+    let mut text = String::with_capacity(capacity);
     text.push_str(EXPORT_PREFIX);
     text.push_str(&EXPORT_VERSION.to_string());
     text.push(' ');
@@ -141,6 +145,10 @@ pub fn encode_portable(key: &MasterKey) -> Zeroizing<String> {
     let encoded = Zeroizing::new(BASE64.encode(key.expose_bytes()));
     text.push_str(&encoded);
     text.push('\n');
+    debug_assert!(
+        text.len() <= capacity,
+        "the export buffer grew, so a copy of the key was left on the heap"
+    );
     Zeroizing::new(text)
 }
 

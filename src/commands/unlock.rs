@@ -7,10 +7,13 @@
 //! Three properties shape the implementation.
 //!
 //! **The registration comes before the decryption.** `.git/config` is not
-//! versioned, so a clone has `* filter=git-xcrypt` in `.gitattributes` and
-//! nothing behind it. Decrypting first would leave a window in which the working
-//! tree holds plaintext and git has no filter — where `git status` reports every
-//! secret as modified and the next `git add` stores it in the clear.
+//! versioned, so a clone has no driver; and the `* filter=git-xcrypt` line in
+//! `.gitattributes` is only there if whoever set the repository up committed
+//! that file. Both are repaired here, because git treats a missing attribute and
+//! an undefined driver identically — as no filter. Decrypting first would leave
+//! a window in which the working tree holds plaintext and git has no filter,
+//! where `git status` reports every secret as modified and the next `git add`
+//! stores it in the clear.
 //!
 //! **A wrong key changes nothing at all.** Every encrypted file is inspected —
 //! 38 bytes each, no decryption — before a single byte is written, and before
@@ -54,8 +57,16 @@ pub struct Report {
     pub key_imported: bool,
     /// The filter registration was written or repaired.
     pub config_written: bool,
+    /// The managed `.gitattributes` section was written or repaired.
+    pub attributes_written: bool,
     /// Paths, relative to the working tree, that were converted.
     pub decrypted: Vec<PathBuf>,
+    /// Paths that could not be read, so may still be encrypted.
+    ///
+    /// Separate from [`Report::warnings`] because the count belongs in the
+    /// closing line: "decrypted 3 files" and "decrypted 3 files, 1 could not be
+    /// read" are different outcomes and must not look the same.
+    pub unreadable: Vec<PathBuf>,
     /// Anything worth saying once, carried out so the binary owns the messages.
     pub warnings: Vec<String>,
 }
@@ -94,22 +105,45 @@ pub fn run(repo: &Repo, key_source: Option<&Path>) -> Result<Report> {
 
     // Everything carrying our magic, and the key each one asks for. Gathered
     // before the first write, so a mismatch costs nothing.
-    let mut walk_warnings = Vec::new();
-    let encrypted = collect_encrypted(repo, &mut walk_warnings)?;
+    let mut walk = Walk::default();
+    let encrypted = collect_encrypted(repo, &mut walk)?;
     refuse_foreign_keys(repo, &encrypted, &key_id)?;
 
     let key_imported = super::import_key::install(repo, &key)?;
-    // Before the decryption, never after — see the module comment.
+    // Both before the decryption, never after — see the module comment. The
+    // attributes section matters as much as the registration: a driver with no
+    // `* filter=git-xcrypt` above it is never invoked, so git would store the
+    // plaintext this command is about to put in the working tree, with exit
+    // code 0 and no signal. Measured on git 2.55 in a clone whose origin never
+    // committed `.gitattributes`.
     let config_written = super::init::register_driver(repo)?;
+    let attributes_written = crate::gitattributes::write_section(
+        &repo.attributes_path(),
+        &crate::gitattributes::render_lines(&config),
+    )?;
 
     let mut report = Report {
         key_id,
         key_imported,
         config_written,
+        attributes_written,
         decrypted: Vec::new(),
+        unreadable: walk.unreadable,
         warnings: config.pointless_eol.clone(),
     };
-    report.warnings.append(&mut walk_warnings);
+    report.warnings.append(&mut walk.warnings);
+
+    if config.missing {
+        // Not an error here — the headers say everything decryption needs — but
+        // the check-in path treats the same state as fatal, so without this the
+        // command would report success and leave a tree in which every `git add`
+        // aborts.
+        report.warnings.push(format!(
+            "{} is missing, so every `git add` in this repository will refuse \
+             until it is restored; run `git-xcrypt init` to create one",
+            crate::repo::CONFIG_FILE
+        ));
+    }
 
     if key_imported && encrypted.is_empty() {
         // The check above can only object to a key it has evidence against, and
@@ -128,9 +162,7 @@ pub fn run(repo: &Repo, key_source: Option<&Path>) -> Result<Report> {
     let mut rewritten: Vec<Vec<u8>> = Vec::new();
 
     for file in &encrypted {
-        let relative = repo
-            .relative(&file.path)
-            .map_or_else(|| file.path.clone(), Path::to_path_buf);
+        let relative = relative_to(repo, &file.path);
         let name = repo_relative_bytes(&relative);
         let content = fs::read(&file.path)?;
         let decision = config.decide(&name);
@@ -211,13 +243,20 @@ struct Encrypted {
 ///
 /// A path that cannot be read becomes a warning rather than a failure. One
 /// root-owned build artefact must not be able to stop a user recovering their
-/// secrets, and skipping a file only ever means leaving it encrypted.
+/// secrets, and skipping a file only ever means leaving it encrypted — but the
+/// skipped paths are counted and reported, because "decrypted everything" and
+/// "decrypted what it could" must not read the same.
 ///
 /// Symbolic links are left alone: following one would write outside the
-/// repository, and replacing it would destroy the link. `.git` is skipped at
-/// every level, which also skips submodules — they have their own configuration
-/// and their own key, and are documented as needing their own `unlock`.
-fn collect_encrypted(repo: &Repo, warnings: &mut Vec<String>) -> Result<Vec<Encrypted>> {
+/// repository, and replacing it would destroy the link.
+///
+/// **A directory holding a `.git` entry is another repository and is not
+/// entered.** Skipping the entry named `.git` is not enough — that leaves the
+/// submodule's *working tree* in the walk, and a submodule encrypted with its
+/// own key then makes the parent's `unlock` fail with a key mismatch it cannot
+/// be talked out of, having decrypted nothing. Measured. A submodule has its own
+/// configuration, its own key and its own index; it needs its own `unlock`.
+fn collect_encrypted(repo: &Repo, walk: &mut Walk) -> Result<Vec<Encrypted>> {
     let mut found = Vec::new();
     let mut pending = vec![repo.work_tree().to_path_buf()];
 
@@ -225,7 +264,8 @@ fn collect_encrypted(repo: &Repo, warnings: &mut Vec<String>) -> Result<Vec<Encr
         let entries = match fs::read_dir(&directory) {
             Ok(entries) => entries,
             Err(err) => {
-                warnings.push(format!("{}: not searched ({err})", directory.display()));
+                walk.warnings
+                    .push(format!("{}: not searched ({err})", directory.display()));
                 continue;
             }
         };
@@ -234,7 +274,8 @@ fn collect_encrypted(repo: &Repo, warnings: &mut Vec<String>) -> Result<Vec<Encr
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(err) => {
-                    warnings.push(format!("{}: not searched ({err})", directory.display()));
+                    walk.warnings
+                        .push(format!("{}: not searched ({err})", directory.display()));
                     continue;
                 }
             };
@@ -244,14 +285,23 @@ fn collect_encrypted(repo: &Repo, warnings: &mut Vec<String>) -> Result<Vec<Encr
 
             let path = entry.path();
             let Ok(metadata) = fs::symlink_metadata(&path) else {
-                warnings.push(format!("{}: skipped, it could not be read", path.display()));
+                walk.warnings
+                    .push(format!("{}: skipped, it could not be read", path.display()));
+                walk.unreadable.push(relative_to(repo, &path));
                 continue;
             };
             if metadata.is_symlink() {
                 continue;
             }
             if metadata.is_dir() {
-                pending.push(path);
+                if path.join(".git").exists() {
+                    walk.warnings.push(format!(
+                        "{}: a repository of its own, left to its own `git-xcrypt unlock`",
+                        relative_to(repo, &path).display()
+                    ));
+                } else {
+                    pending.push(path);
+                }
                 continue;
             }
             if !metadata.is_file() {
@@ -264,7 +314,9 @@ fn collect_encrypted(repo: &Repo, warnings: &mut Vec<String>) -> Result<Vec<Encr
                 Ok(Some(header)) => found.push(Encrypted { path, header }),
                 Ok(None) => {}
                 Err(Error::Io(err)) => {
-                    warnings.push(format!("{}: skipped ({err})", path.display()));
+                    walk.warnings
+                        .push(format!("{}: skipped ({err})", path.display()));
+                    walk.unreadable.push(relative_to(repo, &path));
                 }
                 Err(err) => return Err(err),
             }
@@ -273,6 +325,21 @@ fn collect_encrypted(repo: &Repo, warnings: &mut Vec<String>) -> Result<Vec<Encr
 
     found.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(found)
+}
+
+/// What the walk noticed on its way through, besides the files it found.
+#[derive(Debug, Default)]
+struct Walk {
+    /// Paths that could not be read, so may still hold ciphertext.
+    unreadable: Vec<PathBuf>,
+    /// Messages for the user, one per thing skipped.
+    warnings: Vec<String>,
+}
+
+/// A path relative to the working tree, or the path itself if it is outside.
+fn relative_to(repo: &Repo, path: &Path) -> PathBuf {
+    repo.relative(path)
+        .map_or_else(|| path.to_path_buf(), Path::to_path_buf)
 }
 
 /// Reads the header of `path`, or `None` when the file is not one of ours.
@@ -328,9 +395,7 @@ fn refuse_foreign_keys(
             continue;
         }
 
-        let relative = repo
-            .relative(&file.path)
-            .map_or_else(|| file.path.clone(), Path::to_path_buf);
+        let relative = relative_to(repo, &file.path);
         return Err(Error::Format(format!(
             "{} was encrypted with key {}, but the key offered here is {}.\n\
              Nothing has been changed. Unlock this repository with the key whose id is {}.",
@@ -516,6 +581,76 @@ mod tests {
                 .any(|warning| warning.contains("closed")),
             "the skipped directory went unmentioned: {:?}",
             report.warnings
+        );
+    }
+
+    #[test]
+    fn a_nested_repository_is_left_to_its_own_unlock() {
+        // A submodule has its own key, its own index and its own configuration.
+        // Descending into it made a submodule encrypted with a different key
+        // block the parent entirely: the pre-flight refused with a key mismatch
+        // and the parent's own secrets were never decrypted, with no way to
+        // proceed. Skipping the entry named `.git` was not enough — that leaves
+        // the submodule's working tree in the walk.
+        let (_dir, repo) = prepared();
+        let key = repo.load_key().expect("key");
+        write_encrypted(&repo, "secrets/mine.env", &key, b"mine\n");
+
+        let nested = repo.work_tree().join("vendor").join("sub");
+        fs::create_dir_all(nested.join(".git")).expect("directories");
+        let stranger = MasterKey::from_bytes([88u8; MASTER_KEY_LEN]);
+        fs::write(
+            nested.join("theirs.env"),
+            crypto::encrypt(&stranger, 0, b"theirs\n").expect("encryption"),
+        )
+        .expect("writing");
+
+        let report = run(&repo, None).expect("a nested repository must not block the parent");
+
+        assert_eq!(report.decrypted.len(), 1);
+        assert_eq!(
+            fs::read(repo.work_tree().join("secrets/mine.env")).expect("reading"),
+            b"mine\n"
+        );
+        assert!(
+            format::looks_encrypted(&fs::read(nested.join("theirs.env")).expect("reading")),
+            "the nested repository's file was decrypted with the parent's key"
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("repository of its own")),
+            "the skipped repository went unmentioned: {:?}",
+            report.warnings
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_could_not_be_read_is_counted_not_just_mentioned() {
+        // Skipping it is the right call — one root-owned artefact must not stop
+        // a recovery — but the closing summary has to say so, or "3 files are
+        // now in the clear" reads as "and nothing was missed".
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (_dir, repo) = prepared();
+        let key = repo.load_key().expect("key");
+        write_encrypted(&repo, "secrets/open.env", &key, b"readable\n");
+        write_encrypted(&repo, "secrets/shut.env", &key, b"unreadable\n");
+        let shut = repo.work_tree().join("secrets/shut.env");
+        fs::set_permissions(&shut, fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        let report = run(&repo, None);
+
+        fs::set_permissions(&shut, fs::Permissions::from_mode(0o644)).expect("chmod");
+        let report = report.expect("an unreadable file must not fail the command");
+
+        assert_eq!(report.decrypted.len(), 1);
+        assert_eq!(
+            report.unreadable.len(),
+            1,
+            "the skipped file was not counted, so the summary would claim success"
         );
     }
 

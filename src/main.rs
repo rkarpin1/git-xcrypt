@@ -169,6 +169,9 @@ fn run_import_key(path: &std::path::Path) -> Result<()> {
             repo.config_path().display()
         );
     }
+    if report.attributes_written {
+        eprintln!("git-xcrypt: updated {}", repo.attributes_path().display());
+    }
     Ok(())
 }
 
@@ -190,18 +193,30 @@ fn run_unlock(key: Option<&std::path::Path>) -> Result<()> {
             repo.config_path().display()
         );
     }
+    if report.attributes_written {
+        eprintln!("git-xcrypt: updated {}", repo.attributes_path().display());
+    }
     for warning in &report.warnings {
         eprintln!("git-xcrypt: {warning}");
     }
 
+    for path in &report.decrypted {
+        eprintln!("git-xcrypt: decrypted {}", path.display());
+    }
+
+    // The closing line has to distinguish "everything" from "everything I could
+    // read". A file skipped because it would not open is still ciphertext, and
+    // a summary that says only how many succeeded reads as though none were
+    // missed.
+    let unreadable = match report.unreadable.len() {
+        0 => String::new(),
+        count => format!(", {count} could not be read and may still be encrypted"),
+    };
     if report.decrypted.is_empty() {
-        eprintln!("git-xcrypt: unlocked with key {key_id}; nothing was encrypted");
+        eprintln!("git-xcrypt: unlocked with key {key_id}; nothing was encrypted{unreadable}");
     } else {
-        for path in &report.decrypted {
-            eprintln!("git-xcrypt: decrypted {}", path.display());
-        }
         eprintln!(
-            "git-xcrypt: unlocked with key {key_id}; {} file(s) are now in the clear",
+            "git-xcrypt: unlocked with key {key_id}; {} file(s) are now in the clear{unreadable}",
             report.decrypted.len()
         );
     }

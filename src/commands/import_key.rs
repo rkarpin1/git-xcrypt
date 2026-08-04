@@ -7,19 +7,23 @@
 //! place is refused outright, and an identical one is an empty success — which
 //! is what makes re-running the command harmless.
 //!
-//! The filter registration is repaired at the same time. `.git/config` is not
-//! versioned, so a clone has the catch-all line in `.gitattributes` and no
-//! driver behind it; git reads an undefined filter as no filter and the next
-//! `git add` on a secret stores plaintext with exit code 0. A key without a
-//! registration is therefore not a safe state to leave anyone in, even though
+//! Both halves of the filter are repaired at the same time, and neither is
+//! optional. `.git/config` is not versioned, so a clone has no driver; and the
+//! `* filter=git-xcrypt` line in `.gitattributes` is only there if whoever set
+//! the repository up committed the file — `init` writes it but does not commit
+//! it, so a clone can easily arrive with neither. Git reads a missing attribute
+//! and an undefined filter the same way: as no filter, so the next `git add` on
+//! a secret stores plaintext with exit code 0 and says nothing. A key handed to
+//! a repository in that state is not a safe place to leave anyone, even though
 //! the plan gave this job to `unlock` alone.
 
 use std::path::Path;
 
+use crate::config::Config;
 use crate::format::KEY_ID_LEN;
 use crate::key::MasterKey;
 use crate::repo::Repo;
-use crate::{Error, Result, keyfile};
+use crate::{Error, Result, gitattributes, keyfile};
 
 /// What `import-key` found and what it did about it.
 #[derive(Debug)]
@@ -30,6 +34,8 @@ pub struct Report {
     pub imported: bool,
     /// The filter registration was written or repaired.
     pub config_written: bool,
+    /// The managed `.gitattributes` section was written or repaired.
+    pub attributes_written: bool,
 }
 
 /// Imports the key stored in `source`.
@@ -46,10 +52,22 @@ pub fn run(repo: &Repo, source: &Path) -> Result<Report> {
     let imported = install(repo, &key)?;
     let config_written = super::init::register_driver(repo)?;
 
+    // Same order as `init`: the registration is saved first, so an unreadable
+    // `.git-xcrypt` stops the command with the repair already half landed and a
+    // message naming the offending line. An absent one is not an error — the
+    // section it renders is then just the catch-all, which is the line the whole
+    // guarantee rests on.
+    let config = Config::load(&repo.xcrypt_config_path())?;
+    let attributes_written = gitattributes::write_section(
+        &repo.attributes_path(),
+        &gitattributes::render_lines(&config),
+    )?;
+
     Ok(Report {
         key_id: key.key_id(),
         imported,
         config_written,
+        attributes_written,
     })
 }
 

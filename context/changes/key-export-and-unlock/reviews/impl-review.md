@@ -4,8 +4,12 @@
 - **Plan**: `context/changes/key-export-and-unlock/plan.md`
 - **Zakres**: Fazy 1–2 z 2 (obie ukończone)
 - **Data**: 2026-08-04
-- **Werdykt**: ODRZUCONY po pierwszym przebiegu → ZAAKCEPTOWANY (uzupełnić po drugim przebiegu)
-- **Ustalenia**: przebieg 1 — 1 krytyczne, 6 ostrzeżeń, 7 obserwacji
+- **Werdykt**: ODRZUCONY po pierwszym przebiegu → ODRZUCONY po drugim → ZAAKCEPTOWANY
+- **Ustalenia**: przebieg 1 — 1 krytyczne, 6 ostrzeżeń, 7 obserwacji;
+  przebieg 2 — 2 krytyczne, 2 ostrzeżenia, 4 obserwacje
+- **Przebiegi**: dwa. Drugi nie był formalnością: znalazł **dwie drogi do jawnego sekretu**,
+  których pierwszy nie dotknął, oraz jedno poszerzenie zasięgu wprowadzone przez naprawę
+  z pierwszego przebiegu (H1)
 
 ## Werdykty
 
@@ -226,3 +230,135 @@ Odnotowane, nie naprawiane w kodzie:
 - **`gitindex` przetestowany przeciw prawdziwemu gitowi 2.55 dla wersji 2, 3 i 4 oraz podzielonego indeksu**;
   repozytoria SHA-256 nie zostały przetestowane empirycznie — kod wybiera długość skrótu z
   `extensions.objectformat`, a suma kontrolna weryfikuje ten wybór, więc błąd kończy się `Skipped`.
+
+## Drugi przebieg — to, czego pierwszy nie dotknął
+
+Metoda: pełna weryfikacja każdej naprawy z `5043e58` przeciw prawdziwemu gitowi 2.55 (12 000 zmutowanych
+indeksów, wszystkie 12 wyjść z `forget_stat`, rozszerzenia TREE / UNTR / REUC / EOIE / IEOT / brak,
+indeks SHA-256, wersje 2/3/4, ścieżka 4615-bajtowa, podłączony worktree) plus osobny przebieg na
+zachowaniu end-to-end, którego pierwszy przegląd w ogóle nie badał.
+
+### G1 — `unlock` naprawiał `.git/config`, ale nie linię catch-all w `.gitattributes`
+
+- **Ważność**: ❌ KRYTYCZNE · **Wymiar**: Bezpieczeństwo i jakość · **Lokalizacja**: `src/commands/unlock.rs:103`, `src/commands/import_key.rs:47` (przed naprawą)
+- **Szczegóły**: `init` **tworzy** `.gitattributes`, ale go **nie commituje**. Użytkownik, który zrobi
+  `git add .git-xcrypt secrets/ && git commit`, wypuszcza repozytorium, którego klony nie mają linii
+  `* filter=git-xcrypt` w ogóle. `unlock` rejestrował sterownik w `.git/config` i na tym kończył —
+  a git traktuje brakujący atrybut dokładnie tak samo jak niezdefiniowany sterownik: jako brak filtra.
+  Komentarz modułu zakładał przesłankę, której nigdy nie sprawdzał („klon ma `* filter=git-xcrypt`
+  w `.gitattributes` i nic za nim").
+
+  Zmierzone na git 2.55, w klonie po `unlock`:
+
+  ```
+  $ git-xcrypt unlock ../k.key      # kod 0, „1 file(s) are now in the clear"
+  $ printf 'new-secret-value\n' > secrets/db.env && git add -A && git commit -qm leak
+  $ git cat-file -p HEAD:secrets/db.env
+  new-secret-value
+  ```
+
+  To jest dokładnie tryb awarii zapisany w `zalozenia.md` §Konstrukcja catch-all — „filtr nieuruchomiony,
+  `git add` i `commit` z kodem 0, plaintext w bazie obiektów, zero sygnału dla użytkownika" — a `unlock`
+  jest tym, co wkłada ten plaintext do drzewa roboczego. Żaden istniejący test tego nie pokrywał:
+  `commit_all` w harnessie zawsze commituje `.gitattributes`.
+- **Naprawa**: `unlock` i `import-key` renderują sekcję zarządzaną tym samym kodem co `init`, przed
+  deszyfrowaniem; wynik idzie przez `Report.attributes_written` do komunikatu.
+- **Test**: `tests/key_transfer.rs::a_clone_whose_origin_never_committed_gitattributes_still_gets_the_catch_all`
+  (fixture wyklucza `.gitattributes` przez `.git/info/exclude`; sprawdzony jako czerwony przed naprawą).
+- **Decyzja**: NAPRAWIONE
+
+### G2 — przejście po drzewie wchodziło w podmoduły, wbrew własnemu komentarzowi
+
+- **Ważność**: ❌ KRYTYCZNE · **Wymiar**: Bezpieczeństwo i jakość · **Lokalizacja**: `src/commands/unlock.rs:220` (przed naprawą)
+- **Szczegóły**: komentarz mówił „`.git` jest pomijany na każdym poziomie, co pomija również podmoduły".
+  Pominięcie **wpisu** `.git` nie pomija **drzewa roboczego** podmodułu — przejście wchodziło do `sub/`
+  i czytało każdy plik. Podmoduł z własnym kluczem blokował więc rodzica całkowicie:
+
+  ```
+  $ git-xcrypt unlock
+  git-xcrypt: format error: sub/sub.env was encrypted with key 68dd088e…,
+    but the key offered here is b87db899…. Nothing has been changed.   # kod 4
+  ```
+
+  Własne sekrety rodzica nie były odszyfrowane i nie było flagi, żeby przejść dalej; odblokowanie
+  podmodułu najpierw kończy się kodem `3`, bo klon podmodułu nie ma własnego klucza. Druga konsekwencja
+  w przypadku tego samego klucza: `unlock` przepisywał pliki w cudzym repozytorium, a łatał wyłącznie
+  `repo.git_dir()/index` nazwami względem rodzica, więc indeks podmodułu w `.git/modules/sub/index`
+  zostawał z nieaktualnym cache'em stat i bez ostrzeżenia.
+- **Naprawa**: katalog zawierający wpis `.git` jest granicą repozytorium i nie jest odwiedzany;
+  ostrzeżenie nazywa go i odsyła do jego własnego `unlock`. Komentarz poprawiony.
+- **Test**: `src/commands/unlock.rs::a_nested_repository_is_left_to_its_own_unlock` (sprawdzony jako
+  czerwony przed naprawą).
+- **Decyzja**: NAPRAWIONE
+
+### H1 — naprawa F6 poszerzyła zasięg: nieczytelny **plik** też był pomijany, przy kodzie wyjścia 0
+
+- **Ważność**: ⚠️ OSTRZEŻENIE (poszerzenie naprawy z pierwszego przebiegu) · **Lokalizacja**: `src/commands/unlock.rs:266`
+- **Szczegóły**: F6 miało naprawić „jeden nieczytelny katalog przerywał całe `unlock`". Kod był szerszy:
+  `peek_header` zwraca `Error::Io` również gdy nie da się otworzyć **pliku**, i to też stawało się samym
+  ostrzeżeniem. Zmierzone: przy `secrets/b.env` w trybie `0000` `unlock` kończy się kodem 0, plik zostaje
+  ciphertextem, a linia podsumowania mówi „1 file(s) are now in the clear" — nie do odróżnienia od pełnego
+  sukcesu. Osłabia to też pre-flight: plik z obcym `key_id`, którego nie da się otworzyć, nigdy nie dociera
+  do `refuse_foreign_keys`.
+- **Naprawa**: `Report.unreadable` jako osobna lista, a linia podsumowania mówi
+  „N file(s) are now in the clear, M could not be read and may still be encrypted". Pomijanie zostaje —
+  jeden artefakt należący do root-a nie może stać między użytkownikiem a jego sekretami — ale przestaje
+  wyglądać jak komplet.
+- **Test**: `a_file_that_could_not_be_read_is_counted_not_just_mentioned`.
+- **Decyzja**: NAPRAWIONE
+
+### H2 — `unlock` ignorował `Config::missing` i zostawiał repozytorium, w którym każde `git add` przerywa
+
+- **Ważność**: ⚠️ OSTRZEŻENIE · **Lokalizacja**: `src/commands/unlock.rs:90`
+- **Szczegóły**: przy nieobecnym `.git-xcrypt` `unlock` odszyfrowywał wszystko i kończył zerem, podczas gdy
+  `decide::clean` traktuje ten sam stan jako fatalny. Zmierzone: `git status` po takim `unlock` daje
+  `fatal: secrets/a.env: clean filter 'git-xcrypt' failed` i kod 128. Fail closed, więc bez wycieku, ale
+  komenda raportowała pełny sukces, kładąc sekrety jawnie w drzewie, w którym żadne polecenie gita nie działa.
+- **Naprawa**: ostrzeżenie nazywające plik i `git-xcrypt init`.
+- **Decyzja**: NAPRAWIONE
+
+### Obserwacje z drugiego przebiegu, naprawione
+
+- Wyczerpana pętla ponowień w `atomic::create_temporary` zgłaszała `File exists (os error 17)` bez nazwy
+  pliku — czytane jako „cel jest zajęty", czyli odwrotnie niż to, co się stało. Gałąź `unwrap_or_else` była
+  martwa. Teraz jeden uczciwy komunikat z nazwą pliku (`src/atomic.rs:186`).
+- „Rodzic jest plikiem" w `export-key` wychodziło jako gołe `File exists (os error 17)` bez ścieżki
+  (`src/commands/export_key.rs:106`).
+- `Zeroizing` w `encode_portable` działało wyłącznie dzięki temu, że `String::with_capacity(96)` przypadkiem
+  starczało; realokacja zostawiłaby kopię klucza na stercie. Pojemność liczona ze stałych plus `debug_assert!`
+  (`src/keyfile.rs:132`).
+- Losowa nazwa pliku tymczasowego znaczy, że każdy zabity `unlock` zostawia **inną** resztkę zamiast jednej
+  na PID; dokumentacja podaje teraz wzorzec `*.git-xcrypt-*.tmp` do sprzątania (`src/atomic.rs:63`).
+- `Lock::commit` nie robił `sync_directory` po `rename`, w odróżnieniu od `atomic::replace`. Dodane
+  (`src/gitindex.rs:396`).
+
+### Potwierdzone jako poprawne w drugim przebiegu
+
+Każda naprawa z `5043e58` prześledzona osobno, w większości empirycznie:
+
+- **Blokada indeksu zwalniana na wszystkich 12 wyjściach** z `forget_stat`, w tym po 12 000 zmutowanych
+  indeksach — `.git/index.lock` nigdy nie przeżył, a `git add` po każdym z nich działał. To był
+  najgroźniejszy kształt regresji (osierocony lock wiesza każde późniejsze polecenie gita) i nie wystąpił.
+- **Przejście po rozszerzeniach zgodne z prawdziwym gitem** na TREE, UNTR, REUC, EOIE+IEOT, indeksie bez
+  rozszerzeń, indeksie z niezakończonym konfliktem, wpisie gitlink, `index.skipHash`, repozytorium SHA-256,
+  wersjach 2/3/4, ścieżce 4615-bajtowej i ścieżkach spoza ASCII. `scan()` nie panikuje na żadnej z 12 000 mutacji.
+- **`Mode::InheritTarget` niezmieniony przez `O_EXCL`**: świeży `.gitattributes` wychodzi `0644`, zawężony
+  `.git/config` zostaje `0600`, skrypt `0755` zostaje `0755`.
+- **`cfg(not(unix))` kompiluje się na Windows** — `cargo clippy --target x86_64-pc-windows-msvc --lib` czysty.
+- **Determinizm i round-trip** (PRD Kryterium Akceptacji 6) na macierzy `core.autocrlf` ∈ {false, true, input}
+  × {tekst CRLF, tekst LF, pusty plik, 2560 B binarny, 5 MB losowy}: każdy plik bajt w bajt, `git status` czysty,
+  każdy ponownie dodany blob o identycznym oid. Bity wykonywalności zachowane.
+- **Parzystość EOL filtra i `unlock`** — `serve` i `unlock::run` podają to samo `decision.encrypt` / `decision.eol`
+  z tego samego `Config::decide`; checkout i unlock dają identyczne bajty również przy `text eol=crlf`.
+- **Kody wyjścia** wszystkich nowych ścieżek zgodne z zamrożoną tabelą, sprawdzone przez uruchomienie binarki.
+- **Komunikaty** — każdy nowy `eprintln!` przejrzany; wychodzi wyłącznie `format_key_id`, `stdout` pusty
+  na każdej ścieżce łącznie z `--help`.
+
+## Ustalenia świadomie odrzucone
+
+- **Resztka po `SIGKILL`** w `atomic` — nie ma przenośnego sprzątania; ryzyko zapisane w dokumentacji modułu
+  wraz ze wzorcem do wyszukania, nie usunięte.
+- **`unlock` odszyfrowuje pliki nieśledzone i ignoruje wykluczenia bootstrapowe** (F13) — świadome, plik
+  z naszym magic jest nasz niezależnie od nazwy.
+- **Nieczytelny plik nadal nie przerywa `unlock`** (H1) — pomijanie zostaje, bo odzyskanie sekretów waży
+  więcej niż kompletność; zmienia się tylko to, że wynik przestaje udawać komplet.

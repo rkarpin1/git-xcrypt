@@ -97,19 +97,23 @@ fn refuse_bad_destination(repo: &Repo, destination: &Path, force: bool) -> Resul
 /// anyone can list is one more thing a user did not ask for. Directories that
 /// already exist keep whatever permissions their owner chose.
 fn create_key_directory(path: &Path) -> Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt as _;
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(path)?;
+        builder.mode(0o700);
     }
-    #[cfg(not(unix))]
-    {
-        std::fs::create_dir_all(path)?;
-    }
-    Ok(())
+
+    // The bare error is `File exists`, which for a parent that is a regular file
+    // reads as "you told me not to overwrite" rather than "there is a file where
+    // a directory has to go", and names nothing.
+    builder.create(path).map_err(|err| {
+        Error::Io(std::io::Error::other(format!(
+            "{}: could not create the directory to hold the key ({err})",
+            path.display()
+        )))
+    })
 }
 
 /// An absolute, symlink-resolved form of `path`, which need not exist yet.

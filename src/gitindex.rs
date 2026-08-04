@@ -397,6 +397,15 @@ impl Lock {
             let _ = fs::remove_file(&self.path);
             return Err(Error::Io(err));
         }
+
+        // Same best-effort flush `atomic::write` does after its rename, for the
+        // same reason and with a smaller consequence: a crash here costs a stale
+        // stat cache, not a missing file.
+        if let Some(parent) = self.target.parent()
+            && let Ok(directory) = fs::File::open(parent)
+        {
+            let _ = directory.sync_all();
+        }
         Ok(())
     }
 }
