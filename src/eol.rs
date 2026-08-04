@@ -17,9 +17,19 @@ use crate::config::{EolMode, TextMode};
 
 /// Whether git — and therefore we — would treat this content as binary.
 ///
-/// Measured against git 2.55 rather than taken from documentation, and matching
-/// git's own `convert_is_binary`. Binary means a NUL byte anywhere, a lone `CR`
-/// — one not followed by `LF` — or too many control characters below `0x20`.
+/// A byte-for-byte port of git's `gather_stats` plus `convert_is_binary`,
+/// measured against git 2.55 rather than taken from documentation. Binary means
+/// a NUL byte anywhere, a lone `CR` — one not followed by `LF` — or too many
+/// disallowed control characters relative to printable ones.
+///
+/// The three details that make it a port rather than an approximation, each of
+/// which git-xcrypt got wrong before and each of which moves real files across
+/// the boundary:
+///
+/// * `CR` and `LF` are counted as line endings and go into **neither** bucket;
+/// * `DEL` (`0x7f`) counts as non-printable, despite being above `0x20`;
+/// * of the bytes below `0x20` only `BS`, `TAB`, `FF` and `ESC` are forgiven.
+///
 /// Bytes at or above `0x80` count as printable, which is why UTF-8 text is
 /// recognised as text. The whole content is scanned; the 8000-byte window
 /// belongs to a different heuristic, the one `git diff` uses to print
@@ -40,10 +50,20 @@ pub fn looks_binary(content: &[u8]) -> bool {
 
     for (index, &byte) in content.iter().enumerate() {
         match byte {
+            // CR and LF are counted as line endings and land in neither
+            // bucket. Counting them as printable would inflate the left side
+            // of the ratio below and call binary content text.
+            b'\r' => {
+                if content.get(index + 1) != Some(&b'\n') {
+                    return true;
+                }
+            }
+            b'\n' => {}
             0 => return true,
-            b'\r' if content.get(index + 1) != Some(&b'\n') => return true,
-            b'\t' | b'\n' | b'\r' | 0x0c | 0x08 | 0x1b => printable += 1,
-            0x01..0x20 => nonprintable += 1,
+            // BS, TAB, FF and ESC are the control bytes git forgives.
+            0x08 | b'\t' | 0x0c | 0x1b => printable += 1,
+            // DEL counts against the content, same as the other controls.
+            0x01..0x20 | 0x7f => nonprintable += 1,
             _ => printable += 1,
         }
     }

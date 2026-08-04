@@ -116,9 +116,13 @@ impl Config {
     pub fn parse(text: &str) -> Result<Self> {
         let mut config = Self::default();
 
-        for (number, raw) in text.lines().enumerate() {
-            let line = raw.trim_end();
-            if line.is_empty() || line.trim_start().starts_with('#') {
+        for (number, line) in text.lines().enumerate() {
+            // Deliberately not trimmed: `split_pattern` is the only thing that
+            // understands the `\ ` escape, so trimming first would eat the
+            // escaped trailing space and make a pattern like
+            // `!secrets/README.md\ ` unwritable — the exact complement of the
+            // pathnames the filter now matches correctly.
+            if line.trim().is_empty() || line.trim_start().starts_with('#') {
                 continue;
             }
 
@@ -457,6 +461,23 @@ mod tests {
     #[test]
     fn attributes_on_a_negation_are_refused() {
         assert!(Config::parse("secrets/\n!secrets/README.md text\n").is_err());
+    }
+
+    #[test]
+    fn a_pattern_can_end_in_an_escaped_space() {
+        // The complement of the pathname fix: the filter matches
+        // `secrets/README.md ` correctly, so the declaration has to be able to
+        // name it. Trimming the line before `split_pattern` ate the escape.
+        let config = config("secrets/\n!secrets/README.md\\ \n");
+        assert!(config.decide(b"secrets/password").encrypt);
+        assert!(
+            !config.decide(b"secrets/README.md ").encrypt,
+            "the negation with an escaped trailing space did not take effect"
+        );
+        assert!(
+            config.decide(b"secrets/README.md").encrypt,
+            "and it must not spill onto the name without the space"
+        );
     }
 
     #[test]

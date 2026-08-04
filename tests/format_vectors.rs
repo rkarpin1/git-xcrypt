@@ -10,8 +10,11 @@
 //! crate directly; it pins `aes-siv` against the specification, while these
 //! pin our own wrapping of it.
 
+use git_xcrypt::config::Config;
 use git_xcrypt::crypto::{decrypt, encrypt};
-use git_xcrypt::format::{FLAG_LF_NORMALIZED, OVERHEAD};
+use git_xcrypt::decide;
+use git_xcrypt::eol::looks_binary;
+use git_xcrypt::format::{FLAG_LF_NORMALIZED, OVERHEAD, looks_encrypted};
 use git_xcrypt::key::{MASTER_KEY_LEN, MasterKey};
 
 /// The key every vector below was produced with.
@@ -116,6 +119,127 @@ fn the_frozen_bytes_still_decrypt() {
             "plaintext changed for `{}`",
             vector.name
         );
+    }
+}
+
+/// Frozen verdicts for the `text=auto` rule.
+///
+/// `zalozenia.md` requires these alongside the format vectors, and the reason is
+/// concrete: the vectors above call `crypto::encrypt` with explicit flags, so
+/// they are blind to `looks_binary`. Without this table the text/binary boundary
+/// can move — re-ciphering every file that crosses it — with the suite green.
+///
+/// Each case is `(content, is_binary)` and mirrors a measurement against git's
+/// own `gather_stats`/`convert_is_binary`.
+fn binary_verdicts() -> Vec<(&'static str, Vec<u8>, bool)> {
+    vec![
+        ("empty", Vec::new(), false),
+        (
+            "plain ASCII",
+            b"api_key = do-not-commit-me\n".to_vec(),
+            false,
+        ),
+        ("CRLF text", b"one\r\ntwo\r\n".to_vec(), false),
+        (
+            "forgiven controls",
+            b"bs\x08tab\tff\x0cesc\x1b\n".to_vec(),
+            false,
+        ),
+        ("a NUL anywhere", b"text then \0 a nul".to_vec(), true),
+        (
+            "a NUL far in",
+            {
+                let mut v = vec![b'A'; 100_000];
+                v.push(0);
+                v
+            },
+            true,
+        ),
+        ("lone CR at the end", b"trailing\r".to_vec(), true),
+        ("lone CR inside", b"old\rmac\r".to_vec(), true),
+        ("CR CR LF", b"a\r\r\nb\r\n".to_vec(), true),
+        ("LF then CR", b"\n\r".to_vec(), true),
+        // Bytes >= 0x80 are printable, which is what keeps UTF-8 text as text.
+        (
+            "high bytes",
+            (0x80u8..=0xff).cycle().take(2560).collect(),
+            false,
+        ),
+        (
+            "many controls",
+            (1u8..=8).cycle().take(2400).collect(),
+            true,
+        ),
+        // DEL is above 0x20 but git counts it against the content. Padding with
+        // LF must not rescue it: line endings count towards neither bucket.
+        (
+            "DEL padded with LF",
+            {
+                let mut v = vec![0x7f; 200];
+                v.extend_from_slice(b"x\r\n");
+                v
+            },
+            true,
+        ),
+        (
+            "LF padded controls",
+            {
+                let mut v = vec![b'\n'; 200];
+                v.extend_from_slice(b"\x01\r\n");
+                v
+            },
+            true,
+        ),
+        // One DEL among plenty of printable bytes stays text: 256 >> 7 == 2.
+        (
+            "one DEL in prose",
+            {
+                let mut v = vec![b'a'; 256];
+                v.push(0x7f);
+                v
+            },
+            false,
+        ),
+    ]
+}
+
+#[test]
+fn the_text_auto_rule_still_gives_the_frozen_verdicts() {
+    for (name, content, expected) in binary_verdicts() {
+        assert_eq!(
+            looks_binary(&content),
+            expected,
+            "the text/binary boundary moved for `{name}` — every file that crosses \
+             it gets different ciphertext, so this needs a new suite, not an edited \
+             vector"
+        );
+    }
+}
+
+#[test]
+fn the_recorded_normalisation_flag_follows_the_frozen_verdict() {
+    // Goes through `decide::clean`, not `crypto::encrypt`, so it pins the whole
+    // chain: pattern match, text/binary verdict, flag bit, ciphertext.
+    let config = Config::parse("*.env\n").expect("test config");
+
+    for (name, content, is_binary) in binary_verdicts() {
+        let blob = decide::clean(Some(&vector_key()), &config, b"a.env", &content)
+            .expect("a selected path must encrypt")
+            .content;
+        assert!(looks_encrypted(&blob), "`{name}` was not encrypted at all");
+
+        let (flags, plaintext) = decrypt(&vector_key(), &blob).expect("our own blob");
+        let normalised = flags & FLAG_LF_NORMALIZED != 0;
+        assert_eq!(
+            normalised, !is_binary,
+            "`{name}`: the recorded normalisation flag disagrees with the frozen verdict"
+        );
+        if is_binary {
+            assert_eq!(
+                plaintext, content,
+                "`{name}` was converted despite being binary"
+            );
+        }
     }
 }
 

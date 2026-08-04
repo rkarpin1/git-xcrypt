@@ -169,8 +169,17 @@ fn read_request(input: &mut impl Read) -> Result<Option<Request>> {
                 }
             }
             // git closes the stream when the operation is over, which arrives
-            // as an unexpected end of file rather than as a message.
-            Err(Error::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+            // as an unexpected end of file rather than as a message. Only a
+            // clean boundary counts: an end of file *after* a field has arrived
+            // is a truncated request, and treating it as a shutdown would exit
+            // zero having answered nothing — which tells git the file was
+            // handled. `read_content` already treats the same condition as an
+            // error, so this keeps the two halves in step.
+            Err(Error::Io(err))
+                if err.kind() == std::io::ErrorKind::UnexpectedEof
+                    && command.is_none()
+                    && pathname.is_none() =>
+            {
                 return Ok(None);
             }
             Err(err) => return Err(err),
@@ -209,14 +218,18 @@ fn serve(context: &mut Context, request: &Request, output: &mut impl Write) -> R
                 &request.content,
             )
         }),
-        "smudge" => decide::smudge(
-            context.key.as_ref(),
-            &request.pathname,
-            &request.content,
-            context.config.decide(&request.pathname).eol,
-            context.autocrlf.as_deref(),
-            context.core_eol.as_deref(),
-        ),
+        "smudge" => {
+            let decision = context.config.decide(&request.pathname);
+            decide::smudge(
+                context.key.as_ref(),
+                &request.pathname,
+                &request.content,
+                decision.encrypt,
+                decision.eol,
+                context.autocrlf.as_deref(),
+                context.core_eol.as_deref(),
+            )
+        }
         other => Err(Error::Format(format!(
             "git asked for the unknown filter command `{other}`"
         ))),
@@ -357,6 +370,26 @@ mod tests {
         assert!(
             !reply.windows(9).any(|w| w == b"api_key ="),
             "the plaintext must not appear in the reply"
+        );
+    }
+
+    #[test]
+    fn a_truncated_request_is_an_error_not_a_shutdown() {
+        // Exiting zero here would tell git the file was filtered when nothing
+        // was written back.
+        let mut buffer = Vec::new();
+        write_data(&mut buffer, b"git-filter-client\n").expect("writing");
+        write_data(&mut buffer, b"version=2\n").expect("writing");
+        write_flush(&mut buffer).expect("writing");
+        write_data(&mut buffer, b"capability=clean\n").expect("writing");
+        write_flush(&mut buffer).expect("writing");
+        // A command with no pathname, and then the stream simply stops.
+        write_data(&mut buffer, b"command=clean\n").expect("writing");
+
+        let mut reply = Vec::new();
+        assert!(
+            run(&mut context(), &mut buffer.as_slice(), &mut reply).is_err(),
+            "a half-delivered request must not look like a clean shutdown"
         );
     }
 

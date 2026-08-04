@@ -136,8 +136,9 @@ fn already_encrypted(key: Option<&MasterKey>, path: &[u8], content: &[u8]) -> Re
         });
     }
 
-    // The plaintext is dropped immediately; only the verdict matters.
-    crypto::decrypt(key, content)?;
+    // The plaintext is dropped immediately; only the verdict matters. Wrapped
+    // so the copy it makes does not outlive this line on the heap.
+    drop(zeroize::Zeroizing::new(crypto::decrypt(key, content)?.1));
 
     Ok(Outcome::plain(content.to_vec()))
 }
@@ -157,6 +158,7 @@ pub fn smudge(
     key: Option<&MasterKey>,
     path: &[u8],
     content: &[u8],
+    selected: bool,
     declared_eol: Option<EolMode>,
     autocrlf: Option<&str>,
     core_eol: Option<&str>,
@@ -165,13 +167,23 @@ pub fn smudge(
         // Committed before the pattern existed. Refusing would make checking out
         // old history impossible, and plaintext in the working tree is where
         // plaintext belongs — so this passes through, loudly.
-        return Ok(Outcome {
-            content: content.to_vec(),
-            warning: Some(format!(
+        //
+        // Loudly only for a path the declaration actually selects, though. The
+        // catch-all attribute sends every file in the repository through here,
+        // so warning unconditionally buries the one message that means something
+        // under one per ordinary file — and a fresh clone becomes a wall of
+        // "whether it leaked". The case this warning exists for is narrow: a
+        // *selected* path found in the clear.
+        let warning = selected.then(|| {
+            format!(
                 "{}: stored in the clear, so it is checked out unchanged; \
                  run `git-xcrypt status` to see whether it leaked",
                 path.as_bstr()
-            )),
+            )
+        });
+        return Ok(Outcome {
+            content: content.to_vec(),
+            warning,
         });
     }
 
@@ -305,6 +317,7 @@ mod tests {
                 Some(&key()),
                 b"a.env",
                 &stored.content,
+                true,
                 None,
                 Some("input"),
                 None,
@@ -322,6 +335,7 @@ mod tests {
             Some(&key()),
             b"a.env",
             &stored.content,
+            true,
             None,
             Some("true"),
             None,
@@ -340,6 +354,7 @@ mod tests {
             Some(&key()),
             b"a.env",
             &stored.content,
+            true,
             Some(EolMode::Crlf),
             None,
             None,
@@ -349,11 +364,34 @@ mod tests {
     }
 
     #[test]
+    fn an_unselected_path_in_the_clear_is_checked_out_silently() {
+        // The catch-all attribute sends every file in the repository through
+        // smudge. Warning for each one buries the single message that means
+        // something: a *selected* path found unencrypted.
+        let outcome = smudge(
+            Some(&key()),
+            b"README.md",
+            b"public\n",
+            false,
+            None,
+            None,
+            None,
+        )
+        .expect("passing through must succeed");
+        assert_eq!(outcome.content, b"public\n");
+        assert!(
+            outcome.warning.is_none(),
+            "an ordinary file must not be reported as a possible leak"
+        );
+    }
+
+    #[test]
     fn content_stored_in_the_clear_is_checked_out_with_a_warning() {
         let outcome = smudge(
             Some(&key()),
             b"a.env",
             b"was here first\n",
+            true,
             None,
             None,
             None,
@@ -366,7 +404,7 @@ mod tests {
     #[test]
     fn our_ciphertext_without_a_key_cannot_be_checked_out() {
         let stored = clean(Some(&key()), &config(), b"a.env", b"secret").expect("clean");
-        match smudge(None, b"a.env", &stored.content, None, None, None) {
+        match smudge(None, b"a.env", &stored.content, true, None, None, None) {
             Err(Error::NoKey) => {}
             other => panic!("expected NoKey, got {other:?}"),
         }

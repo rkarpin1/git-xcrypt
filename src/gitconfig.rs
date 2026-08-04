@@ -7,6 +7,7 @@
 
 use std::path::Path;
 
+use bstr::ByteSlice as _;
 use gix_config::File;
 use gix_config::file::Metadata;
 
@@ -67,10 +68,45 @@ pub fn set(config: &mut File, key: &str, value: &str) -> Result<()> {
         .map_err(|err| Error::Config(format!("could not set {key}: {err}")))
 }
 
+/// Removes a dotted key, if it is there at all.
+///
+/// # Errors
+///
+/// [`Error::Config`] when the key names a section that cannot be addressed.
+pub fn unset(config: &mut File, key: &str) -> Result<()> {
+    let (section_key, name) = key
+        .rsplit_once('.')
+        .ok_or_else(|| Error::Config(format!("`{key}` is not a dotted configuration key")))?;
+
+    if let Ok(mut section) = config.section_mut_by_key(section_key) {
+        while section.remove(name).is_some() {}
+    }
+    Ok(())
+}
+
 /// Reads a dotted key, if present.
+///
+/// A key written with no value at all — `[core]\n\tautocrlf` — is `true` to git,
+/// but has no raw value to return. It comes back as `Some("")` so callers can
+/// tell it from an absent key; every git spelling of true includes that one.
 #[must_use]
 pub fn get(config: &File, key: &str) -> Option<String> {
-    config.raw_value(key).ok().map(|value| value.to_string())
+    if let Ok(value) = config.raw_value(key) {
+        return Some(value.to_string());
+    }
+
+    let (section_key, name) = key.rsplit_once('.')?;
+    let (section, subsection) = match section_key.split_once('.') {
+        Some((section, subsection)) => (section, Some(subsection.as_bytes().as_bstr())),
+        None => (section_key, None),
+    };
+
+    let present = config
+        .sections_by_name(section)?
+        .filter(|section| section.header().subsection_name() == subsection)
+        .any(|section| section.value_names().any(|value_name| value_name == name));
+
+    present.then(String::new)
 }
 
 #[cfg(test)]
@@ -127,6 +163,45 @@ mod tests {
 
         let reloaded = open_local(&path).expect("valid config");
         assert_eq!(get(&reloaded, "user.name").as_deref(), Some("Someone"));
+    }
+
+    #[test]
+    fn a_key_written_without_a_value_is_present_not_absent() {
+        // `[core]\n\tautocrlf` is true to git. It has no raw value, so reporting
+        // it as absent made the whole CRLF table fall through to `core.eol`.
+        let dir = TempDir::new().expect("temporary directory");
+        let path = dir.path().join("config");
+        std::fs::write(&path, "[core]\n\tautocrlf\n").expect("writing must succeed");
+
+        let config = open_local(&path).expect("valid config");
+        assert_eq!(get(&config, "core.autocrlf").as_deref(), Some(""));
+        assert!(get(&config, "core.eol").is_none());
+    }
+
+    #[test]
+    fn unsetting_removes_a_key_and_leaves_its_neighbours() {
+        let dir = TempDir::new().expect("temporary directory");
+        let path = dir.path().join("config");
+
+        let mut config = open_local(&path).expect("empty config");
+        set(&mut config, "diff.git-xcrypt.textconv", "gone").expect("setting");
+        set(&mut config, "filter.git-xcrypt.required", "true").expect("setting");
+        unset(&mut config, "diff.git-xcrypt.textconv").expect("unsetting must succeed");
+        save_local(&path, &config).expect("saving must succeed");
+
+        let reloaded = open_local(&path).expect("valid config");
+        assert!(get(&reloaded, "diff.git-xcrypt.textconv").is_none());
+        assert_eq!(
+            get(&reloaded, "filter.git-xcrypt.required").as_deref(),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn unsetting_an_absent_key_is_not_an_error() {
+        let dir = TempDir::new().expect("temporary directory");
+        let mut config = open_local(&dir.path().join("config")).expect("empty config");
+        unset(&mut config, "diff.git-xcrypt.textconv").expect("unsetting must succeed");
     }
 
     #[test]

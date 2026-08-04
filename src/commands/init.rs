@@ -159,6 +159,17 @@ fn register_driver(repo: &Repo) -> Result<bool> {
         }
     }
 
+    // "Repair the rest" has to include undoing what an earlier build wrote.
+    // Versions before the diff driver was deferred to S-05 registered
+    // `diff.git-xcrypt.textconv` pointing at a subcommand that does not exist;
+    // leaving it behind means those repositories keep the breakage.
+    for stale in [format!("diff.{DRIVER}.textconv")] {
+        if gitconfig::get(&config, &stale).is_some() {
+            gitconfig::unset(&mut config, &stale)?;
+            changed = true;
+        }
+    }
+
     if changed {
         gitconfig::save_local(&path, &config)?;
     }
@@ -243,6 +254,31 @@ mod tests {
         assert!(
             !report.changed_anything(),
             "a settled repository needs no repair"
+        );
+    }
+
+    #[test]
+    fn a_stale_diff_driver_from_an_older_build_is_removed() {
+        // Older builds registered `diff.git-xcrypt.textconv` pointing at a
+        // subcommand that does not exist. "Repair the rest" has to undo that,
+        // or those repositories keep the breakage forever.
+        let dir = init_repo();
+        let repo = Repo::discover(dir.path()).expect("discovery");
+        run(&repo).expect("first init");
+
+        let path = repo.config_path();
+        let mut config = gitconfig::open_local(&path).expect("config");
+        gitconfig::set(&mut config, &format!("diff.{DRIVER}.textconv"), "old diff")
+            .expect("setting");
+        gitconfig::save_local(&path, &config).expect("saving");
+
+        let report = run(&repo).expect("init must repair");
+
+        assert!(report.config_written, "the repair went unreported");
+        let config = gitconfig::open_local(&path).expect("config");
+        assert!(
+            gitconfig::get(&config, &format!("diff.{DRIVER}.textconv")).is_none(),
+            "a diff driver pointing at a missing subcommand survived init"
         );
     }
 
