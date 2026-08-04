@@ -447,6 +447,13 @@ pub struct Tracked {
     /// plaintext of a file no pattern declared was now a blob in the object
     /// database. The history scan had the check all along and the two disagreed.
     pub mode: u32,
+    /// Whether this is a `git add -N` placeholder rather than staged content.
+    ///
+    /// Such an entry carries mode `100644` and the empty blob, so it reads as
+    /// "stored in the clear" and `--fix` used to repoint it — announcing a
+    /// repair that the next `git commit` did not make, because git still treats
+    /// the path as unstaged.
+    pub intent_to_add: bool,
 }
 
 impl Tracked {
@@ -457,6 +464,12 @@ impl Tracked {
     #[must_use]
     pub fn is_regular_file(&self) -> bool {
         self.mode & 0o170_000 == 0o100_000
+    }
+
+    /// Whether this entry holds content the next commit would actually store.
+    #[must_use]
+    pub fn holds_content(&self) -> bool {
+        self.is_regular_file() && !self.intent_to_add
     }
 }
 
@@ -500,6 +513,7 @@ pub fn list(index_path: &Path, hash: gix_hash::Kind) -> Result<Listed> {
                     path: entry.name.to_vec(),
                     id: entry.id.to_vec(),
                     mode: entry.mode,
+                    intent_to_add: entry.intent_to_add,
                 });
             }
         },
@@ -649,6 +663,8 @@ struct Entry<'a> {
     stage: u8,
     /// The entry mode, which says whether this is a file at all.
     mode: u32,
+    /// `git add -N`: the path is announced but its content is not staged.
+    intent_to_add: bool,
 }
 
 /// Offset of the `mode` field from the start of an entry.
@@ -725,6 +741,12 @@ fn walk(
         }
         let flags = u16::from_be_bytes([body[flags_at], body[flags_at + 1]]);
         let extended = flags & 0x4000 != 0;
+        // The on-disk extended word carries git's bits 16..31, so its `0x2000`
+        // is `CE_INTENT_TO_ADD (1 << 29)`.
+        let intent_to_add = version >= 3
+            && extended
+            && body.len() >= flags_at + 4
+            && u16::from_be_bytes([body[flags_at + 2], body[flags_at + 3]]) & 0x2000 != 0;
         let stage = ((flags >> 12) & 0x3) as u8;
         let declared = usize::from(flags & 0x0fff);
 
@@ -779,6 +801,7 @@ fn walk(
                 body[start + MODE_FIELD + 2],
                 body[start + MODE_FIELD + 3],
             ]),
+            intent_to_add,
         });
         previous = name;
     }

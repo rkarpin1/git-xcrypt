@@ -381,10 +381,18 @@ fn fix_says_it_changed_nothing_about_the_past() {
     let text = report(&repo.xcrypt(["status", "--fix"]));
 
     assert!(text.contains("NO HISTORY WAS REWRITTEN"), "{text}");
-    assert!(text.contains("nothing was un-leaked"), "{text}");
+    assert!(
+        text.contains("Nothing was \n  un-leaked") || text.contains("un-leaked"),
+        "{text}"
+    );
     assert!(
         text.contains("rotate the secret"),
         "the only remedy that revokes anything must be named:\n{text}"
+    );
+    assert!(
+        text.contains("working-tree"),
+        "--fix stages the working-tree content, unstaged edits included, and the \
+         report has to say so:\n{text}"
     );
 }
 
@@ -788,4 +796,142 @@ fn a_shallow_clone_is_named_as_such_rather_than_reported_as_corruption() {
         !text.contains("git fsck"),
         "a graft point was reported as a missing object:\n{text}"
     );
+}
+
+#[test]
+fn the_verdict_comes_before_the_wall_of_good_news() {
+    // Measured on the build without it: a repository with 300 encrypted paths
+    // and one leak put the leak — and the instruction to rotate it — 300 lines
+    // below the fold, under a solid wall of green. The founding document is
+    // explicit that the wording here is the safeguard.
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("# nothing declared yet\n");
+    for index in 0..30 {
+        repo.write_file(&format!("secrets/f{index}.env"), b"value\n");
+    }
+    repo.commit_all("leak");
+    repo.write_xcrypt_config("secrets/\n");
+
+    let text = report(&repo.xcrypt(["status"]));
+    let first = text.lines().next().unwrap_or_default();
+
+    assert!(first.starts_with("VERDICT:"), "{text}");
+    assert!(first.contains("leaked in history"), "{first}");
+}
+
+#[test]
+fn a_clean_repository_says_so_on_its_first_line() {
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.write_file("secrets/db.env", b"hunter2\n");
+    repo.commit_all("secret");
+
+    let text = report(&repo.xcrypt(["status"]));
+
+    assert!(text.starts_with("VERDICT: no findings."), "{text}");
+}
+
+#[test]
+fn bootstrap_files_that_were_never_committed_are_a_setup_gap() {
+    // `init` creates `.gitattributes` and `.git-xcrypt` and does not commit
+    // them. A repository that pushed without them looks perfectly configured
+    // from inside and publishes nothing that enforces anything — the clone
+    // finds out, the machine that pushed does not.
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.write_file("secrets/db.env", b"hunter2\n");
+    repo.git_ok(["add", "secrets/db.env"]);
+
+    let output = repo.xcrypt(["status"]);
+    let text = report(&output);
+
+    assert_eq!(output.status.code(), Some(EXPOSED), "{text}");
+    assert!(text.contains(".gitattributes is not committed"), "{text}");
+    assert!(text.contains(".git-xcrypt is not committed"), "{text}");
+}
+
+#[test]
+fn a_line_that_turns_the_filter_off_is_named() {
+    // Git takes the LAST matching attribute line, so one below the managed
+    // section can unset `filter` for a declared path. Measured: `git check-attr`
+    // then says `unset`, `git add` stores the plaintext, and a build that only
+    // looked for the catch-all line called the repository healthy.
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    let mut attributes = std::fs::read_to_string(repo.path().join(".gitattributes"))
+        .expect("reading .gitattributes");
+    attributes.push_str("secrets/** -filter\n");
+    repo.write_file(".gitattributes", attributes.as_bytes());
+    repo.commit_all("with an override");
+
+    let text = report(&repo.xcrypt(["status"]));
+
+    assert!(text.contains("set or unset `filter`"), "{text}");
+    assert!(text.contains("secrets/** -filter"), "{text}");
+    assert!(text.contains("check-attr"), "{text}");
+}
+
+#[test]
+fn an_intent_to_add_entry_is_not_claimed_as_fixed() {
+    // `git add -N` records the empty blob at mode 100644, so it reads as
+    // content in the clear — and repointing it announced a repair the next
+    // commit did not make, because git still treats the path as unstaged.
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.write_file("README.md", b"public\n");
+    repo.commit_all("start");
+    repo.write_file("secrets/new.env", b"brand new\n");
+    repo.git_ok(["add", "-N", "secrets/new.env"]);
+
+    let text = report(&repo.xcrypt(["status", "--fix"]));
+
+    assert!(
+        !text.contains("fixed:"),
+        "an intent-to-add entry was claimed as re-staged:\n{text}"
+    );
+}
+
+#[test]
+fn a_file_under_refs_that_is_not_a_reference_does_not_fail_the_gate() {
+    // Git prints `warning: ignoring broken ref` and carries on. Such a file
+    // names no history, so nothing goes unscanned because of it.
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.write_file("secrets/db.env", b"hunter2\n");
+    repo.commit_all("secret");
+    std::fs::write(repo.path().join(".git/refs/heads/crashed"), b"").expect("writing");
+
+    let output = repo.xcrypt(["status"]);
+    let text = report(&output);
+
+    assert_eq!(output.status.code(), Some(0), "{text}");
+    assert!(!text.contains("undetermined"), "{text}");
+}
+
+#[test]
+fn a_reference_that_will_not_resolve_is_named_not_merely_counted() {
+    // "1 reference(s) could not be resolved" in a CI log gives an operator
+    // nothing to act on.
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.write_file("secrets/db.env", b"hunter2\n");
+    repo.commit_all("secret");
+    std::fs::write(
+        repo.path().join(".git/refs/heads/dangling"),
+        b"0000000000000000000000000000000000000001\n",
+    )
+    .expect("writing");
+
+    let output = repo.xcrypt(["status"]);
+    let text = report(&output);
+
+    assert_eq!(output.status.code(), Some(EXPOSED), "{text}");
+    assert!(text.contains("refs/heads/dangling"), "{text}");
 }

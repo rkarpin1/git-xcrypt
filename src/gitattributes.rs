@@ -412,6 +412,62 @@ pub fn catch_all_present(path: &Path) -> Result<bool> {
     Ok(read(path)?.lines().any(|line| line.trim_end() == CATCH_ALL))
 }
 
+/// Lines outside the managed section that set or unset `filter`.
+///
+/// The catch-all is one line among many, and git takes the **last** match — so
+/// a line below the managed section saying `secrets/** -filter`, or setting
+/// `filter=lfs`, turns this tool off for those paths. Measured on git 2.55:
+/// `git check-attr filter` then reports `unset`, `git add` stores the plaintext,
+/// and `status` — which only looked for the catch-all line — called the
+/// repository healthy.
+///
+/// Reported rather than resolved. Answering "which paths does this actually
+/// reach" means running git's attribute stack over every declared path, nested
+/// `.gitattributes` files included, which is a dependency and a subsystem this
+/// element did not take on. Naming the lines is what a user needs in order to
+/// look, and `filter=lfs` on unrelated paths is perfectly legitimate — so this
+/// is a note, never a gate failure.
+///
+/// # Errors
+///
+/// [`Error::Io`] when the file exists but cannot be read, [`Error::Config`] when
+/// it is not text.
+pub fn foreign_filter_lines(path: &Path) -> Result<Vec<String>> {
+    let text = read(path)?;
+    let mut inside = false;
+    let mut found = Vec::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim_end().trim_end_matches('\r');
+        if trimmed == BEGIN {
+            inside = true;
+            continue;
+        }
+        if trimmed == END {
+            inside = false;
+            continue;
+        }
+        if inside || trimmed.is_empty() || trimmed.trim_start().starts_with('#') {
+            continue;
+        }
+        // The pattern is the first field; everything after it is attributes.
+        let attributes = trimmed
+            .split_once(char::is_whitespace)
+            .map(|(_, rest)| rest);
+        if attributes.is_some_and(|rest| {
+            rest.split_whitespace().any(|token| {
+                token == "filter"
+                    || token == "-filter"
+                    || token == "!filter"
+                    || token.starts_with("filter=")
+            })
+        }) {
+            found.push(trimmed.trim().to_string());
+        }
+    }
+    Ok(found)
+}
+
 /// The configuration keys `init` writes, for `status` to check for completeness.
 ///
 /// A clone that never ran `init` or `unlock` carries the catch-all attribute

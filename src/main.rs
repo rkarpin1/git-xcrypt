@@ -125,7 +125,28 @@ enum Command {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    // `Cli::parse()` exits with clap's own code, which is 2 — the code the
+    // frozen table gives to "configuration or a state conflict". A gate that
+    // pages someone on 2 could not tell a misconfigured repository from a typo.
+    // Help and version are a successful request for output, not a failure.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            // Only an explicit `--help` or `--version` is a request that
+            // succeeded. Running the binary with no subcommand at all prints
+            // help too, but it is a usage error — `git` itself exits 1 there.
+            let usage = !matches!(
+                err.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            );
+            let _ = err.print();
+            return if usage {
+                ExitCode::from(exit::USAGE)
+            } else {
+                ExitCode::SUCCESS
+            };
+        }
+    };
 
     match cli.command {
         Command::Init => report(run_init()),

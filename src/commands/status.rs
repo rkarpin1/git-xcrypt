@@ -58,6 +58,14 @@ pub enum SetupGap {
     },
     /// `.gitattributes` carries no `* filter=git-xcrypt` line.
     CatchAllMissing,
+    /// A file the whole mechanism bootstraps from is not tracked.
+    ///
+    /// `.gitattributes` is what makes git call the filter and `.git-xcrypt` is
+    /// what the filter reads. Neither is any use to a clone unless it is
+    /// committed, and `init` creates them without committing them — so a
+    /// repository can look perfectly configured locally and publish nothing that
+    /// enforces anything. The clone finds out; the machine that pushed does not.
+    Untracked(String),
 }
 
 impl fmt::Display for SetupGap {
@@ -77,6 +85,12 @@ impl fmt::Display for SetupGap {
                 "{} carries no `{}` line, so git never calls the filter",
                 crate::repo::ATTRIBUTES_FILE,
                 gitattributes::CATCH_ALL
+            ),
+            Self::Untracked(path) => write!(
+                f,
+                "{path} is not committed, so no clone of this repository gets it \
+                 — and without it a clone filters nothing. `git add {path}` and \
+                 commit it"
             ),
         }
     }
@@ -119,6 +133,18 @@ pub struct Report {
     pub undetermined: Vec<String>,
     /// How much history was walked, for the closing line.
     pub scanned: Scanned,
+    /// Whether the history scan ran at all.
+    ///
+    /// Without it the closing line printed "scanned 0 commit(s)" for a run that
+    /// returned before the scan, which reads as "I looked and there was nothing"
+    /// in a repository with five hundred commits.
+    pub scan_ran: bool,
+    /// Whether `--fix` was asked for.
+    ///
+    /// The advice under "in the clear" tells a user to run `--fix`; printing
+    /// that in the output of `--fix` itself points at the command that has just
+    /// declined, and says nothing about the attempt.
+    pub fix_requested: bool,
     /// Notes that describe a lesser problem and never change the exit code.
     pub notes: Vec<String>,
     /// Anything worth saying once, carried out so the binary owns the messages.
@@ -150,6 +176,12 @@ impl Report {
 /// Lossy on purpose and only here: a path is arbitrary bytes on Unix, so the
 /// decision paths — matching, hashing, index lookup — keep the bytes, and only
 /// the moment of printing gives up on them.
+/// How many paths the good-news section prints before summarising.
+const MAX_LISTED: usize = 10;
+
+/// How many plaintext blobs are shown per exposed path.
+const MAX_SIGHTINGS: usize = 3;
+
 fn show(path: &[u8]) -> String {
     bstr::BStr::new(path).to_string()
 }
@@ -173,6 +205,7 @@ fn shell_quoted(path: &[u8]) -> String {
 /// safe" — so it has to be assertable from a test.
 impl fmt::Display for Report {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.write_verdict(f)?;
         if self.setup.is_empty() {
             writeln!(
                 f,
@@ -208,18 +241,61 @@ impl fmt::Display for Report {
             writeln!(f, "\nnote: {note}")?;
         }
 
-        writeln!(
-            f,
-            "\nscanned {} commit(s) and {} distinct blob(s) under a declared path. \
-             `status` answers whether your declarations are enforced, not whether \
-             this repository holds secrets: a path no pattern ever matched is \
-             invisible to it.",
-            self.scanned.commits, self.scanned.blobs
-        )
+        if self.scan_ran {
+            writeln!(
+                f,
+                "\nscanned {} commit(s) and {} distinct blob(s) under a declared \
+                 path. `status` answers whether your declarations are enforced, not \
+                 whether this repository holds secrets: a path no pattern ever \
+                 matched is invisible to it.",
+                self.scanned.commits, self.scanned.blobs
+            )
+        } else {
+            // "scanned 0 commit(s)" reads as "I looked and there was nothing",
+            // which in a five-hundred-commit repository is the opposite of true.
+            writeln!(
+                f,
+                "\nhistory was NOT scanned — see `undetermined` above. `status` \
+                 answers whether your declarations are enforced, not whether this \
+                 repository holds secrets: a path no pattern ever matched is \
+                 invisible to it."
+            )
+        }
     }
 }
 
 impl Report {
+    /// One line, first, saying whether anything was found.
+    ///
+    /// Not decoration. `write_encrypted` lists every declared path, and a
+    /// repository with three hundred secrets and one leak put the leak — and the
+    /// instruction to rotate it — three hundred lines below the fold, under a
+    /// solid wall of good news. The founding document is explicit that the
+    /// wording here *is* the safeguard; a safeguard nobody scrolls to is not one.
+    fn write_verdict(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if !self.exposed() {
+            return writeln!(f, "VERDICT: no findings.\n");
+        }
+
+        let mut parts: Vec<String> = Vec::new();
+        if !self.leaked.is_empty() {
+            parts.push(format!("{} path(s) leaked in history", self.leaked.len()));
+        }
+        if !self.in_the_clear.is_empty() {
+            parts.push(format!(
+                "{} path(s) stored in the clear now",
+                self.in_the_clear.len()
+            ));
+        }
+        if !self.setup.is_empty() {
+            parts.push(format!("{} setup gap(s)", self.setup.len()));
+        }
+        if !self.undetermined.is_empty() {
+            parts.push(format!("{} thing(s) undetermined", self.undetermined.len()));
+        }
+        writeln!(f, "VERDICT: {}.\n", parts.join(", "))
+    }
+
     /// What could not be determined, and therefore what nothing here proves.
     fn write_undetermined(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.undetermined.is_empty() {
@@ -256,12 +332,15 @@ impl Report {
         }
         writeln!(
             f,
-            "\n  This changed the index and nothing else. NO HISTORY WAS REWRITTEN, \
-             and nothing was un-leaked: every plain-text version already committed \
-             is still in this repository and in every clone of it. If any of these \
-             files held a secret that has been pushed, rotate the secret — that is \
-             the only step that revokes it. The working tree is untouched, so your \
-             files are still readable; commit when ready."
+            "\n  What is staged for each of them is its **working-tree** content, \
+             the same as `git add` would stage — so any edit you had not staged \
+             yet is staged now. Check `git diff --cached` before committing.\n\
+             \n  \
+             No file was rewritten and NO HISTORY WAS REWRITTEN. Nothing was \
+             un-leaked: every plain-text version already committed is still in \
+             this repository and in every clone of it. If any of these files held \
+             a secret that has been pushed, rotate the secret — that is the only \
+             step that revokes it."
         )
     }
 
@@ -275,8 +354,15 @@ impl Report {
             "\nencrypted: {} declared path(s) are stored as ciphertext.",
             self.encrypted.len()
         )?;
-        for path in &self.encrypted {
+        // Capped, unlike every other section. This is the one list that grows
+        // with the size of a healthy repository, and it is the only one a reader
+        // does not need in full — while the sections below it are the ones they
+        // came for.
+        for path in self.encrypted.iter().take(MAX_LISTED) {
             writeln!(f, "  {}", show(path))?;
+        }
+        if self.encrypted.len() > MAX_LISTED {
+            writeln!(f, "  … and {} more", self.encrypted.len() - MAX_LISTED)?;
         }
         Ok(())
     }
@@ -294,6 +380,16 @@ impl Report {
         )?;
         for path in &self.in_the_clear {
             writeln!(f, "  {}", show(path))?;
+        }
+        if self.fix_requested {
+            // --fix already ran and left these behind; the reason is in the
+            // warnings on stderr. Repeating "run --fix" here would point at the
+            // command whose output the reader is holding.
+            return writeln!(
+                f,
+                "\n  `--fix` was asked for and did not re-stage these — the reason for \
+                 each is on stderr. `git add` on them by hand does the same job."
+            );
         }
         writeln!(
             f,
@@ -320,6 +416,10 @@ impl Report {
              clear at some point, and the blobs are still here.",
             self.leaked.len()
         )?;
+        // Every path is listed — they are the actionable unit and the thing a
+        // rewrite takes. The per-blob detail is capped: it is evidence, not
+        // instruction, and a path with forty revisions would bury the procedure
+        // below it under forty lines nobody reads.
         for exposure in &self.leaked {
             writeln!(
                 f,
@@ -327,11 +427,18 @@ impl Report {
                 show(&exposure.path),
                 exposure.sightings.len()
             )?;
-            for sighting in &exposure.sightings {
+            for sighting in exposure.sightings.iter().take(MAX_SIGHTINGS) {
                 writeln!(
                     f,
                     "      blob {} in commit {}",
                     sighting.blob, sighting.commit
+                )?;
+            }
+            if exposure.sightings.len() > MAX_SIGHTINGS {
+                writeln!(
+                    f,
+                    "      … and {} more",
+                    exposure.sightings.len() - MAX_SIGHTINGS
                 )?;
             }
         }
@@ -347,22 +454,42 @@ impl Report {
             "\n  1. ROTATE THE SECRET. This is the only step that actually revokes \
              the exposure, and it is worth doing even if you do nothing else."
         )?;
-        writeln!(
-            f,
-            "  2. Re-stage the current content so future commits are encrypted:\n\
-             \x20      git-xcrypt status --fix"
-        )?;
+        if self.fix_requested && self.in_the_clear.is_empty() {
+            writeln!(
+                f,
+                "  2. Already done: the current content is re-staged, so future \
+                 commits are encrypted."
+            )?;
+        } else {
+            writeln!(
+                f,
+                "  2. Re-stage the current content so future commits are encrypted:\n\
+                 \x20      git-xcrypt status --fix"
+            )?;
+        }
         writeln!(
             f,
             "  3. Only then, and only if you also want the old blobs gone, rewrite \
              history with the external git-filter-repo. git-xcrypt does not rewrite \
              history and will not pretend to:"
         )?;
-        write!(f, "\x20      git filter-repo --invert-paths")?;
-        for exposure in &self.leaked {
-            write!(f, " --path {}", shell_quoted(&exposure.path))?;
+        // One `--path` each is fine for a handful and unusable for hundreds, so
+        // past a point the command switches to the form git-filter-repo provides
+        // for exactly this.
+        if self.leaked.len() > MAX_LISTED {
+            writeln!(
+                f,
+                "\x20      # {} paths — put them in a file, one per line, then:\n\
+                 \x20      git filter-repo --invert-paths --paths-from-file leaked.txt",
+                self.leaked.len()
+            )?;
+        } else {
+            write!(f, "\x20      git filter-repo --invert-paths")?;
+            for exposure in &self.leaked {
+                write!(f, " --path {}", shell_quoted(&exposure.path))?;
+            }
+            writeln!(f)?;
         }
-        writeln!(f)?;
         writeln!(
             f,
             "     That deletes the file from every commit. To keep the file and drop \
@@ -402,6 +529,7 @@ impl Report {
 pub fn run(repo: &Repo, fix: bool) -> Result<Report> {
     let mut report = Report {
         has_key: repo.has_key(),
+        fix_requested: fix,
         ..Report::default()
     };
 
@@ -428,11 +556,47 @@ pub fn run(repo: &Repo, fix: bool) -> Result<Report> {
         }
     }
 
-    if !gitattributes::catch_all_present(&repo.attributes_path())? {
+    // The `?` would surface an unreadable `.gitattributes` as `Error::Io`, which
+    // the frozen table gives code 1 — the same code a typo produces, and not
+    // what this function's own contract promises. It is a state conflict.
+    let catch_all = gitattributes::catch_all_present(&repo.attributes_path()).map_err(|err| {
+        crate::Error::Config(format!(
+            "{} could not be read ({err}), so whether git filters this repository \
+             at all cannot be determined",
+            repo.attributes_path().display()
+        ))
+    })?;
+    if !catch_all {
         report.setup.push(SetupGap::CatchAllMissing);
     }
 
     report.notes.extend(diff_driver_note(repo, &config));
+    // Git takes the last matching attribute line, so one below the managed
+    // section can turn the filter off for paths this tool believes it protects.
+    // Named, not resolved — see `gitattributes::foreign_filter_lines`.
+    let foreign = gitattributes::foreign_filter_lines(&repo.attributes_path()).unwrap_or_default();
+    if !foreign.is_empty() {
+        report.notes.push(format!(
+            "{} carries {} line(s) of its own that set or unset `filter`, and git \
+             takes the LAST match — so any declared path they reach is not \
+             filtered by git-xcrypt, whatever this report says about it. Check \
+             with `git check-attr filter -- <path>`:\n    {}",
+            crate::repo::ATTRIBUTES_FILE,
+            foreign.len(),
+            foreign.join("\n    ")
+        ));
+    }
+    if !report.has_key {
+        // Otherwise a locked repository and a healthy one render identically,
+        // and "no findings" reads as "everything is fine here" to someone who
+        // has just lost the ability to read any of it.
+        report.notes.push(
+            "there is no key in this repository, so nothing here can be decrypted. \
+             That is the expected state after `lock` and in a fresh clone; \
+             `git-xcrypt unlock <key-file>` opens it."
+                .into(),
+        );
+    }
 
     let declarations = Config::load(&repo.xcrypt_config_path())?;
     if declarations.missing {
@@ -448,6 +612,7 @@ pub fn run(repo: &Repo, fix: bool) -> Result<Report> {
         return Ok(report);
     }
     report.warnings.extend(declarations.pointless_eol.clone());
+    report.notes.extend(stale_section_note(repo, &declarations));
 
     let hash = gitindex::object_hash(gitconfig::get(&config, "extensions.objectformat").as_deref());
     let objects = history::objects(repo.common_dir(), hash)?;
@@ -463,12 +628,25 @@ pub fn run(repo: &Repo, fix: bool) -> Result<Report> {
         repo.common_dir(),
         hash,
         &declarations,
+        is_partial_clone(&config),
     )?;
+    report.scan_ran = true;
     report.scanned = Scanned {
         commits: scan.commits,
         blobs: scan.blobs,
     };
     report.warnings.extend(scan.warnings);
+    if scan.partial {
+        // The twin of the shallow case, and it was making the same mistake:
+        // a promisor object is absent by design, so reporting it as unreadable
+        // sent the user to `git fsck`, which exits 0 here and finds nothing.
+        report.undetermined.push(
+            "this is a partial clone, so some objects were never downloaded and \
+             could not be judged. `git fetch --refetch --filter=blob:none` or a \
+             full clone brings them down; `git fsck` will not report them missing."
+                .into(),
+        );
+    }
     if scan.shallow {
         // Named before the object count, and separately: a shallow clone is not
         // a damaged one, and telling a user to run `git fsck` over a graft point
@@ -500,15 +678,42 @@ pub fn run(repo: &Repo, fix: bool) -> Result<Report> {
                 .into(),
         );
     } else if scan.unresolved_refs > 0 {
+        // Named, not counted. "1 reference(s) could not be resolved" in a CI log
+        // gives an operator nothing to act on.
+        let mut named = scan.unresolved_names.join(", ");
+        if scan.unresolved_refs > scan.unresolved_names.len() {
+            named.push_str(", …");
+        }
         report.undetermined.push(format!(
             "{} reference(s) could not be resolved, so whatever is reachable only \
-             through them was not scanned.",
+             through them was not scanned: {named}",
             scan.unresolved_refs
         ));
     }
+    report.notes.extend(scan.notes);
     report.leaked = scan.exposed;
 
     Ok(report)
+}
+
+/// Whether this repository fetches objects lazily.
+///
+/// Git marks a partial clone with `remote.<name>.promisor` and
+/// `extensions.partialclone`; either is enough to know an absent object is a
+/// design decision rather than damage.
+fn is_partial_clone(config: &gix_config::File) -> bool {
+    if gitconfig::get(config, "extensions.partialclone").is_some() {
+        return true;
+    }
+    config
+        .sections_by_name("remote")
+        .into_iter()
+        .flatten()
+        .any(|section| {
+            section
+                .value("promisor")
+                .is_some_and(|value| gitconfig::is_true(&value.to_string()))
+        })
 }
 
 /// Reads what the index would have the next commit store.
@@ -541,6 +746,34 @@ fn inspect_index(
         }
     };
 
+    // `init` creates these two and does not commit them. A repository where
+    // they were never staged looks perfectly configured from inside and
+    // publishes nothing that enforces anything — the clone finds out, the
+    // machine that pushed does not. Both are checked against the index rather
+    // than the disk, because being on disk is exactly what is not in question.
+    //
+    // Only once something else is tracked, though. Between `git init` and the
+    // first `git add` everything is untracked, and complaining then is a
+    // complaint about a repository that has not published anything yet.
+    if !entries.is_empty() {
+        let mut tracked_bootstrap = [false, false];
+        for entry in &entries {
+            if entry.path == crate::repo::ATTRIBUTES_FILE.as_bytes() {
+                tracked_bootstrap[0] = true;
+            } else if entry.path == crate::repo::CONFIG_FILE.as_bytes() {
+                tracked_bootstrap[1] = true;
+            }
+        }
+        for (present, name) in tracked_bootstrap
+            .iter()
+            .zip([crate::repo::ATTRIBUTES_FILE, crate::repo::CONFIG_FILE])
+        {
+            if !present {
+                report.setup.push(SetupGap::Untracked(name.to_string()));
+            }
+        }
+    }
+
     for entry in entries {
         // A symbolic link and a submodule gitlink are not file content, so git
         // never filters them and no declaration could have applied. Measured on
@@ -548,7 +781,11 @@ fn inspect_index(
         // clear", `--fix` followed it, encrypted the file it pointed at — one
         // no pattern selected — and left a symlink whose target was the first
         // NUL of a ciphertext. `history::walk_tree` had the check all along.
-        if !entry.is_regular_file() {
+        // A `git add -N` placeholder is the third case: mode 100644 and the
+        // empty blob, so it reads as content in the clear — and repointing it
+        // announced a repair the next commit did not make, because git still
+        // treats the path as unstaged.
+        if !entry.holds_content() {
             continue;
         }
         let gitindex::Tracked { path: name, id, .. } = entry;
@@ -618,19 +855,24 @@ fn restage(
     // this command that needs a key, and propagating the error here would throw
     // away the setup findings and the whole history scan — leaving a user who
     // typed one flag too many with less information than if they had not.
+    // Every failure here, not only a missing key: an unreadable or corrupt key
+    // file used to propagate and throw away the setup findings and the whole
+    // history scan, which is the same loss the missing-key case was fixed for.
     let key = match repo.load_key() {
         Ok(key) => key,
-        Err(crate::Error::NoKey) => {
+        Err(err) => {
+            let what = match err {
+                crate::Error::NoKey => "there is none here".to_string(),
+                other => format!("it could not be read ({other})"),
+            };
             report.undetermined.push(format!(
-                "--fix needs the repository key in order to re-encrypt, and there \
-                 is none here, so nothing was re-staged. Run \
-                 `git-xcrypt unlock <key-file>` first. The {} path(s) below are \
-                 still stored in the clear.",
+                "--fix needs the repository key in order to re-encrypt, and {what}, \
+                 so nothing was re-staged. `git-xcrypt unlock <key-file>` puts one \
+                 in place. The {} path(s) reported below are still in the clear.",
                 report.in_the_clear.len()
             ));
             return Ok(());
         }
-        Err(err) => return Err(err),
     };
     let loose = gix_odb::loose::Store::at(
         repo.common_dir().join("objects"),
@@ -658,8 +900,30 @@ fn restage(
             }
         };
 
-        let outcome = crate::decide::clean(Some(&key), declarations, &name, &content)
-            .map_err(|err| named(&name, err))?;
+        // One file this build cannot clean — ciphertext under a key this
+        // repository does not hold, a truncated header — must not take the
+        // report with it. Propagating here printed nothing at all and exited 4
+        // over a run that had already established two secrets sitting in
+        // history in the clear, so the gate read "the tool broke" and lost every
+        // finding. The two failures either side of this one were already handled
+        // this way; this one was the odd case out.
+        let outcome = match crate::decide::clean(Some(&key), declarations, &name, &content) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                report.warnings.push(format!(
+                    "{}: not re-staged ({}). The index still holds it in the clear.",
+                    show(&name),
+                    named(&name, err)
+                ));
+                kept.push(name);
+                continue;
+            }
+        };
+        if let Some(warning) = outcome.warning {
+            // The filter prints this; the second implementation of the check-in
+            // path must not be the one that swallows it.
+            report.warnings.push(warning);
+        }
         match loose.write_buf(gix_object::Kind::Blob, &outcome.content) {
             Ok(id) => updates.push((name, id.as_slice().to_vec())),
             Err(err) => {
@@ -749,6 +1013,29 @@ fn named(name: &[u8], err: crate::Error) -> crate::Error {
     }
 }
 
+/// Mentions a `.gitattributes` section that no longer matches `.git-xcrypt`.
+///
+/// A note, never a gap: the cosmetic lines are `sync`'s job and letting them go
+/// stale never stores a secret in the clear. But `sync --check` exits 1 on this
+/// state while `status` exited 0 and said nothing, and the two commands
+/// disagreeing about the same repository is its own kind of wrong — the more so
+/// because a clone of it runs `unlock`, which rewrites the section and leaves
+/// `git status` dirty, against the founding document's own acceptance criterion.
+fn stale_section_note(repo: &Repo, declarations: &Config) -> Option<String> {
+    let lines = gitattributes::render_lines(declarations);
+    let (existing, desired) = gitattributes::desired(&repo.attributes_path(), &lines).ok()?;
+    (existing != desired).then(|| {
+        format!(
+            "{} no longer matches {} — the per-pattern lines are out of date. \
+             Nothing is stored in the clear over this, but a clone's `unlock` \
+             will rewrite them and leave `git status` dirty. `git-xcrypt sync` \
+             settles it.",
+            crate::repo::ATTRIBUTES_FILE,
+            crate::repo::CONFIG_FILE
+        )
+    })
+}
+
 /// Mentions an absent diff driver, without letting it fail the gate.
 ///
 /// Deliberately outside [`gitattributes::driver_keys`] and outside the exit
@@ -794,13 +1081,45 @@ mod tests {
         dir
     }
 
-    /// A repository set up by `init`, with `secrets/` declared.
+    /// A repository set up by `init`, with `secrets/` declared and committed.
+    ///
+    /// The two bootstrap files are staged, because a repository that never
+    /// committed them is genuinely misconfigured — a clone would get neither —
+    /// and `status` now says so. They go in through `hash-object` rather than
+    /// `git add`, because `init` registered the *test harness* as the filter and
+    /// git cannot run it; what lands is what a real `git add` would store, since
+    /// neither file is ever encrypted.
     fn prepared() -> (TempDir, Repo) {
         let dir = init_repo();
         let repo = Repo::discover(dir.path()).expect("discovery");
         super::super::init::run(&repo).expect("init must succeed");
         fs::write(repo.xcrypt_config_path(), "secrets/\n").expect("declarations");
+        stage_unfiltered(&dir, crate::repo::ATTRIBUTES_FILE);
+        stage_unfiltered(&dir, crate::repo::CONFIG_FILE);
         (dir, repo)
+    }
+
+    /// Stages `relative` exactly as it is on disk, bypassing the filter.
+    fn stage_unfiltered(dir: &TempDir, relative: &str) {
+        let hashed = Command::new("git")
+            .args(["hash-object", "-w", "--no-filters", "--", relative])
+            .current_dir(dir.path())
+            .output()
+            .expect("git must be on PATH");
+        assert!(hashed.status.success(), "git hash-object failed");
+        let oid = String::from_utf8(hashed.stdout).expect("git printed a hash");
+        let ok = Command::new("git")
+            .args([
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("100644,{},{relative}", oid.trim()),
+            ])
+            .current_dir(dir.path())
+            .status()
+            .expect("git must be on PATH")
+            .success();
+        assert!(ok, "git update-index failed for {relative}");
     }
 
     #[test]
@@ -966,7 +1285,16 @@ mod tests {
         let report = run(&repo, false).expect("status must succeed");
 
         assert!(report.setup.is_empty(), "{:?}", report.setup);
-        assert!(report.notes.is_empty(), "{:?}", report.notes);
+        assert!(
+            !report.notes.iter().any(|note| note.contains("textconv")),
+            "a deliberate deregistration was reported as a gap: {:?}",
+            report.notes
+        );
+        assert!(
+            report.notes.iter().any(|note| note.contains("no key")),
+            "a locked repository must say so rather than read as a healthy one: {:?}",
+            report.notes
+        );
     }
 
     #[test]
@@ -980,6 +1308,10 @@ mod tests {
         let report = run(&repo, false).expect("status must succeed");
 
         assert!(!report.exposed(), "a cosmetic gap must not fail the gate");
-        assert_eq!(report.notes.len(), 1, "{:?}", report.notes);
+        assert!(
+            report.notes.iter().any(|note| note.contains("textconv")),
+            "{:?}",
+            report.notes
+        );
     }
 }

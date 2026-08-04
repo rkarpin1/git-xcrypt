@@ -105,9 +105,22 @@ pub struct Scan {
     /// clean, exit code 0. A warning on `stderr` is not enough: a CI gate reads
     /// the code.
     pub unresolved_refs: usize,
+    /// Names of the references the walk could not start from, capped.
+    ///
+    /// The count alone reaches `stdout` as "1 reference(s) could not be
+    /// resolved", which tells an operator reading a CI log nothing they can act
+    /// on. The names are what turn it into an instruction.
+    pub unresolved_names: Vec<String>,
     /// The reference store could not be enumerated at all, so nothing here
     /// covers anything.
     pub refs_unavailable: bool,
+    /// This repository fetches objects lazily, so some were never downloaded.
+    ///
+    /// The twin of [`Scan::shallow`], and it was making the same mistake: a
+    /// promisor object is absent by design, and reporting it as unreadable sent
+    /// the user to `git fsck`, which exits 0 on a partial clone and reports
+    /// nothing at all.
+    pub partial: bool,
     /// This is a shallow clone, so history stops at the graft points.
     ///
     /// Reported rather than treated as corruption. A shallow clone is an
@@ -118,6 +131,9 @@ pub struct Scan {
     /// stands, because a history that was never fetched genuinely cannot be
     /// vouched for; only the explanation was wrong.
     pub shallow: bool,
+    /// Things worth stating that are not findings — a reference deliberately
+    /// not walked, a file under `refs/` that git ignores too.
+    pub notes: Vec<String>,
     /// Anything worth saying once, carried out so the binary owns the messages.
     pub warnings: Vec<String>,
 }
@@ -144,11 +160,13 @@ pub fn scan(
     common_dir: &Path,
     hash: gix_hash::Kind,
     config: &Config,
+    partial: bool,
 ) -> Result<Scan> {
     let mut scan = Scan::default();
     let tips = tips(git_dir, common_dir, hash, objects, &mut scan);
     let grafts = grafts(git_dir, common_dir);
     scan.shallow = !grafts.is_empty();
+    scan.partial = partial;
 
     let mut queue: Vec<ObjectId> = tips;
     let mut seen_commits: HashSet<ObjectId> = HashSet::new();
@@ -480,18 +498,20 @@ fn tips(
             // would then report nothing wrong.
             Ok(id) => match objects.try_header(&id) {
                 Ok(Some(header)) if header.kind == gix_object::Kind::Commit => tips.push(id),
-                Ok(Some(_)) => {}
+                // A tag on a tree or a blob names no history, so there is
+                // nothing here to scan — but silence would make "nothing found"
+                // and "nothing looked at" identical, which is the one thing this
+                // module refuses to do.
+                Ok(Some(header)) => scan.notes.push(format!(
+                    "{name} points at a {} and was not walked",
+                    header.kind
+                )),
                 Ok(None) | Err(_) => {
-                    scan.unresolved_refs += 1;
-                    scan.warnings
-                        .push(format!("{name}: not scanned, {id} could not be read"));
+                    note_unresolved(scan, &name, &format!("{id} could not be read"));
                 }
             },
             Err(err) => {
-                scan.unresolved_refs += 1;
-                scan.warnings.push(format!(
-                    "{name}: not scanned, it could not be resolved ({err})"
-                ));
+                note_unresolved(scan, &name, &format!("it could not be resolved ({err})"));
             }
         }
     };
@@ -502,11 +522,16 @@ fn tips(
                 for reference in references {
                     match reference {
                         Ok(reference) => push(reference, scan),
-                        Err(err) => {
-                            scan.unresolved_refs += 1;
-                            scan.warnings
-                                .push(format!("a reference could not be read ({err})"));
-                        }
+                        // Git prints `warning: ignoring broken ref` and carries
+                        // on for a file under `refs/` that is not a reference —
+                        // crash residue, a stray `notes.txt`. Such a file names
+                        // no history, so nothing goes unscanned because of it,
+                        // and failing the gate over one was a false alarm on a
+                        // state git itself shrugs at. A reference that *is* one
+                        // and will not resolve is caught when it is peeled.
+                        Err(err) => scan
+                            .notes
+                            .push(format!("a file under refs/ is not a reference ({err})")),
                     }
                 }
             }
@@ -530,11 +555,10 @@ fn tips(
         Ok(Some(head)) => push(head, scan),
         // An unborn branch: a fresh repository with no commit yet.
         Ok(None) => {}
-        Err(err) => {
-            scan.refs_unavailable = true;
-            scan.warnings
-                .push(format!("HEAD could not be read ({err})"));
-        }
+        // One reference, not the store: everything under `refs/` was still
+        // enumerated, so claiming "no history was scanned at all" would
+        // contradict the commit count printed three lines later.
+        Err(err) => note_unresolved(scan, "HEAD", &format!("it could not be read ({err})")),
     }
 
     tips.sort();
@@ -641,6 +665,19 @@ fn is_clear(objects: &gix_odb::Handle, id: &ObjectId, scan: &mut Scan) -> Option
     }
 }
 
+/// Records a reference the walk could not start from.
+///
+/// Budgeted like the objects, and separately from them: a repository with a
+/// thousand broken references would otherwise flood `stderr`, and before the
+/// budgets were split the references consumed the objects' allowance.
+fn note_unresolved(scan: &mut Scan, name: &str, why: &str) {
+    scan.unresolved_refs += 1;
+    if scan.unresolved_refs <= MAX_UNREADABLE_WARNINGS {
+        scan.unresolved_names.push(name.to_string());
+        scan.warnings.push(format!("{name}: not scanned, {why}"));
+    }
+}
+
 /// Records an object the scan could not judge.
 ///
 /// The budget counts the messages this function has produced, not the whole
@@ -707,8 +744,15 @@ mod tests {
             let git_dir = self.dir.path().join(".git");
             let objects = super::objects(&git_dir, gix_hash::Kind::Sha1)
                 .expect("the object database must open");
-            super::scan(&objects, &git_dir, &git_dir, gix_hash::Kind::Sha1, &config)
-                .expect("the scan must succeed")
+            super::scan(
+                &objects,
+                &git_dir,
+                &git_dir,
+                gix_hash::Kind::Sha1,
+                &config,
+                false,
+            )
+            .expect("the scan must succeed")
         }
     }
 
