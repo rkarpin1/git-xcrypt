@@ -18,6 +18,18 @@
 //! tracked path's *cleaned* content, and encryption is deterministic, so hashing
 //! what the clean path would produce and comparing is exact.
 //!
+//! **Paths are matched as raw bytes, and callers supply them from `read_dir`.**
+//! On a case-insensitive filesystem (`core.ignorecase`, the default on macOS and
+//! Windows) and under `core.precomposeunicode`, the same file has two spellings:
+//! git keeps the one it was added under, the directory keeps the one on disk.
+//! Measured on git 2.55/APFS — a file added as `secret.env` and renamed to
+//! `SECRET.env` reads as untracked here, and an NFD name on disk does not match
+//! the NFC name in the index. The consequences are on the safe side for `lock`,
+//! which then refuses rather than proceeds, and both callers now notice when a
+//! name they know is tracked does not match. It is the same underlying gap as
+//! the `core.ignorecase` question recorded against `S-02`, and closing it is a
+//! decision about what a *pattern* means, not one this module can take.
+//!
 //! Measured on git 2.55, in a clone unlocked with the right key:
 //!
 //! ```text
@@ -213,6 +225,11 @@ pub fn staged_ids(index_path: &Path, hash: gix_hash::Kind, paths: &[Vec<u8>]) ->
         },
     );
 
+    // `found` is published only on a complete walk. `visit` runs per entry, so a
+    // walk that gives up half way has already filled part of it — and a partial
+    // answer here would be a truthful-looking `Some(id)` beside a `None` that
+    // only means "the parse stopped before reaching it", which is the value that
+    // decides whether `lock` deletes a file.
     match walked {
         None => Ok(Staged::Unavailable("its entries did not parse".into())),
         Some(true) => Ok(Staged::Unavailable(
@@ -343,6 +360,12 @@ struct Entry<'a> {
 }
 
 /// Finds the entries the caller asked about, if the whole index parses.
+///
+/// No stage filter, unlike [`staged_ids`], and the asymmetry is deliberate: this
+/// one only zeroes a cached `stat`, and a conflicted entry carries a zeroed one
+/// already, so clearing it changes nothing git will act on. Verified against git
+/// 2.55 on a conflicted index in versions 2, 3 and 4 — the merge still resolved.
+/// The only visible effect is that [`Outcome::Cleared`] counts the extra stages.
 fn scan(
     body: &[u8],
     version: u32,

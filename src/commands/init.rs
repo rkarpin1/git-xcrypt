@@ -201,6 +201,51 @@ pub(crate) fn register_driver(repo: &Repo) -> Result<bool> {
     Ok(changed)
 }
 
+/// Registers only what is missing, and never repoints a working driver.
+///
+/// For `lock`, which is the one command after which the user has no key left to
+/// run `unlock` again — and `init` deliberately refuses in a repository that
+/// carries traces but no key, so there is no second repair either. Measured:
+/// [`register_driver`] rewrites `process` to whatever binary is running, so
+/// locking with a copy under `target/debug`, in `~/Downloads` or on a container
+/// mount repointed a working registration at a path that then disappeared, and
+/// left a repository in which every `git add` aborts and nothing can fix it.
+///
+/// So an existing `process` value is left exactly as it is, whatever it names.
+/// `required` is still set whenever it is not already `true`: that flag is what
+/// turns a failing filter into an aborted operation instead of a stored
+/// plaintext, and setting it can only ever refuse more.
+///
+/// # Errors
+///
+/// [`Error::Config`] when `.git/config` cannot be read or written.
+pub(crate) fn register_driver_if_absent(repo: &Repo) -> Result<bool> {
+    let path = repo.config_path();
+    let mut config = gitconfig::open_local(&path)?;
+
+    let mut changed = false;
+    let process = format!("filter.{DRIVER}.process");
+    if gitconfig::get(&config, &process).is_none_or(|value| value.trim().is_empty()) {
+        gitconfig::set(
+            &mut config,
+            &process,
+            &format!("{} process", current_executable()?),
+        )?;
+        changed = true;
+    }
+
+    let required = format!("filter.{DRIVER}.required");
+    if gitconfig::get(&config, &required).as_deref() != Some("true") {
+        gitconfig::set(&mut config, &required, "true")?;
+        changed = true;
+    }
+
+    if changed {
+        gitconfig::save_local(&path, &config)?;
+    }
+    Ok(changed)
+}
+
 /// Creates `.git-xcrypt` if it is absent, reporting whether it did.
 fn create_config_file(repo: &Repo) -> Result<bool> {
     let path = repo.xcrypt_config_path();

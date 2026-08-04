@@ -370,6 +370,91 @@ fn another_checkout_of_the_same_repository_stops_lock() {
 }
 
 #[test]
+fn a_checkout_whose_back_pointer_is_broken_still_stops_lock() {
+    // A worktree moved with `mv` rather than `git worktree move` is fully alive
+    // while its `gitdir` back-pointer names nothing. Measured before this: lock
+    // read that as a stale registration, deleted the key, and left the moved
+    // checkout holding plaintext it could no longer close.
+    let (repo, _outside, _key) = repository_with_secrets();
+    let linked = repo.add_worktree("side");
+    let moved = linked.path().with_file_name("side-moved");
+    fs::rename(linked.path(), &moved).expect("moving the checkout");
+
+    let output = repo.xcrypt(["lock", "--yes"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a live checkout was treated as a stale registration: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("worktree prune"),
+        "the message must name the way out: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(repo.path().join(".git/git-xcrypt/keys/default").exists());
+    assert_eq!(
+        fs::read(moved.join("secrets/db.env")).expect("reading"),
+        b"api_key = do-not-commit-me\n"
+    );
+}
+
+#[test]
+fn a_cosmetic_drift_in_gitattributes_does_not_dirty_the_tree() {
+    // `.git-xcrypt` is the source of truth and its `.gitattributes` lines are
+    // cosmetic, so drift is the documented normal state and `sync` is what
+    // resolves it. Rewriting the section here left `git status` dirty behind a
+    // command that reported success and had already deleted the key.
+    let (repo, _outside, _key) = repository_with_secrets();
+    repo.write_xcrypt_config("secrets/\n*.env\nsecrets/deploy.sh -text\n*.pem\n");
+    repo.commit_all("a pattern sync has not seen");
+    repo.assert_status_clean();
+
+    repo.xcrypt_ok(["lock", "--yes"]);
+
+    repo.assert_status_clean();
+}
+
+#[test]
+fn a_second_lock_after_an_interrupted_one_leaves_a_clean_tree() {
+    // The first run's files are already ciphertext, so the second skips them —
+    // and passing only the files it rewrote to the stat-cache patch left the
+    // first run's output reported as modified for good.
+    let (repo, _outside, _key) = repository_with_secrets();
+    // Make one file unwritable so the first run stops part way through.
+    let blocked = repo.path().join("secrets/sub");
+    fs::create_dir_all(&blocked).expect("directories");
+    repo.write_file("secrets/sub/late.env", b"token = second\n");
+    repo.commit_all("a second secret");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o555)).expect("chmod");
+
+        let first = repo.xcrypt(["lock", "--yes"]);
+        assert!(
+            !first.status.success(),
+            "the fixture did not interrupt lock"
+        );
+        assert!(
+            String::from_utf8_lossy(&first.stderr).contains("late.env"),
+            "the failure did not name the file: {}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        assert!(
+            repo.path().join(".git/git-xcrypt/keys/default").exists(),
+            "a part-way failure deleted the key"
+        );
+
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755)).expect("chmod");
+        repo.xcrypt_ok(["lock", "--yes"]);
+        repo.assert_status_clean();
+    }
+}
+
+#[test]
 fn a_tracked_file_shaped_like_our_residue_is_not_deleted() {
     // The sweep is a deletion list, so its false positives cost a user their
     // file. Residue of ours is never tracked; anything that is belongs to them.

@@ -235,6 +235,10 @@ impl<R: BufRead, W: Write> Confirm for Ask<R, W> {
         write!(self.output, "\nType `yes` to delete the key: ")?;
         self.output.flush()?;
 
+        // ASCII whitespace only: `str::trim` also strips U+00A0 and friends, and
+        // a non-breaking space is exactly the kind of thing a paste from a web
+        // page carries. `\u{a0}yes` reading as consent is not a risk this
+        // particular prompt should take.
         let mut answer = String::new();
         if self.input.read_line(&mut answer)? == 0 {
             // No newline was echoed, so the next line the user sees would run
@@ -242,7 +246,7 @@ impl<R: BufRead, W: Write> Confirm for Ask<R, W> {
             writeln!(self.output)?;
             return Ok(false);
         }
-        Ok(answer.trim() == "yes")
+        Ok(answer.trim_matches(|c: char| c.is_ascii_whitespace()) == "yes")
     }
 }
 
@@ -331,31 +335,59 @@ pub fn run(repo: &Repo, confirm: &mut dyn Confirm) -> Result<Outcome> {
         ));
     }
 
+    // Nothing above this line has touched anything, so an abort really did
+    // change nothing. From here on it has, which is why the last look at the
+    // working tree happens now: a declared file created while the prompt waited
+    // is not in the selection, and locking around it would delete the key over a
+    // plaintext secret nobody mentioned. Measured before this check: a file
+    // created 1.5 s into the prompt survived a successful lock, in the clear.
+    refuse_if_the_tree_moved(repo, &config, &selected, &residue)?;
+
     // The last command run before the key goes is the last chance to notice that
     // git has no filter behind the catch-all attribute — and a locked repository
     // needs it more than an unlocked one, because there the clean path is what
     // turns "no key" into a refused `git add` instead of a stored plaintext.
     // Measured on git 2.55: with either half missing, `git add` on a secret in a
     // locked repository exits 0 and stores the plaintext.
-    report.config_written = super::init::register_driver(repo)?;
-    report.attributes_written = crate::gitattributes::write_section(
-        &repo.attributes_path(),
-        &crate::gitattributes::render_lines(&config),
-    )?;
+    //
+    // Only what is *missing*, in both halves. The cosmetic lines are allowed to
+    // be out of date — `.git-xcrypt` is the source of truth and `sync` is what
+    // regenerates them — so rewriting the section here would leave `git status`
+    // dirty after a successful lock, disclosed to nobody and after the key was
+    // already gone.
+    report.config_written = super::init::register_driver_if_absent(repo)?;
+    report.attributes_written = write_catch_all_if_missing(repo, &config)?;
 
     // Before the encryption pass, so nothing we are about to write is mistaken
     // for residue, and so a leftover of a file we then encrypt cannot outlive
     // the command holding that file's plaintext.
     sweep(&residue, &mut report);
 
-    let rewritten = encrypt_in_place(&key, &config, &selected, &survey, hash, &mut report)
+    encrypt_in_place(&key, &config, &selected, &survey, hash, &mut report)
         .map_err(|err| interrupted(&report, err))?;
 
-    // Without this git compares the new size against the one it cached for the
-    // plaintext, concludes the file changed and never runs the filter to find
-    // out otherwise — `git status` would then report every locked secret as
-    // modified, for good. The mirror of what `unlock` does. See `crate::gitindex`.
-    match gitindex::forget_stat(&repo.git_dir().join("index"), hash, &rewritten)? {
+    // Every selected file, not only the ones this run rewrote. Git compares the
+    // new size against the one it cached for the plaintext, concludes the file
+    // changed and never runs the filter to find out otherwise — so `git status`
+    // reports every locked secret as modified, for good. Passing only the
+    // rewritten ones left a file encrypted by an *interrupted* earlier run
+    // permanently modified, because the second run skipped it as already closed.
+    // Measured. See `crate::gitindex`.
+    let names: Vec<Vec<u8>> = selected.iter().map(|file| file.name.clone()).collect();
+    match gitindex::forget_stat(&repo.git_dir().join("index"), hash, &names)? {
+        gitindex::Outcome::Cleared(cleared) if cleared < names.len() => {
+            // Every selected file was proved tracked by the survey, so a name
+            // the index did not match is a name spelled differently there than
+            // on disk — case folding on macOS and Windows, or NFD against NFC.
+            report.warnings.push(format!(
+                "{} of {} file(s) were not found in the index under the name they \
+                 have on disk, so their cached size was left alone. They are \
+                 encrypted correctly; if `git status` shows them as modified, \
+                 `git add --renormalize .` settles it.",
+                names.len() - cleared,
+                names.len()
+            ));
+        }
         gitindex::Outcome::Cleared(_) => {}
         gitindex::Outcome::Skipped(why) => report.warnings.push(why),
     }
@@ -380,37 +412,38 @@ pub fn run(repo: &Repo, confirm: &mut dyn Confirm) -> Result<Outcome> {
 /// Refusing rather than locking them all: each checkout has its own index, its
 /// own `HEAD` and possibly its own `.git-xcrypt`, so proving them clean means
 /// running this whole command per worktree, which the user can do.
+///
+/// **The registration directory is the evidence, not the checkout.** An earlier
+/// version asked whether the path in `worktrees/<name>/gitdir` still existed and
+/// treated a miss as a stale registration. Two measured ways that was wrong: the
+/// pointer is sometimes relative, so `exists()` answered against the process's
+/// current directory and the same command gave opposite answers from the
+/// repository root and from a subdirectory of it; and a checkout moved with `mv`
+/// rather than `git worktree move` is fully alive while its back-pointer names
+/// nothing. Both ended with the key deleted and a live checkout left in the
+/// clear. A registration git would really prune costs the user one
+/// `git worktree prune`, which the message names.
 fn refuse_other_worktrees(repo: &Repo) -> Result<()> {
     let mut others = Vec::new();
 
-    // Linked worktrees. `.git/worktrees/<name>/gitdir` names the `.git` file in
-    // the checkout; a registration whose target is gone is stale, and git would
-    // prune it, so it strands nothing.
-    if let Ok(entries) = fs::read_dir(repo.common_dir().join("worktrees")) {
-        for entry in entries.flatten() {
-            let git_dir = entry.path();
-            if same_path(&git_dir, repo.git_dir()) {
-                continue;
-            }
-            let Ok(text) = fs::read_to_string(git_dir.join("gitdir")) else {
-                continue;
-            };
-            let pointer = PathBuf::from(text.trim_end_matches(['\n', '\r']));
-            if !pointer.exists() {
-                continue;
-            }
-            others.push(pointer.parent().unwrap_or(&pointer).to_path_buf());
+    for entry in fs::read_dir(repo.common_dir().join("worktrees"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let registration = entry.path();
+        if same_path(&registration, repo.git_dir()) {
+            continue;
         }
+        others.push(describe_worktree(repo, &registration));
     }
 
     // And, when this *is* a linked worktree, the main checkout — which is not
     // listed anywhere under `worktrees/`.
     if !same_path(repo.git_dir(), repo.common_dir())
-        && repo.common_dir().file_name() == Some(std::ffi::OsStr::new(".git"))
-        && let Some(main) = repo.common_dir().parent()
-        && main.is_dir()
+        && let Some(main) = main_checkout(repo)
     {
-        others.push(main.to_path_buf());
+        others.push(main);
     }
 
     if others.is_empty() {
@@ -420,18 +453,151 @@ fn refuse_other_worktrees(repo: &Repo) -> Result<()> {
     others.sort();
     let list = others
         .iter()
-        .map(|path| format!("  {}", path.display()))
+        .map(|what| format!("  {what}"))
         .collect::<Vec<_>>()
         .join("\n");
     Err(Error::Config(format!(
-        "this repository has {} other checkout(s), and they all share the key lock \
+        "this repository has {} other checkout(s), and they all read the key lock \
          would delete:\n\
          {list}\n\
          Locking only this one would leave their files in the clear with no key left \
          to close them. Lock each checkout first, or remove it with \
-         `git worktree remove`. Nothing has been changed.",
+         `git worktree remove`; if one of them is already gone, `git worktree prune` \
+         clears the registration. Nothing has been changed.",
         others.len()
     )))
+}
+
+/// Refuses if the working tree stopped matching what was surveyed and agreed to.
+///
+/// The prompt is an unbounded human-scale wait. An edit to a file already in the
+/// selection is caught later, by the object id [`survey`] recorded; this catches
+/// the other half — a declared file that **appeared** or **vanished** meanwhile,
+/// which no per-file check can see because it was never in the list.
+fn refuse_if_the_tree_moved(
+    repo: &Repo,
+    config: &Config,
+    selected: &[Candidate],
+    residue: &[&Candidate],
+) -> Result<()> {
+    let mut walk = Walk::default();
+    let now = collect(repo, config, &mut walk)?;
+
+    let mut before: Vec<&[u8]> = selected
+        .iter()
+        .map(|file| file.name.as_slice())
+        .chain(residue.iter().map(|file| file.name.as_slice()))
+        .collect();
+    let mut after: Vec<&[u8]> = now
+        .selected
+        .iter()
+        .chain(&now.residue)
+        .map(|file| file.name.as_slice())
+        .collect();
+    before.sort_unstable();
+    after.sort_unstable();
+    after.dedup();
+
+    if before == after {
+        return Ok(());
+    }
+    Err(Error::Config(
+        "the set of declared files changed while lock was running, so what it \
+         checked is no longer what is here. Nothing has been changed and the key \
+         has been kept; run lock again."
+            .into(),
+    ))
+}
+
+/// Writes the managed section only when the catch-all line is missing entirely.
+///
+/// The line `* filter=git-xcrypt` is the one thing the whole guarantee hangs on,
+/// and git reads a missing attribute exactly as it reads a missing driver — as
+/// no filter. Everything else in the section is cosmetic and is `sync`'s job, so
+/// a section that is merely out of date is left alone: rewriting it would leave
+/// a modified `.gitattributes` behind a command that reported success and has
+/// already deleted the key.
+fn write_catch_all_if_missing(repo: &Repo, config: &Config) -> Result<bool> {
+    let path = repo.attributes_path();
+    let present = match crate::gitattributes::read(&path) {
+        Ok(text) => text
+            .lines()
+            .any(|line| line.trim_end() == crate::gitattributes::CATCH_ALL),
+        Err(Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(err) => return Err(err),
+    };
+    if present {
+        return Ok(false);
+    }
+    crate::gitattributes::write_section(&path, &crate::gitattributes::render_lines(config))
+}
+
+/// Names a linked checkout for the refusal, however little can be read.
+fn describe_worktree(repo: &Repo, registration: &Path) -> String {
+    let name = registration.file_name().map_or_else(
+        || registration.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+
+    // For the message only — never as evidence of whether the checkout is
+    // there. A relative pointer is resolved against the registration, which is
+    // where git measures it from, not against the process's current directory.
+    let Ok(text) = fs::read_to_string(registration.join("gitdir")) else {
+        return name;
+    };
+    let pointer = Path::new(text.trim_end_matches(['\n', '\r']));
+    if pointer.as_os_str().is_empty() {
+        return name;
+    }
+    let absolute = if pointer.is_absolute() {
+        pointer.to_path_buf()
+    } else {
+        crate::repo::lexically_normal(&registration.join(pointer))
+    };
+    let checkout = absolute.parent().unwrap_or(&absolute);
+    let _ = repo;
+    format!("{name} at {}", checkout.display())
+}
+
+/// Where the main checkout is, when this command runs in a linked one.
+///
+/// Not "the parent of the common directory": with `git init --separate-git-dir`
+/// the common directory is somewhere else entirely and is not called `.git`.
+/// Git finds the checkout through `core.worktree` in that case, so this does
+/// too. Measured before this: from a linked worktree of a separate-git-dir
+/// repository, `lock` deleted the key and left the main checkout not merely in
+/// the clear but unable to run `git status` at all, since `required = true` and
+/// no key makes every filter call fail.
+///
+/// When neither route answers, the checkout is reported as unknown rather than
+/// assumed absent — this function decides whether to refuse, and guessing "no
+/// checkout" is the guess that deletes the key.
+fn main_checkout(repo: &Repo) -> Option<String> {
+    let config = gitconfig::open_local(&repo.config_path()).ok()?;
+    if gitconfig::get(&config, "core.bare").as_deref() == Some("true") {
+        // A bare repository has no checkout of its own to strand.
+        return None;
+    }
+
+    if let Some(declared) = gitconfig::get(&config, "core.worktree")
+        && !declared.is_empty()
+    {
+        let path = Path::new(&declared);
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            crate::repo::lexically_normal(&repo.common_dir().join(path))
+        };
+        return Some(format!("the main checkout at {}", absolute.display()));
+    }
+
+    if repo.common_dir().file_name() == Some(std::ffi::OsStr::new(".git"))
+        && let Some(main) = repo.common_dir().parent()
+    {
+        return Some(format!("the main checkout at {}", main.display()));
+    }
+
+    Some("the main checkout, whose location this build could not determine".into())
 }
 
 /// Whether two paths name the same place, without insisting they exist.
@@ -739,7 +905,12 @@ fn refusal(unstored: &[(&Path, Unstored)]) -> Error {
             Unstored::InTheClear,
         ),
         (
-            "changed since they were last added — commit or stash them",
+            // `git add` leads, because it is the one remedy that works for all
+            // of them. `git add -N` records the empty blob, so a path that was
+            // only ever intent-to-add lands in this group and `git commit`
+            // refuses it outright — measured on git 2.55.
+            "changed since they were last added — `git add` them, then commit or \
+             stash",
             Unstored::Modified,
         ),
     ];
@@ -963,14 +1134,19 @@ fn remove_key(repo: &Repo, report: &mut Report) -> Result<()> {
 
 /// Puts a path in front of an error that only knew about content.
 ///
-/// The variant is preserved, so the exit code still says what kind of problem it
-/// was — a foreign `key_id` stays a format error and keeps code 4.
+/// The exit code is preserved throughout: a foreign `key_id` becomes a format
+/// error, which is the code [`Error::KeyMismatch`] reports anyway, and gains the
+/// file name its own message cannot carry — "this file was encrypted with key …"
+/// names no file. `NoKey` is passed through untouched, because it is about the
+/// repository rather than about any one path.
 fn named(relative: &Path, err: Error) -> Error {
     let at = relative.display();
     match err {
         Error::Format(message) => Error::Format(format!("{at}: {message}")),
         Error::Crypto(message) => Error::Crypto(format!("{at}: {message}")),
         Error::Config(message) => Error::Config(format!("{at}: {message}")),
+        Error::Io(err) => Error::Io(std::io::Error::other(format!("{at}: {err}"))),
+        mismatch @ Error::KeyMismatch { .. } => Error::Format(format!("{at}: {mismatch}")),
         other => other,
     }
 }
@@ -1241,6 +1417,90 @@ mod tests {
     }
 
     #[test]
+    fn a_declared_file_that_appears_while_the_prompt_waits_stops_the_run() {
+        // The other half of the same window. An edit to a file already surveyed
+        // is caught by its recorded object id; a file that was never in the list
+        // cannot be, and locking around it would delete the key over a plaintext
+        // secret nobody mentioned. Measured before this check: a file created
+        // 1.5 s into the prompt survived a successful lock, in the clear.
+        struct Meddling(PathBuf);
+        impl Confirm for Meddling {
+            fn confirm(&mut self, _warning: &Warning) -> Result<bool> {
+                fs::write(&self.0, b"brand new secret\n").expect("writing");
+                Ok(true)
+            }
+        }
+
+        let (dir, repo) = prepared();
+        write_and_stage(&repo, &dir, "secrets/db.env", b"hunter2\n");
+        let late = repo.work_tree().join("secrets").join("late.env");
+
+        let error = run(&repo, &mut Meddling(late.clone()))
+            .expect_err("a secret that appeared must not be locked around");
+
+        assert_eq!(error.exit_code(), crate::exit::CONFIG);
+        assert!(repo.has_key(), "the key went over a file nobody checked");
+        assert_eq!(
+            fs::read(&late).expect("reading"),
+            b"brand new secret\n",
+            "the new file was encrypted without ever being checked"
+        );
+        assert_eq!(
+            fs::read(repo.work_tree().join("secrets/db.env")).expect("reading"),
+            b"hunter2\n",
+            "the run wrote something despite refusing"
+        );
+    }
+
+    #[test]
+    fn a_working_registration_is_never_repointed_at_this_binary() {
+        // `lock` is the one command after which no key is left to run `unlock`
+        // again, and `init` refuses in a repository with traces and no key — so
+        // a registration rewritten to a path that later disappears leaves a
+        // repository nothing can repair. Measured: locking with a copy of the
+        // binary under another path used to move the driver there.
+        let (dir, repo) = prepared();
+        write_and_stage(&repo, &dir, "secrets/db.env", b"hunter2\n");
+        let theirs = "'/somewhere/else/git-xcrypt' process";
+        git(dir.path(), &["config", "filter.git-xcrypt.process", theirs]);
+
+        run(&repo, &mut Scripted::new(true)).expect("lock must succeed");
+
+        let config = crate::gitconfig::open_local(&repo.config_path()).expect("config");
+        assert_eq!(
+            crate::gitconfig::get(&config, "filter.git-xcrypt.process").as_deref(),
+            Some(theirs),
+            "lock repointed a working driver at itself"
+        );
+    }
+
+    #[test]
+    fn a_missing_registration_is_still_put_back() {
+        // The other side of the same rule: absent is not "working", and a
+        // locked repository with no driver stores plaintext on the next add.
+        let (dir, repo) = prepared();
+        write_and_stage(&repo, &dir, "secrets/db.env", b"hunter2\n");
+        git(
+            dir.path(),
+            &["config", "--remove-section", "filter.git-xcrypt"],
+        );
+
+        let outcome = run(&repo, &mut Scripted::new(true)).expect("lock must succeed");
+
+        let Outcome::Locked(report) = outcome else {
+            panic!("lock did not run");
+        };
+        assert!(report.config_written);
+        let config = crate::gitconfig::open_local(&repo.config_path()).expect("config");
+        assert!(crate::gitconfig::get(&config, "filter.git-xcrypt.process").is_some());
+        assert_eq!(
+            crate::gitconfig::get(&config, "filter.git-xcrypt.required").as_deref(),
+            Some("true"),
+            "without required = true a failing filter commits the plaintext"
+        );
+    }
+
+    #[test]
     fn a_refused_confirmation_changes_nothing_at_all() {
         let (dir, repo) = prepared();
         write_and_stage(&repo, &dir, "secrets/db.env", b"hunter2\n");
@@ -1476,11 +1736,16 @@ mod tests {
         for (answer, expected) in [
             ("yes\n", true),
             ("  yes  \n", true),
+            ("\tyes\r\n", true),
             ("y\n", false),
             ("YES\n", false),
             ("no\n", false),
+            ("yes no\n", false),
             ("\n", false),
             ("", false),
+            // `str::trim` strips this one, which would make a paste from a web
+            // page read as consent to delete the key.
+            ("\u{a0}yes\n", false),
         ] {
             let mut ask = Ask::new(answer.as_bytes(), Vec::new());
             assert_eq!(

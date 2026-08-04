@@ -37,7 +37,10 @@ const END: &str = "# <<< git-xcrypt <<<";
 ///
 /// Static by design: it names no pattern, so changing `.git-xcrypt` never makes
 /// it stale. The filter is invoked for every file and decides for itself.
-const CATCH_ALL: &str = "* filter=git-xcrypt";
+/// The one line the whole guarantee hangs on. Public so `lock` can check for
+/// it without guessing at its spelling: git reads a missing attribute exactly
+/// as it reads a missing driver, as no filter at all.
+pub const CATCH_ALL: &str = "* filter=git-xcrypt";
 
 /// Renders the per-pattern lines for `config`.
 ///
