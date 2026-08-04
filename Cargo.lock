@@ -409,10 +409,12 @@ name = "git-xcrypt"
 version = "0.1.0"
 dependencies = [
  "aes-siv",
+ "bstr",
  "clap",
  "getrandom 0.4.3",
  "gix-config",
  "gix-discover",
+ "gix-glob",
  "hkdf",
  "sha2",
  "tempfile",

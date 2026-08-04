@@ -532,20 +532,20 @@ Brak. Nic nie jest wydane, żadne istniejące repozytorium nie używa tego forma
 
 #### Automatyczne
 
-- [ ] 3.1 Test właściwości `passthrough(x) == x`
-- [ ] 3.2 `sekrety/` obejmuje `sekrety/a/b.txt`
-- [ ] 3.3 Negacja wyłącza plik z szyfrowania
-- [ ] 3.4 Szeroki wzorzec bez atrybutów nie kasuje wcześniejszej deklaracji
-- [ ] 3.5 Nieznany atrybut i atrybut przy negacji kończą się błędem
-- [ ] 3.6 Pliki bootstrapu nigdy nie są szyfrowane
-- [ ] 3.7 Heurystyka `text=auto` zgodna ze zmierzoną regułą gita
-- [ ] 3.8 `normalize_to_lf` idempotentna, samotny `CR` nietknięty
-- [ ] 3.9 Ponowne szyfrowanie własnego ciphertextu zwraca go bez zmian
-- [ ] 3.10 Ciphertext z obcym `key_id` na ścieżce clean daje błąd `4`
+- [x] 3.1 Test właściwości `passthrough(x) == x`
+- [x] 3.2 `sekrety/` obejmuje `sekrety/a/b.txt`
+- [x] 3.3 Negacja wyłącza plik z szyfrowania
+- [x] 3.4 Szeroki wzorzec bez atrybutów nie kasuje wcześniejszej deklaracji
+- [x] 3.5 Nieznany atrybut i atrybut przy negacji kończą się błędem
+- [x] 3.6 Pliki bootstrapu nigdy nie są szyfrowane
+- [x] 3.7 Heurystyka `text=auto` zgodna ze zmierzoną regułą gita
+- [x] 3.8 `normalize_to_lf` idempotentna, samotny `CR` nietknięty
+- [x] 3.9 Ponowne szyfrowanie własnego ciphertextu zwraca go bez zmian
+- [x] 3.10 Ciphertext z obcym `key_id` na ścieżce clean daje błąd `4`
 
 #### Ręczne
 
-- [ ] 3.11 Ostrzeżenie przy `eol=` na ścieżce `-text` jest zrozumiałe
+- [x] 3.11 Ostrzeżenie przy `eol=` na ścieżce `-text` jest zrozumiałe
 
 ### Faza 4: Filtr długożyjący i usunięcie placeholdera
 

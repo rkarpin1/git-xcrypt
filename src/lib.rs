@@ -12,7 +12,10 @@ use std::io::{Read, Write};
 use thiserror::Error;
 
 pub mod commands;
+pub mod config;
 pub mod crypto;
+pub mod decide;
+pub mod eol;
 pub mod exit;
 pub mod format;
 pub mod gitattributes;
