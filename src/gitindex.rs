@@ -45,13 +45,18 @@
 //! once", so it has to go to the filesystem and compare content. Measured, same
 //! repository: after zeroing, refresh exits 0 and `git status` is clean.
 //!
-//! So this module edits four bytes per affected entry and nothing else. It does
-//! not rebuild the index: writing it out through a library would silently drop
-//! the extensions that library does not know how to write — the split-index
-//! link above all, whose loss is not a slow `git status` but a destroyed index.
-//! Patching in place preserves every byte we did not mean to change, and the
-//! trailing checksum is verified before the edit and recomputed after it, so a
-//! file that is not shaped the way we think is left alone rather than mangled.
+//! So this module patches bytes rather than rebuilding the index: writing it out
+//! through a library would silently drop the extensions that library does not
+//! know how to write — the split-index link above all, whose loss is not a slow
+//! `git status` but a destroyed index. Patching in place preserves every byte we
+//! did not mean to change, and the trailing checksum is verified before the edit
+//! and recomputed after it, so a file that is not shaped the way we think is
+//! left alone rather than mangled.
+//!
+//! [`forget_stat`] touches four bytes per affected entry. [`restage`] also
+//! replaces the object id, and therefore has to drop the `TREE` cache — see its
+//! own comment for the measured reason, which is a commit that quietly stored
+//! the plaintext again.
 
 use std::fs;
 use std::path::Path;
@@ -158,6 +163,147 @@ pub fn forget_stat(index_path: &Path, hash: gix_hash::Kind, paths: &[Vec<u8>]) -
     Ok(Outcome::Cleared(scan.size_fields.len()))
 }
 
+/// Points index entries at different blobs, and forgets their cached size.
+///
+/// This is what `status --fix` is: git's own `git add` on a path whose staged
+/// content is plain text, done without spawning git. The blob has to exist in
+/// the object database already — the caller writes it — and this puts the index
+/// entry on it, so the next commit stores the ciphertext.
+///
+/// The stat cache is cleared in the same pass, and not as a nicety: with the
+/// old size still recorded, git compares it against the working-tree file,
+/// concludes the content changed and never runs the clean filter to find out
+/// otherwise. See this module's opening comment.
+///
+/// Stage 0 only. A path in the middle of a merge has no settled content, and
+/// rewriting one side of a conflict to point at a blob nobody asked for would be
+/// the worst kind of help.
+///
+/// # Errors
+///
+/// [`Error::Io`] when the index cannot be read or replaced. [`Error::Config`]
+/// when an object id is not the length this repository's hash produces —
+/// writing a short id into an entry would corrupt every entry after it.
+pub fn restage(
+    index_path: &Path,
+    hash: gix_hash::Kind,
+    updates: &[(Vec<u8>, Vec<u8>)],
+) -> Result<Outcome> {
+    let hash_len = hash.len_in_bytes();
+    if updates.is_empty() {
+        return Ok(Outcome::Cleared(0));
+    }
+    for (path, id) in updates {
+        if id.len() != hash_len {
+            return Err(Error::Config(format!(
+                "{}: the new object id is {} bytes, but this repository's index \
+                 stores {hash_len}; the index was left alone",
+                String::from_utf8_lossy(path),
+                id.len()
+            )));
+        }
+    }
+
+    // Lock first, then read: the same order git uses, and for the same reason —
+    // a `git add` in another terminal between our read and our write would be
+    // silently reverted by a stale buffer, taking its staged changes with it.
+    let Some(lock) = Lock::acquire(index_path)? else {
+        return Ok(Outcome::Skipped(format!(
+            "{}.lock is held by another git process, so nothing was re-staged. \
+             Try again, or run `git add` on the reported paths yourself.",
+            index_path.display()
+        )));
+    };
+
+    let data = match fs::read(index_path) {
+        Ok(data) => data,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Outcome::Skipped(format!(
+                "{} does not exist, so there is nothing staged to re-stage",
+                index_path.display()
+            )));
+        }
+        Err(err) => return Err(Error::Io(err)),
+    };
+
+    let Index {
+        mut data,
+        body_len,
+        version,
+        count,
+        skip_hash,
+    } = match inspect(data, hash) {
+        Ok(index) => index,
+        Err(why) => return Ok(skipped(index_path, &why)),
+    };
+
+    let mut edits: Vec<(usize, &[u8])> = Vec::new();
+    let walked = walk(&data[..body_len], version, count, hash_len, &mut |entry| {
+        if entry.stage != 0 {
+            return;
+        }
+        if let Some((_, id)) = updates.iter().find(|(path, _)| path == entry.name) {
+            edits.push((entry.start, id.as_slice()));
+        }
+    });
+
+    let layout = match walked {
+        None => return Ok(skipped(index_path, "its entries did not parse")),
+        Some(walked) if walked.split_index => {
+            return Ok(skipped(
+                index_path,
+                "this repository uses a split index, whose entries live in a shared \
+                 file this build does not patch",
+            ));
+        }
+        Some(walked) => walked,
+    };
+    if edits.is_empty() {
+        return Ok(Outcome::Cleared(0));
+    }
+
+    let count = edits.len();
+    for (start, id) in edits {
+        data[start + ID_FIELD..start + ID_FIELD + hash_len].copy_from_slice(id);
+        data[start + SIZE_FIELD..start + SIZE_FIELD + 4].fill(0);
+    }
+
+    // **The cache tree has to go, and this is not housekeeping.** `TREE` caches
+    // the tree object each directory would write to, and git trusts it: measured
+    // on git 2.55, an index whose entry was repointed at a new blob while `TREE`
+    // still named the old directory tree left `git diff-index --cached HEAD`
+    // reporting *no change at all*, and the next `git commit` wrote the stale
+    // tree — so the plaintext went back into the object database from a command
+    // that had just reported it fixed. `git add` avoids this by invalidating the
+    // path's ancestors; dropping the extension is the same thing with a wider
+    // brush, and costs one rebuild on the next commit.
+    //
+    // `EOIE` goes with it because it carries a hash over the extension headers,
+    // which removing one invalidates. Everything else is kept: `IEOT` indexes
+    // the *entries*, whose lengths are unchanged, and `REUC`, `UNTR` and the
+    // fsmonitor state describe things this edit did not touch.
+    let mut rebuilt = data[..layout.extensions_at].to_vec();
+    for extension in &layout.extensions {
+        if matches!(&extension.signature, b"TREE" | b"EOIE") {
+            continue;
+        }
+        rebuilt.extend_from_slice(&data[extension.start..extension.end]);
+    }
+
+    if skip_hash {
+        rebuilt.extend_from_slice(&vec![0u8; hash_len]);
+    } else {
+        let Some(digest) = checksum(&rebuilt, hash) else {
+            return Ok(skipped(index_path, "its checksum could not be computed"));
+        };
+        rebuilt.extend_from_slice(&digest);
+    }
+    debug_assert!(body_len >= layout.extensions_at);
+
+    lock.commit(&rebuilt)?;
+    Ok(Outcome::Cleared(count))
+}
+
 /// What the index says about a set of paths.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Staged {
@@ -232,12 +378,12 @@ pub fn staged_ids(index_path: &Path, hash: gix_hash::Kind, paths: &[Vec<u8>]) ->
     // decides whether `lock` deletes a file.
     match walked {
         None => Ok(Staged::Unavailable("its entries did not parse".into())),
-        Some(true) => Ok(Staged::Unavailable(
+        Some(walked) if walked.split_index => Ok(Staged::Unavailable(
             "this repository uses a split index, whose entries live in a shared \
              file this build does not read"
                 .into(),
         )),
-        Some(false) => Ok(Staged::Read(found)),
+        Some(_) => Ok(Staged::Read(found)),
     }
 }
 
@@ -300,12 +446,12 @@ pub fn list(index_path: &Path, hash: gix_hash::Kind) -> Result<Listed> {
     // rest, and here the omission would be a declared path reported as safe.
     match walked {
         None => Ok(Listed::Unavailable("its entries did not parse".into())),
-        Some(true) => Ok(Listed::Unavailable(
+        Some(walked) if walked.split_index => Ok(Listed::Unavailable(
             "this repository uses a split index, whose entries live in a shared \
              file this build does not read"
                 .into(),
         )),
-        Some(false) => Ok(Listed::Read(entries)),
+        Some(_) => Ok(Listed::Read(entries)),
     }
 }
 
@@ -442,7 +588,7 @@ fn scan(
     paths: &[Vec<u8>],
 ) -> Option<Scan> {
     let mut fields = Vec::new();
-    let split_index = walk(body, version, count, hash_len, &mut |entry| {
+    let walked = walk(body, version, count, hash_len, &mut |entry| {
         if paths.iter().any(|path| path.as_slice() == entry.name) {
             fields.push(entry.start + SIZE_FIELD);
         }
@@ -450,7 +596,7 @@ fn scan(
 
     Some(Scan {
         size_fields: fields,
-        split_index,
+        split_index: walked.split_index,
     })
 }
 
@@ -460,8 +606,10 @@ fn scan(
 /// a misread from turning into a patched byte in the wrong place. The extension
 /// walk is not only there to spot a split index: it has to consume the file to
 /// its last byte, which is what proves the entry walk ended where it should
-/// rather than somewhere plausible. `true` means the index carries a `link`
-/// extension, so its entries live in a shared file this build does not open.
+/// rather than somewhere plausible. The extensions are located but not decoded,
+/// which is enough for the two questions callers have: whether a `link`
+/// extension makes this a split index, and which bytes an edit has to leave out
+/// when a cache it invalidates has to go.
 ///
 /// The entry layout is identical in every index version: `ctime` (8), `mtime`
 /// (8), `dev`, `ino`, `mode`, `uid`, `gid`, `size` (4 each), the object id, then
@@ -479,7 +627,7 @@ fn walk(
     count: usize,
     hash_len: usize,
     visit: &mut dyn FnMut(&Entry<'_>),
-) -> Option<bool> {
+) -> Option<Walked> {
     // Everything before the name: the stat block, the object id, the flags.
     let fixed = ID_FIELD + hash_len + 2;
 
@@ -550,14 +698,20 @@ fn walk(
     // back, until the data runs out. Walking it has to land exactly on the last
     // byte — anything else means the entry walk went wrong somewhere earlier and
     // the offsets above are not `size` fields at all.
-    let mut split_index = false;
+    let mut walked = Walked {
+        split_index: false,
+        extensions_at: cursor,
+        extensions: Vec::new(),
+    };
     while cursor < body.len() {
         let header_end = cursor.checked_add(8)?;
         if header_end > body.len() {
             return None;
         }
-        if &body[cursor..cursor + 4] == b"link" {
-            split_index = true;
+        let mut signature = [0u8; 4];
+        signature.copy_from_slice(&body[cursor..cursor + 4]);
+        if &signature == b"link" {
+            walked.split_index = true;
         }
         let length = u32::from_be_bytes([
             body[cursor + 4],
@@ -565,13 +719,36 @@ fn walk(
             body[cursor + 6],
             body[cursor + 7],
         ]) as usize;
+        let start = cursor;
         cursor = header_end.checked_add(length)?;
         if cursor > body.len() {
             return None;
         }
+        walked.extensions.push(Extension {
+            signature,
+            start,
+            end: cursor,
+        });
     }
 
-    Some(split_index)
+    Some(walked)
+}
+
+/// What one pass over the whole index learned about its layout.
+struct Walked {
+    /// The index carries a `link` extension, so its entries are elsewhere.
+    split_index: bool,
+    /// Where the entries stop and the extensions begin.
+    extensions_at: usize,
+    /// Every extension, in file order.
+    extensions: Vec<Extension>,
+}
+
+/// One extension, located rather than decoded.
+struct Extension {
+    signature: [u8; 4],
+    start: usize,
+    end: usize,
 }
 
 /// Git's variable-width integer, as version 4 uses it for the prefix length.
@@ -1055,6 +1232,149 @@ mod tests {
             .expect("reading must succeed");
 
         assert_eq!(staged, Staged::Read(vec![None]));
+    }
+
+    #[test]
+    fn every_index_version_survives_a_restage_and_git_commits_the_new_blob() {
+        // The property is not what the index says, it is what `git commit`
+        // writes. Measured before the cache tree was dropped: the entry pointed
+        // at the new blob, `git diff-index --cached HEAD` reported no change at
+        // all, and the commit wrote the stale tree — so the old content went
+        // straight back in from an operation that had reported success.
+        for version in [2u32, 3, 4] {
+            let dir = repo_with_index(version);
+            let replacement = Command::new("git")
+                .args(["hash-object", "-w", "--stdin"])
+                .current_dir(dir.path())
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .and_then(|mut child| {
+                    use std::io::Write as _;
+                    child
+                        .stdin
+                        .take()
+                        .expect("stdin")
+                        .write_all(b"replaced content\n")?;
+                    child.wait_with_output()
+                })
+                .expect("git must be on PATH");
+            let oid = String::from_utf8(replacement.stdout).expect("a hash");
+            let oid = oid.trim();
+            let raw: Vec<u8> = (0..oid.len() / 2)
+                .map(|at| u8::from_str_radix(&oid[at * 2..at * 2 + 2], 16).expect("hexadecimal"))
+                .collect();
+
+            let outcome = restage(
+                &index_of(&dir),
+                gix_hash::Kind::Sha1,
+                &[(b"deep/nested/b.txt".to_vec(), raw)],
+            )
+            .expect("re-staging must succeed");
+
+            assert_eq!(
+                outcome,
+                Outcome::Cleared(1),
+                "index version {version} was not patched"
+            );
+            assert_eq!(
+                git_staged_id(&dir, "deep/nested/b.txt"),
+                oid,
+                "index version {version}: the entry was not repointed"
+            );
+            assert_eq!(
+                git_staged_id(&dir, "a.txt").len(),
+                40,
+                "index version {version}: an untargeted entry was damaged"
+            );
+
+            let committed = Command::new("git")
+                .args(["commit", "-q", "-m", "restaged"])
+                .current_dir(dir.path())
+                .output()
+                .expect("git must be on PATH");
+            assert!(
+                committed.status.success(),
+                "index version {version}: git refused the patched index: {}",
+                String::from_utf8_lossy(&committed.stderr)
+            );
+            let stored = Command::new("git")
+                .args(["cat-file", "blob", "HEAD:deep/nested/b.txt"])
+                .current_dir(dir.path())
+                .output()
+                .expect("git must be on PATH");
+            assert_eq!(
+                stored.stdout, b"replaced content\n",
+                "index version {version}: the commit stored the stale tree"
+            );
+            // Git still accepts the index, and reports exactly the one real
+            // difference: this test writes no working-tree file, so that file
+            // now differs from what was committed. Anything else in the list
+            // would mean an entry we did not mean to touch was damaged.
+            assert_eq!(
+                git_status(&dir),
+                " M deep/nested/b.txt\n",
+                "index version {version}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_restage_of_a_path_that_is_not_there_changes_nothing() {
+        let dir = repo_with_index(2);
+        let before = fs::read(index_of(&dir)).expect("reading the index");
+
+        let outcome = restage(
+            &index_of(&dir),
+            gix_hash::Kind::Sha1,
+            &[(b"never-existed".to_vec(), vec![0u8; 20])],
+        )
+        .expect("re-staging must succeed");
+
+        assert_eq!(outcome, Outcome::Cleared(0));
+        assert_eq!(before, fs::read(index_of(&dir)).expect("reading the index"));
+    }
+
+    #[test]
+    fn an_object_id_of_the_wrong_length_is_refused_before_anything_is_written() {
+        // A short id written into an entry would shift every entry after it.
+        let dir = repo_with_index(2);
+        let before = fs::read(index_of(&dir)).expect("reading the index");
+
+        let error = restage(
+            &index_of(&dir),
+            gix_hash::Kind::Sha1,
+            &[(b"a.txt".to_vec(), vec![0u8; 8])],
+        )
+        .expect_err("a short object id must be refused");
+
+        assert_eq!(error.exit_code(), crate::exit::CONFIG);
+        assert_eq!(before, fs::read(index_of(&dir)).expect("reading the index"));
+    }
+
+    #[test]
+    fn a_restage_leaves_a_split_index_alone_and_says_so() {
+        let dir = repo_with_index(2);
+        let ok = Command::new("git")
+            .args(["update-index", "--split-index"])
+            .current_dir(dir.path())
+            .status()
+            .expect("git must be on PATH")
+            .success();
+        assert!(ok, "git could not split the index");
+
+        let outcome = restage(
+            &index_of(&dir),
+            gix_hash::Kind::Sha1,
+            &[(b"a.txt".to_vec(), vec![0u8; 20])],
+        )
+        .expect("a split index is not our failure");
+
+        match outcome {
+            Outcome::Skipped(message) => assert!(message.contains("split index"), "{message}"),
+            other => panic!("a split index must not be reported as done: {other:?}"),
+        }
+        assert_eq!(git_status(&dir), "", "the index was left unusable");
     }
 
     #[test]

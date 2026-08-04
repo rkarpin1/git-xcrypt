@@ -83,7 +83,16 @@ enum Command {
     /// Exits `5` on a finding, so it works as a CI gate. It answers "are my
     /// declarations enforced", not "are there secrets here": a file that never
     /// matched a pattern is invisible to it.
-    Status,
+    Status {
+        /// Re-stage declared files the index holds in the clear.
+        ///
+        /// What `git add` would do, through the filter, so the next commit
+        /// stores them encrypted. It touches the index and nothing else: the
+        /// working tree stays readable and no history is rewritten, so nothing
+        /// already committed in the clear is un-leaked by it.
+        #[arg(long)]
+        fix: bool,
+    },
 
     /// Serve git's long-running filter protocol. Registered by `init`.
     ///
@@ -125,7 +134,7 @@ fn main() -> ExitCode {
         Command::ImportKey { path } => report(run_import_key(&path)),
         Command::Unlock { key } => report(run_unlock(key.as_deref())),
         Command::Lock { yes } => run_lock(yes),
-        Command::Status => run_status(),
+        Command::Status { fix } => run_status(fix),
         Command::Process => report(commands::process::run()),
         Command::Diff { path } => report(run_diff(&path)),
     }
@@ -399,8 +408,8 @@ fn lock_and_describe(assume_yes: bool) -> Result<ExitCode> {
 /// `stdout` as file content, and a gate that has to be scraped off `stderr` is a
 /// gate nobody pipes. Diagnostics that are *about* the run rather than part of
 /// the answer still go to `stderr`.
-fn run_status() -> ExitCode {
-    match status_and_describe() {
+fn run_status(fix: bool) -> ExitCode {
+    match status_and_describe(fix) {
         Ok(code) => code,
         Err(err) => {
             eprintln!("git-xcrypt: {err}");
@@ -409,11 +418,11 @@ fn run_status() -> ExitCode {
     }
 }
 
-fn status_and_describe() -> Result<ExitCode> {
+fn status_and_describe(fix: bool) -> Result<ExitCode> {
     use std::io::Write as _;
 
     let repo = Repo::discover_from_cwd()?;
-    let report = commands::status::run(&repo)?;
+    let report = commands::status::run(&repo, fix)?;
 
     for warning in &report.warnings {
         eprintln!("git-xcrypt: {warning}");

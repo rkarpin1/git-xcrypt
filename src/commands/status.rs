@@ -20,6 +20,8 @@ use std::fmt;
 
 use crate::config::Config;
 use crate::repo::{DRIVER, Repo};
+use gix_object::Write as _;
+
 use crate::{Result, gitattributes, gitconfig, gitindex, history};
 
 /// One reason git would not be filtering this repository.
@@ -84,6 +86,12 @@ pub struct Report {
     /// Listed rather than left out: a hole a user wrote on purpose must not be
     /// invisible, or the declaration reads as covering more than it does.
     pub by_choice: Vec<Vec<u8>>,
+    /// Paths `--fix` re-staged through the filter.
+    ///
+    /// Named separately from [`Report::encrypted`] so the sentence that follows
+    /// them — that this changes the next commit and nothing about the past — has
+    /// something to attach to.
+    pub fixed: Vec<Vec<u8>>,
     /// Things this build could not determine, and why.
     ///
     /// These fail the gate. "I could not tell" reported as a pass is the one
@@ -158,6 +166,7 @@ impl fmt::Display for Report {
         }
 
         self.write_undetermined(f)?;
+        self.write_fixed(f)?;
         self.write_encrypted(f)?;
         self.write_in_the_clear(f)?;
         self.write_leaked(f)?;
@@ -193,6 +202,35 @@ impl Report {
             writeln!(f, "  - {reason}")?;
         }
         Ok(())
+    }
+
+    /// What `--fix` did, and — at least as important — what it did not.
+    ///
+    /// The closing sentence is the safeguard, not decoration. `--fix` repairs the
+    /// future and nothing else, and a user who reads "fixed" as "the secret is
+    /// safe now" has been actively misled by this command.
+    fn write_fixed(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.fixed.is_empty() {
+            return Ok(());
+        }
+        writeln!(
+            f,
+            "\nfixed: {} path(s) were re-staged through the filter, so the NEXT \
+             commit stores them encrypted.",
+            self.fixed.len()
+        )?;
+        for path in &self.fixed {
+            writeln!(f, "  {}", show(path))?;
+        }
+        writeln!(
+            f,
+            "\n  This changed the index and nothing else. NO HISTORY WAS REWRITTEN, \
+             and nothing was un-leaked: every plain-text version already committed \
+             is still in this repository and in every clone of it. If any of these \
+             files held a secret that has been pushed, rotate the secret — that is \
+             the only step that revokes it. The working tree is untouched, so your \
+             files are still readable; commit when ready."
+        )
     }
 
     /// The good case: declared and already stored as ciphertext.
@@ -329,7 +367,7 @@ impl Report {
 /// command whose whole job is to tell.
 ///
 /// [`Error::Config`]: crate::Error::Config
-pub fn run(repo: &Repo) -> Result<Report> {
+pub fn run(repo: &Repo, fix: bool) -> Result<Report> {
     let mut report = Report {
         has_key: repo.has_key(),
         ..Report::default()
@@ -383,6 +421,9 @@ pub fn run(repo: &Repo) -> Result<Report> {
     let objects = history::objects(repo.common_dir())?;
 
     inspect_index(repo, &declarations, &objects, hash, &mut report)?;
+    if fix {
+        restage(repo, &declarations, hash, &mut report)?;
+    }
 
     let scan = history::scan(
         &objects,
@@ -472,6 +513,124 @@ fn inspect_index(
     Ok(())
 }
 
+/// Re-stages every declared path the index holds in the clear.
+///
+/// This is `git add` on those paths, done without spawning git: the working-tree
+/// content goes through [`decide::clean`] — the very function git calls on the
+/// check-in path, so the bytes are the bytes a real `git add` would store — the
+/// resulting blob is written to the object database, and the index entry is
+/// pointed at it.
+///
+/// **The working tree is not touched.** Encrypting the files in place is what
+/// `lock` does, and doing it here would take a user's own secrets away from them
+/// in the name of a repair. What changes is what the *next commit* stores.
+///
+/// A path whose working-tree file is gone is left alone: there is nothing to
+/// clean, and inventing content for it would be worse than saying so.
+fn restage(
+    repo: &Repo,
+    declarations: &Config,
+    hash: gix_hash::Kind,
+    report: &mut Report,
+) -> Result<()> {
+    if report.in_the_clear.is_empty() {
+        return Ok(());
+    }
+
+    // Asked for only now, and reported as its own exit code: `--fix` re-encrypts,
+    // which is the one thing in this command that cannot be done without a key.
+    let key = repo.load_key()?;
+    let loose = gix_odb::loose::Store::at(
+        repo.common_dir().join("objects"),
+        gix_odb::loose::Options {
+            object_hash: hash,
+            ..gix_odb::loose::Options::default()
+        },
+    );
+
+    let mut updates: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut kept: Vec<Vec<u8>> = Vec::new();
+
+    for name in std::mem::take(&mut report.in_the_clear) {
+        let path = repo.work_tree().join(std::path::Path::new(&show(&name)));
+        let content = match std::fs::read(&path) {
+            Ok(content) => zeroize::Zeroizing::new(content),
+            Err(err) => {
+                report.warnings.push(format!(
+                    "{}: not re-staged, its working-tree file could not be read \
+                     ({err}). The index still holds it in the clear.",
+                    show(&name)
+                ));
+                kept.push(name);
+                continue;
+            }
+        };
+
+        let outcome = crate::decide::clean(Some(&key), declarations, &name, &content)
+            .map_err(|err| named(&name, err))?;
+        match loose.write_buf(gix_object::Kind::Blob, &outcome.content) {
+            Ok(id) => updates.push((name, id.as_slice().to_vec())),
+            Err(err) => {
+                report.warnings.push(format!(
+                    "{}: not re-staged, its encrypted form could not be written to \
+                     the object database ({err})",
+                    show(&name)
+                ));
+                kept.push(name);
+            }
+        }
+    }
+
+    match gitindex::restage(&repo.git_dir().join("index"), hash, &updates)? {
+        gitindex::Outcome::Cleared(count) if count == updates.len() => {
+            report.fixed = updates.into_iter().map(|(name, _)| name).collect();
+        }
+        // A short count means the index spells one of these paths differently
+        // than the directory does — case folding on macOS and Windows, NFD
+        // against NFC. Those entries were not touched, so they are still in the
+        // clear and must not be reported as fixed.
+        gitindex::Outcome::Cleared(count) => {
+            report.warnings.push(format!(
+                "{} of {} path(s) were not found in the index under the name they \
+                 have on disk, so they were left as they were. `git add` on them \
+                 by hand settles it.",
+                updates.len() - count,
+                updates.len()
+            ));
+            report.undetermined.push(
+                "some paths could not be re-staged, so this repository is not in \
+                 the state --fix reports"
+                    .into(),
+            );
+            report.fixed = updates.into_iter().map(|(name, _)| name).collect();
+            report.fixed.truncate(count);
+        }
+        gitindex::Outcome::Skipped(why) => {
+            report.warnings.push(why);
+            kept.extend(updates.into_iter().map(|(name, _)| name));
+        }
+    }
+
+    report.in_the_clear = kept;
+    report.in_the_clear.sort();
+    report.fixed.sort();
+    Ok(())
+}
+
+/// Puts a path in front of an error that only knew about content.
+fn named(name: &[u8], err: crate::Error) -> crate::Error {
+    use crate::Error;
+    let at = show(name);
+    match err {
+        Error::Format(message) => Error::Format(format!("{at}: {message}")),
+        Error::Crypto(message) => Error::Crypto(format!("{at}: {message}")),
+        Error::Config(message) => Error::Config(format!("{at}: {message}")),
+        Error::Io(err) => Error::Io(std::io::Error::other(format!("{at}: {err}"))),
+        mismatch @ Error::KeyMismatch { .. } => Error::Format(format!("{at}: {mismatch}")),
+        other => other,
+    }
+}
+
 /// Mentions an absent diff driver, without letting it fail the gate.
 ///
 /// Deliberately outside [`gitattributes::driver_keys`] and outside the exit
@@ -530,7 +689,7 @@ mod tests {
     fn a_repository_after_init_reports_a_complete_setup() {
         let (_dir, repo) = prepared();
 
-        let report = run(&repo).expect("status must succeed");
+        let report = run(&repo, false).expect("status must succeed");
 
         assert!(report.setup.is_empty(), "{:?}", report.setup);
         assert!(!report.exposed());
@@ -545,7 +704,7 @@ mod tests {
         let (_dir, repo) = prepared();
         fs::write(repo.config_path(), "[core]\n\tbare = false\n").expect("clobbering the config");
 
-        let report = run(&repo).expect("status must succeed");
+        let report = run(&repo, false).expect("status must succeed");
 
         assert!(report.exposed());
         assert!(
@@ -573,7 +732,7 @@ mod tests {
             .expect("setting");
         gitconfig::save_local(&path, &config).expect("saving");
 
-        let report = run(&repo).expect("status must succeed");
+        let report = run(&repo, false).expect("status must succeed");
 
         assert!(
             report
@@ -598,7 +757,7 @@ mod tests {
                 .expect("setting");
             gitconfig::save_local(&path, &config).expect("saving");
 
-            let report = run(&repo).expect("status must succeed");
+            let report = run(&repo, false).expect("status must succeed");
             assert!(
                 report.setup.is_empty(),
                 "`required = {spelling}` was read as false: {:?}",
@@ -612,7 +771,7 @@ mod tests {
         let (_dir, repo) = prepared();
         fs::write(repo.attributes_path(), "# nothing of ours\n").expect("writing");
 
-        let report = run(&repo).expect("status must succeed");
+        let report = run(&repo, false).expect("status must succeed");
 
         assert!(report.setup.contains(&SetupGap::CatchAllMissing));
     }
@@ -622,7 +781,7 @@ mod tests {
         let (_dir, repo) = prepared();
         fs::remove_file(repo.attributes_path()).expect("removing");
 
-        let report = run(&repo).expect("status must succeed");
+        let report = run(&repo, false).expect("status must succeed");
 
         assert!(report.setup.contains(&SetupGap::CatchAllMissing));
     }
@@ -635,7 +794,7 @@ mod tests {
         fs::remove_file(repo.key_path()).expect("removing the key");
         fs::write(repo.attributes_path(), "# nothing of ours\n").expect("writing");
 
-        let report = run(&repo).expect("status must succeed");
+        let report = run(&repo, false).expect("status must succeed");
         let text = report.to_string();
 
         assert!(text.contains("unlock"), "{text}");
@@ -653,7 +812,7 @@ mod tests {
         gitconfig::save_local(&path, &config).expect("saving");
         fs::remove_file(repo.key_path()).expect("removing the key");
 
-        let report = run(&repo).expect("status must succeed");
+        let report = run(&repo, false).expect("status must succeed");
 
         assert!(report.setup.is_empty(), "{:?}", report.setup);
         assert!(report.notes.is_empty(), "{:?}", report.notes);
@@ -667,7 +826,7 @@ mod tests {
         gitconfig::unset(&mut config, &format!("diff.{DRIVER}.textconv")).expect("unsetting");
         gitconfig::save_local(&path, &config).expect("saving");
 
-        let report = run(&repo).expect("status must succeed");
+        let report = run(&repo, false).expect("status must succeed");
 
         assert!(!report.exposed(), "a cosmetic gap must not fail the gate");
         assert_eq!(report.notes.len(), 1, "{:?}", report.notes);

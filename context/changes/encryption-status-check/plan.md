@@ -196,27 +196,27 @@ niezerowy. Sprawdzenie musi być tanie: pojedynczy odczyt, żadnego przejścia p
 
 #### Automatyczne
 
-- [x] 2.1 Sekret sprzed dopisania wzorca jest wykrywany
-- [x] 2.2 Sekret usunięty z `HEAD` nadal jest wykrywany
-- [x] 2.3 Repozytorium szyfrowane od początku daje kod `0`
-- [x] 2.4 Plik spoza wzorców nie jest raportowany
-- [x] 2.5 Negacje raportowane osobno, nie jako błąd
-- [x] 2.6 Raport zawiera zdanie o rotacji sekretu
-- [x] 2.7 `cargo clippy --all-targets -- -D warnings`
+- [x] 2.1 Sekret sprzed dopisania wzorca jest wykrywany — 2cf2ecd
+- [x] 2.2 Sekret usunięty z `HEAD` nadal jest wykrywany — 2cf2ecd
+- [x] 2.3 Repozytorium szyfrowane od początku daje kod `0` — 2cf2ecd
+- [x] 2.4 Plik spoza wzorców nie jest raportowany — 2cf2ecd
+- [x] 2.5 Negacje raportowane osobno, nie jako błąd — 2cf2ecd
+- [x] 2.6 Raport zawiera zdanie o rotacji sekretu — 2cf2ecd
+- [x] 2.7 `cargo clippy --all-targets -- -D warnings` — 2cf2ecd
 
 ### Faza 3: `--fix` i ostrzeżenie na ścieżce filtra
 
 #### Automatyczne
 
-- [ ] 3.1 `status --fix` szyfruje pliki leżące jawnie
-- [ ] 3.2 `--fix` nie zmienia historii i mówi o tym wprost
-- [ ] 3.3 Po `--fix` ekspozycja w historii nadal daje kod `5`
-- [ ] 3.4 Pierwszy `git add` pliku jawnego w `HEAD` wypisuje ostrzeżenie
-- [ ] 3.5 Ostrzeżenie nie przerywa `git add`
-- [ ] 3.6 Ostrzeżenie nie pojawia się dla pliku spoza `HEAD`
-- [ ] 3.7 `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`
+- [x] 3.1 `status --fix` szyfruje pliki leżące jawnie
+- [x] 3.2 `--fix` nie zmienia historii i mówi o tym wprost
+- [x] 3.3 Po `--fix` ekspozycja w historii nadal daje kod `5`
+- [x] 3.4 Pierwszy `git add` pliku jawnego w `HEAD` wypisuje ostrzeżenie
+- [x] 3.5 Ostrzeżenie nie przerywa `git add`
+- [x] 3.6 Ostrzeżenie nie pojawia się dla pliku spoza `HEAD`
+- [x] 3.7 `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`
 
 #### Ręczne
 
-- [ ] 3.8 Raport nie sugeruje, że po `--fix` sekret jest bezpieczny
-- [ ] 3.9 Ostrzeżenie filtra widoczne w oknie Git w IDE
+- [x] 3.8 Raport nie sugeruje, że po `--fix` sekret jest bezpieczny — zautomatyzowane testem `fix_says_it_changed_nothing_about_the_past`
+- [ ] 3.9 Ostrzeżenie filtra widoczne w oknie Git w IDE — **nierozstrzygnięte**: wymaga człowieka przy otwartym RustRoverze; nie da się sprawdzić automatycznie i nie zgadujemy

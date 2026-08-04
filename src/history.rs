@@ -190,6 +190,145 @@ pub fn stored_in_the_clear(objects: &gix_odb::Handle, id: &gix_hash::oid) -> Opt
     }
 }
 
+/// One cheap question, asked on the check-in path: is this path already in
+/// `HEAD` in the clear?
+///
+/// The founding document gives the filter this job because the filter is the one
+/// mechanism that runs whatever client is driving git. A `pre-commit` hook is
+/// bypassed by `--no-verify`, switched off by a checkbox in an IDE, and does not
+/// survive a clone; the attribute mechanism git enforces itself.
+///
+/// The constraint that shapes it is that this runs while `git add` waits. A full
+/// history scan here would stall every commit, so the question is deliberately
+/// the narrow one — one path, one tree chain, one blob — and the answer is only
+/// ever a message. **It must never make the filter exit non-zero.** With
+/// `required = true` a non-zero exit aborts the whole operation, and this is a
+/// warning about the past, not a reason to refuse the present.
+///
+/// Everything is resolved lazily and cached, so a repository where nothing is
+/// declared never opens the object database at all, and one where a hundred
+/// secrets live in the same directory reads that directory's tree once.
+pub struct HeadLookup {
+    objects: gix_odb::Handle,
+    /// The tree `HEAD` points at, resolved on the first question.
+    root: Option<ObjectId>,
+    /// Directory path to the tree it names, `None` where there is no such
+    /// directory in `HEAD`.
+    directories: HashMap<Vec<u8>, Option<ObjectId>>,
+}
+
+impl HeadLookup {
+    /// Prepares the lookup, or gives up quietly.
+    ///
+    /// `None` when there is nothing to look in — an unborn branch, an
+    /// unreadable object database. Quiet is right: this whole facility is an
+    /// extra, and a repository that cannot answer the question is not a
+    /// repository that should stop accepting commits over it.
+    #[must_use]
+    pub fn open(git_dir: &Path, common_dir: &Path, hash: gix_hash::Kind) -> Option<Self> {
+        let objects = objects(common_dir).ok()?;
+        let options = gix_ref::store::init::Options {
+            object_hash: hash,
+            ..gix_ref::store::init::Options::default()
+        };
+        let store = if git_dir == common_dir {
+            gix_ref::file::Store::at(git_dir.to_path_buf(), options)
+        } else {
+            gix_ref::file::Store::for_linked_worktree(
+                git_dir.to_path_buf(),
+                common_dir.to_path_buf(),
+                options,
+            )
+        };
+
+        let mut head = store.try_find("HEAD").ok().flatten()?;
+        let commit = head.peel_to_id(&store, &objects).ok()?;
+
+        let mut buffer = Vec::new();
+        let root = objects
+            .find_commit_iter(&commit, &mut buffer)
+            .ok()
+            .and_then(|mut iter| iter.tree_id().ok());
+
+        Some(Self {
+            objects,
+            root,
+            directories: HashMap::new(),
+        })
+    }
+
+    /// Whether `HEAD` holds `path` as content without our magic.
+    ///
+    /// False for anything it cannot answer, deliberately: a false negative here
+    /// costs a message, a false positive costs the user's trust in every message
+    /// this tool prints.
+    pub fn holds_in_the_clear(&mut self, path: &[u8]) -> bool {
+        let Some(root) = self.root else {
+            return false;
+        };
+
+        let (directory, filename) = match path.iter().rposition(|byte| *byte == b'/') {
+            Some(at) => (&path[..at], &path[at + 1..]),
+            None => (&path[..0], path),
+        };
+        let Some(tree) = self.directory(root, directory) else {
+            return false;
+        };
+
+        let mut buffer = Vec::new();
+        let Ok(entries) = self.objects.find_tree_iter(&tree, &mut buffer) else {
+            return false;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else { return false };
+            if entry.filename != filename {
+                continue;
+            }
+            if !entry.mode.is_blob() {
+                return false;
+            }
+            return stored_in_the_clear(&self.objects, entry.oid).unwrap_or(false);
+        }
+        false
+    }
+
+    /// The tree `directory` names under `root`, walking one component at a time.
+    fn directory(&mut self, root: ObjectId, directory: &[u8]) -> Option<ObjectId> {
+        if directory.is_empty() {
+            return Some(root);
+        }
+        if let Some(cached) = self.directories.get(directory) {
+            return *cached;
+        }
+
+        let mut current = root;
+        for component in directory.split(|byte| *byte == b'/') {
+            let mut buffer = Vec::new();
+            let Ok(entries) = self.objects.find_tree_iter(&current, &mut buffer) else {
+                self.directories.insert(directory.to_vec(), None);
+                return None;
+            };
+            let mut next = None;
+            for entry in entries.flatten() {
+                if entry.filename == component && entry.mode.is_tree() {
+                    next = Some(entry.oid.to_owned());
+                    break;
+                }
+            }
+            match next {
+                Some(id) => current = id,
+                None => {
+                    self.directories.insert(directory.to_vec(), None);
+                    return None;
+                }
+            }
+        }
+
+        self.directories.insert(directory.to_vec(), Some(current));
+        Some(current)
+    }
+}
+
 /// Turns the gathered sightings into a stable, sorted report.
 fn collect(found: HashMap<Vec<u8>, Vec<Sighting>>) -> Vec<Exposure> {
     let mut exposed: Vec<Exposure> = found

@@ -319,3 +319,179 @@ fn a_locked_repository_can_still_be_scanned() {
     assert_eq!(output.status.code(), Some(0), "{text}");
     assert!(text.contains("encrypted: 1 declared path"), "{text}");
 }
+
+/// A repository with `secrets/db.env` committed in the clear before anything
+/// declared it — the state `--fix` and the filter warning both exist for.
+fn leaked_before_the_declaration() -> TestRepo {
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("# nothing declared yet\n");
+    repo.write_file("secrets/db.env", b"hunter2\n");
+    repo.commit_all("before anyone declared anything");
+    repo.write_xcrypt_config("secrets/\n");
+    repo
+}
+
+#[test]
+fn fix_re_stages_the_declared_file_and_the_next_commit_stores_ciphertext() {
+    // The property that matters is not what the index says, it is what `git
+    // commit` writes. Measured before this worked: the index pointed at the new
+    // blob, `git diff-index --cached HEAD` reported no change at all, and the
+    // commit put the plaintext straight back — because the cache tree still
+    // named the old directory tree. `status --fix` reported success over it.
+    let repo = leaked_before_the_declaration();
+
+    let output = repo.xcrypt(["status", "--fix"]);
+    assert_eq!(output.status.code(), Some(EXPOSED), "{}", report(&output));
+
+    let staged =
+        String::from_utf8_lossy(&repo.git_ok(["status", "--porcelain"]).stdout).into_owned();
+    assert!(
+        staged.contains("M  secrets/db.env"),
+        "the re-stage did not reach the index:\n{staged}"
+    );
+
+    // The declaration itself changed in the fixture and has to travel with the
+    // commit, or the tree is left dirty for a reason that has nothing to do
+    // with the fix.
+    repo.git_ok(["add", ".git-xcrypt"]);
+    repo.git_ok(["commit", "-q", "-m", "after fix"]);
+    let blob = repo.blob_bytes("secrets/db.env");
+    assert!(
+        blob.starts_with(b"\0GITXCRYPT\0"),
+        "the commit stored {} bytes that are not ciphertext",
+        blob.len()
+    );
+    repo.assert_worktree_eq("secrets/db.env", b"hunter2\n");
+    repo.assert_status_clean();
+}
+
+#[test]
+fn fix_says_it_changed_nothing_about_the_past() {
+    let repo = leaked_before_the_declaration();
+
+    let text = report(&repo.xcrypt(["status", "--fix"]));
+
+    assert!(text.contains("NO HISTORY WAS REWRITTEN"), "{text}");
+    assert!(text.contains("nothing was un-leaked"), "{text}");
+    assert!(
+        text.contains("rotate the secret"),
+        "the only remedy that revokes anything must be named:\n{text}"
+    );
+}
+
+#[test]
+fn the_history_finding_survives_fix() {
+    // `--fix` repairs the future. Reporting the repository as clean afterwards
+    // would be the exact misreading the wording guards against, so the gate has
+    // to keep failing.
+    let repo = leaked_before_the_declaration();
+    repo.xcrypt(["status", "--fix"]);
+
+    let output = repo.xcrypt(["status"]);
+
+    assert_eq!(output.status.code(), Some(EXPOSED));
+    assert!(report(&output).contains("leaked in history"));
+}
+
+#[test]
+fn fix_leaves_the_working_tree_readable() {
+    // Encrypting in place is what `lock` does. Doing it here would take a user's
+    // own secrets away from them in the name of a repair.
+    let repo = leaked_before_the_declaration();
+    repo.write_file("secrets/other.env", b"second\n");
+    repo.git_ok(["add", "-A"]);
+
+    repo.xcrypt(["status", "--fix"]);
+
+    repo.assert_worktree_eq("secrets/db.env", b"hunter2\n");
+    repo.assert_worktree_eq("secrets/other.env", b"second\n");
+}
+
+#[test]
+fn fix_without_a_key_refuses_rather_than_pretending() {
+    // A locked repository, reached the only way this state is reachable here:
+    // `lock` itself refuses over a file stored in the clear, which is the very
+    // state under test.
+    let repo = leaked_before_the_declaration();
+    std::fs::remove_file(repo.path().join(".git/git-xcrypt/keys/default")).expect("removing");
+
+    let output = repo.xcrypt(["status", "--fix"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "a missing key has its own code:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn the_first_encryption_of_a_file_head_holds_in_the_clear_is_warned_about() {
+    let repo = leaked_before_the_declaration();
+
+    let output = repo.git(["add", "secrets/db.env"]);
+
+    assert!(
+        output.status.success(),
+        "the warning aborted `git add`: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("HEAD already holds it in the clear"),
+        "no warning on the check-in path:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("git-xcrypt status"),
+        "the warning must point at the command that explains it:\n{stderr}"
+    );
+}
+
+#[test]
+fn the_warning_does_not_stop_the_content_from_being_encrypted() {
+    // It is a warning, not a refusal. With `required = true` a non-zero exit
+    // would abort the whole operation.
+    let repo = leaked_before_the_declaration();
+
+    repo.commit_all("now encrypted");
+
+    let blob = repo.blob_bytes("secrets/db.env");
+    assert!(blob.starts_with(b"\0GITXCRYPT\0"), "{} bytes", blob.len());
+}
+
+#[test]
+fn a_file_that_is_not_in_head_is_encrypted_without_a_warning() {
+    // Every file in the repository goes through the filter, so a warning that is
+    // not gated is a warning nobody reads.
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.write_file("README.md", b"public\n");
+    repo.commit_all("start");
+    repo.write_file("secrets/fresh.env", b"brand new\n");
+
+    let output = repo.git(["add", "-A"]);
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("HEAD already holds"),
+        "a file that was never committed in the clear was reported as one:\n{stderr}"
+    );
+}
+
+#[test]
+fn one_git_command_warns_once_per_path() {
+    // Measured on git 2.55: a single `git status` cleans the same file four
+    // times. Four copies of a message teach a reader to skip it.
+    let repo = leaked_before_the_declaration();
+
+    let output = repo.git(["status", "--porcelain"]);
+
+    let warnings = String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .filter(|line| line.contains("HEAD already holds"))
+        .count();
+    assert_eq!(warnings, 1, "{}", String::from_utf8_lossy(&output.stderr));
+}

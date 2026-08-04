@@ -30,6 +30,31 @@ pub struct Context {
     key: Option<MasterKey>,
     autocrlf: Option<String>,
     core_eol: Option<String>,
+    /// Where to look for a path's earlier, plain-text self.
+    ///
+    /// `None` means "not tried yet"; `Some(None)` means "tried, nothing to look
+    /// in". Lazy on purpose: a repository that declares nothing must not pay for
+    /// opening the object database on every git operation, and the question is
+    /// only ever asked about a file that is actually being encrypted.
+    head: Option<Option<crate::history::HeadLookup>>,
+    /// What [`crate::history::HeadLookup::open`] needs, kept so it can be built
+    /// later.
+    location: Option<Location>,
+    /// Paths already warned about in this process.
+    ///
+    /// One process serves one git operation, and git cleans the same file
+    /// several times within one: measured on git 2.55, a single `git status`
+    /// filtered one path four times, so the un-deduplicated warning arrived four
+    /// times over. Four copies of a message teach a reader to skip it, which is
+    /// the opposite of what this one is for.
+    warned: std::collections::HashSet<Vec<u8>>,
+}
+
+/// Where this repository's objects and references live.
+struct Location {
+    git_dir: std::path::PathBuf,
+    common_dir: std::path::PathBuf,
+    hash: gix_hash::Kind,
 }
 
 impl Context {
@@ -67,7 +92,46 @@ impl Context {
             key,
             autocrlf: crate::gitconfig::get(&git_config, "core.autocrlf"),
             core_eol: crate::gitconfig::get(&git_config, "core.eol"),
+            head: None,
+            location: Some(Location {
+                git_dir: repo.git_dir().to_path_buf(),
+                common_dir: repo.common_dir().to_path_buf(),
+                hash: crate::gitindex::object_hash(
+                    crate::gitconfig::get(&git_config, "extensions.objectformat").as_deref(),
+                ),
+            }),
+            warned: std::collections::HashSet::new(),
         })
+    }
+
+    /// Whether `HEAD` already holds `path` in the clear.
+    ///
+    /// Built on first use and kept for the rest of the process, which is what the
+    /// long-running protocol makes worth doing: one `git add -A` asks this once
+    /// per newly encrypted file, over the same trees.
+    fn head_holds_in_the_clear(&mut self, path: &[u8]) -> bool {
+        if self.warned.contains(path) {
+            return false;
+        }
+        if self.head.is_none() {
+            let opened = self.location.as_ref().and_then(|location| {
+                crate::history::HeadLookup::open(
+                    &location.git_dir,
+                    &location.common_dir,
+                    location.hash,
+                )
+            });
+            self.head = Some(opened);
+        }
+        let found = self
+            .head
+            .as_mut()
+            .and_then(Option::as_mut)
+            .is_some_and(|head| head.holds_in_the_clear(path));
+        if found {
+            self.warned.insert(path.to_vec());
+        }
+        found
     }
 
     /// Looks for `.git-xcrypt` again if it was absent when the process started.
@@ -212,8 +276,21 @@ fn read_request(input: &mut impl Read) -> Result<Option<Request>> {
 
 /// Answers one request.
 fn serve(context: &mut Context, request: &Request, output: &mut impl Write) -> Result<()> {
+    let mut first_encryption = None;
     let outcome = match request.command.as_str() {
         "clean" => context.refresh_config_if_absent().and_then(|()| {
+            // Gated before anything is looked up. The catch-all attribute sends
+            // every file in the repository through here, so an ungated check
+            // would open the object database for a repository that encrypts
+            // nothing, and would ask about files no pattern selects — the same
+            // shape of mistake that once turned a 301-file checkout into 301
+            // warnings. Content that already carries our magic is not a first
+            // encryption either: that is a re-add of something already stored.
+            if context.config.decide(&request.pathname).encrypt
+                && !crate::format::looks_encrypted(&request.content)
+            {
+                first_encryption = Some(request.pathname.clone());
+            }
             decide::clean(
                 context.key.as_ref(),
                 &context.config,
@@ -242,6 +319,21 @@ fn serve(context: &mut Context, request: &Request, output: &mut impl Write) -> R
         Ok(outcome) => {
             if let Some(warning) = outcome.warning {
                 eprintln!("git-xcrypt: {warning}");
+            }
+            // After the encryption succeeded, and never as a reason to fail it.
+            // With `required = true` a non-zero exit would abort the whole
+            // operation, and this is news about the past, not a refusal of the
+            // present — so it is a line on `stderr` and nothing more.
+            if let Some(path) = first_encryption
+                && context.head_holds_in_the_clear(&path)
+            {
+                eprintln!(
+                    "git-xcrypt: {}: this is the first time it is being encrypted, \
+                     and HEAD already holds it in the clear. The plain text stays in \
+                     history; run `git-xcrypt status` to see what is exposed, and \
+                     rotate the secret if it was ever pushed.",
+                    path.as_bstr()
+                );
             }
             pktline::write_data(output, b"status=success\n")?;
             pktline::write_flush(output)?;
@@ -274,6 +366,12 @@ mod tests {
             key: Some(MasterKey::from_bytes([11u8; MASTER_KEY_LEN])),
             autocrlf: None,
             core_eol: None,
+            // No repository behind these unit tests, so there is nothing for the
+            // first-encryption warning to look in; `head_holds_in_the_clear`
+            // answers `false` and the protocol is exercised on its own.
+            head: Some(None),
+            location: None,
+            warned: std::collections::HashSet::new(),
         }
     }
 
@@ -359,6 +457,12 @@ mod tests {
             key: None,
             autocrlf: None,
             core_eol: None,
+            // No repository behind these unit tests, so there is nothing for the
+            // first-encryption warning to look in; `head_holds_in_the_clear`
+            // answers `false` and the protocol is exercised on its own.
+            head: Some(None),
+            location: None,
+            warned: std::collections::HashSet::new(),
         };
 
         let mut reply = Vec::new();
