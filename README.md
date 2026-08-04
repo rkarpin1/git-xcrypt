@@ -58,6 +58,49 @@ git-xcrypt unlock ~/git-xcrypt-my-project.key
 `git status` is clean immediately afterwards. That is the point of the
 deterministic cipher: unchanged files never look modified.
 
+## The key file is the only copy — back it up yourself
+
+**Read this before you commit anything you cannot afford to lose.**
+
+`git-xcrypt init` writes one 32-byte master key to
+`.git/git-xcrypt/keys/default`. `.git/` is not versioned, is not pushed, and is
+not part of any clone. Nothing in this tool copies that key anywhere, and
+**v0.1 has no backup mechanism at all** — that is a deliberate scope decision,
+not an oversight.
+
+So:
+
+- If the key file is lost, **every secret in the repository's entire history
+  becomes unreadable, permanently.** Not just the current files: every version
+  of every encrypted file in every commit, in every clone, forever. There is no
+  recovery procedure and there is no one to ask.
+- Losing it is easy. `rm -rf` on a working copy takes it. A reinstalled laptop
+  takes it. `git clone` of your own repository does **not** bring it back.
+  `git-xcrypt lock` deletes it on purpose, and `unlock` does not undo that.
+
+Make a copy the moment you run `init`:
+
+```sh
+git-xcrypt export-key ~/backup/git-xcrypt-my-project.key
+```
+
+The file is written with mode `0600`. Where it should **not** go:
+
+- **not inside the repository or any other checkout of it** — `export-key`
+  refuses those outright, because one `git add -A` would commit the key;
+- **not into the git directory** — also refused;
+- **not into a CI log, a terminal scrollback or a shell redirect.** The key is
+  never printed to `stdout`; keep it that way.
+
+Where it should go is somewhere that survives losing the machine and that you
+trust with a plaintext secret: a password manager, an encrypted backup volume,
+or an offline device. Treat it exactly as you would treat the secrets it opens —
+because anyone holding it can read all of them, in every commit.
+
+`git-xcrypt lock` asks for a typed `yes` and prints the `key_id` before deleting
+the key, and refuses outright when declared files have uncommitted changes.
+Those are speed bumps in front of the cliff. They are not a backup.
+
 ## Commands
 
 | Command | What it does |
@@ -65,7 +108,7 @@ deterministic cipher: unchanged files never look modified.
 | `init` | Generate the repository key, register the filter and the diff driver, create `.git-xcrypt`, write the managed `.gitattributes` section. |
 | `sync` | Regenerate the per-pattern `.gitattributes` lines. `--check` reports staleness through exit code 1 instead of writing. |
 | `status` | Report whether your declarations are actually enforced, scanning the whole reachable history. `--fix` re-stages declared files the index holds in the clear. Exits `5` on a finding, `6` when it could not tell. |
-| `export-key` | Write the repository key to a file outside the working tree. |
+| `export-key` | Write the repository key to a file outside the working tree. This is also how you make the backup nothing else makes — see above. |
 | `import-key` | Put a key carried from another machine into this repository. |
 | `unlock` | Decrypt the working tree and register the filter, importing a key file first if one is given. |
 | `lock` | Encrypt the working tree and delete the key. Interactive by default; `--yes` skips the question but not the refusal on uncommitted changes. |
@@ -174,6 +217,10 @@ note, not a finding.
 - A file with mixed line endings does not survive the round trip: normalisation
   is lossy, so such a file comes back changed. Git warns about the same thing
   through `core.safecrlf`; whether to reproduce that warning is still open.
+- **There is no key backup mechanism.** Keeping a copy of the key file is
+  entirely your job, and losing it costs the whole history of secrets. See "The
+  key file is the only copy" above; this is a decided scope boundary for v0.1,
+  not a gap waiting to be filled before release.
 - A repository encrypted with the original `git-crypt` is **not** supported and
   there is no migration path.
 
