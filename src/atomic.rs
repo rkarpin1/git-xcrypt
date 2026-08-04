@@ -202,18 +202,71 @@ const MARKER: &[u8] = b".git-xcrypt-";
 /// How many random bytes go into a temporary name.
 const RANDOM_LEN: usize = 8;
 
+/// The longest single name a filesystem will normally take, in bytes.
+///
+/// `NAME_MAX` is 255 on ext4, APFS, HFS+, XFS and NTFS alike. Nothing here reads
+/// the real limit — there is no portable way to — so this is the floor every
+/// target platform meets.
+const MAX_NAME: usize = 255;
+
 /// A sibling name no one can guess and therefore no one can pre-create.
+///
+/// The target's own name is **shortened when the suffix would not fit**. Git
+/// puts no such ceiling on a path: a file whose name is 224 bytes or longer
+/// commits and checks out perfectly, and before this the sibling name came to
+/// 256 bytes and `create_temporary` failed with `ENAMETOOLONG`. Measured, on a
+/// repository holding one such file: `lock` exited 1 saying "running lock again
+/// finishes the job", which was false — it failed identically for ever, so the
+/// repository could never be closed and the secret stayed in the clear.
+///
+/// The cost of shortening is that [`strip_temporary_suffix`] then reconstructs a
+/// *truncated* target, so residue left by a killed run on such a file may not be
+/// recognised as belonging to a declared path and may go unswept. That is the
+/// same outcome residue under an undeclared path already has, and it replaces a
+/// command that could not run at all.
 fn temporary_name(name: &std::ffi::OsStr) -> Result<OsString> {
     let mut random = [0u8; RANDOM_LEN];
     getrandom::fill(&mut random).map_err(|err| Error::Entropy(err.to_string()))?;
 
-    let mut temporary = name.to_os_string();
-    temporary.push(format!(
+    let suffix = format!(
         "{}{}.tmp",
         String::from_utf8_lossy(MARKER),
         crate::hex(&random)
-    ));
+    );
+
+    let mut temporary = shorten(name, MAX_NAME.saturating_sub(suffix.len()));
+    temporary.push(suffix);
     Ok(temporary)
+}
+
+/// `name`, cut down to at most `limit` bytes.
+///
+/// A file name is an arbitrary byte string on Unix, so the cut is by bytes and
+/// may land inside a multi-byte character — which is fine for a name nothing
+/// ever decodes. On other platforms the name goes through its lossy text form,
+/// which is what every other path in this crate does with a Windows name.
+fn shorten(name: &std::ffi::OsStr, limit: usize) -> OsString {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+        let bytes = name.as_bytes();
+        if bytes.len() <= limit {
+            return name.to_os_string();
+        }
+        OsString::from_vec(bytes[..limit].to_vec())
+    }
+    #[cfg(not(unix))]
+    {
+        let text = name.to_string_lossy();
+        if text.len() <= limit {
+            return name.to_os_string();
+        }
+        let mut cut = limit;
+        while cut > 0 && !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        OsString::from(&text[..cut])
+    }
 }
 
 /// The target a temporary file was named after, if `name` is one of ours.
@@ -263,6 +316,49 @@ mod tests {
         assert_eq!(
             fs::read(&path).expect("reading must succeed"),
             b"* filter=git-xcrypt\n"
+        );
+    }
+
+    #[test]
+    fn a_name_too_long_to_carry_the_suffix_is_still_written() {
+        // Git commits and checks out a 224-byte name without complaint, so a
+        // repository can hold one. Before the sibling name was shortened, the
+        // temporary came to 256 bytes and every write failed with
+        // `ENAMETOOLONG` — measured: `lock` exited 1 for ever on such a
+        // repository while telling the user to run it again, and `unlock` left
+        // the working tree half decrypted.
+        let dir = TempDir::new().expect("temporary directory");
+        for length in [200usize, 223, 224, 255] {
+            let path = dir.path().join("z".repeat(length));
+
+            write(&path, b"content\n")
+                .unwrap_or_else(|err| panic!("a {length}-byte name must be writable: {err}"));
+            write(&path, b"replaced\n").expect("and replaceable");
+
+            assert_eq!(
+                fs::read(&path).expect("reading must succeed"),
+                b"replaced\n"
+            );
+        }
+
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .expect("listing")
+            .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+            .filter(|name| {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::ffi::OsStrExt as _;
+                    strip_temporary_suffix(name.as_bytes()).is_some()
+                }
+                #[cfg(not(unix))]
+                {
+                    strip_temporary_suffix(name.to_string_lossy().as_bytes()).is_some()
+                }
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temporary files survived: {leftovers:?}"
         );
     }
 

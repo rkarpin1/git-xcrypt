@@ -139,6 +139,87 @@ impl Repo {
     pub fn relative<'a>(&self, path: &'a Path) -> Option<&'a Path> {
         path.strip_prefix(&self.work_tree).ok()
     }
+
+    /// Every checkout of this repository: this one, the main one, and every
+    /// linked worktree.
+    ///
+    /// [`Repo::work_tree`] answers for the checkout a command was run from, and
+    /// that is not the same question. A key written into a *sibling* checkout is
+    /// as committable as one written into this one — measured on git 2.55,
+    /// `export-key ../linked/k.key` from the main checkout put the key in the
+    /// linked worktree's `git status` as `?? k.key`, one `git add -A` from a
+    /// commit. `lock` already had to know this geometry to avoid stranding a
+    /// sibling; the refusal in `export-key` needs the same list.
+    ///
+    /// Best effort on the pointers, and that is the honest limit: a worktree
+    /// whose registration this cannot read is not in the list, so a caller uses
+    /// it to *widen* a refusal, never to prove a path is safe.
+    #[must_use]
+    pub fn work_trees(&self) -> Vec<PathBuf> {
+        let mut trees = vec![self.work_tree.clone()];
+
+        // `worktrees/<name>/gitdir` names the `.git` *file* in the checkout, so
+        // the checkout itself is its parent. A relative pointer is measured from
+        // the registration, which is where git measures it from.
+        for entry in std::fs::read_dir(self.common_dir.join("worktrees"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let registration = entry.path();
+            let Ok(text) = std::fs::read_to_string(registration.join("gitdir")) else {
+                continue;
+            };
+            let pointer = Path::new(text.trim_end_matches(['\n', '\r']));
+            if pointer.as_os_str().is_empty() {
+                continue;
+            }
+            let absolute = if pointer.is_absolute() {
+                pointer.to_path_buf()
+            } else {
+                lexically_normal(&registration.join(pointer))
+            };
+            if let Some(checkout) = absolute.parent() {
+                trees.push(checkout.to_path_buf());
+            }
+        }
+
+        if let Some(main) = self.main_work_tree() {
+            trees.push(main);
+        }
+        trees
+    }
+
+    /// Where the main checkout is, when this is a linked worktree.
+    ///
+    /// Not "the parent of the common directory": with `git init
+    /// --separate-git-dir` the common directory is somewhere else entirely and
+    /// is not called `.git`. Git finds the checkout through `core.worktree`
+    /// there, so this does too.
+    fn main_work_tree(&self) -> Option<PathBuf> {
+        let config = crate::gitconfig::open_local(&self.config_path()).ok()?;
+        if crate::gitconfig::get(&config, "core.bare")
+            .as_deref()
+            .is_some_and(crate::gitconfig::is_true)
+        {
+            return None;
+        }
+
+        if let Some(declared) = crate::gitconfig::get(&config, "core.worktree")
+            && !declared.is_empty()
+        {
+            let path = Path::new(&declared);
+            return Some(if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                lexically_normal(&self.common_dir.join(path))
+            });
+        }
+
+        (self.common_dir.file_name() == Some(std::ffi::OsStr::new(".git")))
+            .then(|| self.common_dir.parent().map(Path::to_path_buf))
+            .flatten()
+    }
 }
 
 /// The directory every worktree of this repository shares.

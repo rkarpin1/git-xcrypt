@@ -45,6 +45,19 @@
 //! * **[`HeadLookup`] resolves `HEAD` once per filter process.** A long-running
 //!   filter outlives a `git rebase` that moves it, so the warning can be judged
 //!   against the tree `HEAD` had at startup. It is advisory either way.
+//! * **The reflog and the other pseudo-references are out of scope.** Every
+//!   worktree's `HEAD` and `refs/` are walked, but not `ORIG_HEAD`,
+//!   `MERGE_HEAD`, `FETCH_HEAD` or `logs/`. So the canonical "oops": commit a
+//!   secret, `git reset --hard HEAD~1`, then declare the pattern — the blob
+//!   stays in the object database until `gc.reflogExpire` (90 days by default)
+//!   and this scan reports nothing. The boundary is deliberate: those objects
+//!   are local and no push carries them, so they are lost work rather than
+//!   published exposure. `git reflog expire --expire=now --all` followed by
+//!   `git gc --prune=now` clears them. The scan also says nothing about what a
+//!   *remote* already holds, which no local command can.
+//! * **A declared blob is decompressed whole to be judged.** Only 11 bytes are
+//!   needed, but the object database hands over the whole object, so one
+//!   multi-gigabyte declared blob in history is a whole-file allocation.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -451,6 +464,14 @@ fn collect(found: HashMap<Vec<u8>, Vec<Sighting>>) -> Vec<Exposure> {
 /// Failures are per reference: a repository with one broken tag still has a
 /// history worth scanning, and refusing the whole command over it would hide
 /// every finding in the rest.
+///
+/// **Every worktree's references, not only this one's.** A linked worktree has a
+/// `HEAD` and a private `refs/` of its own under `.git/worktrees/<name>/`, and
+/// git counts both as reachability: measured on git 2.55, a commit named only by
+/// a detached `worktrees/wt/HEAD` survived `git gc --prune=now`. Scanning only
+/// the store this command was run from reported `VERDICT: no findings` and exit
+/// `0` for a repository whose object database still held a declared path in the
+/// clear — naming the same commit with an ordinary branch flipped it to `5`.
 fn tips(
     git_dir: &Path,
     common_dir: &Path,
@@ -458,7 +479,7 @@ fn tips(
     objects: &gix_odb::Handle,
     scan: &mut Scan,
 ) -> Vec<ObjectId> {
-    let options = gix_ref::store::init::Options {
+    let options = || gix_ref::store::init::Options {
         object_hash: hash,
         ..gix_ref::store::init::Options::default()
     };
@@ -467,16 +488,54 @@ fn tips(
     // would leave every branch invisible and report a repository with plenty of
     // history as having none.
     let store = if git_dir == common_dir {
-        gix_ref::file::Store::at(git_dir.to_path_buf(), options)
+        gix_ref::file::Store::at(git_dir.to_path_buf(), options())
     } else {
         gix_ref::file::Store::for_linked_worktree(
             git_dir.to_path_buf(),
             common_dir.to_path_buf(),
-            options,
+            options(),
         )
     };
 
     let mut tips = Vec::new();
+    collect_tips(&store, objects, scan, &mut tips);
+
+    // The other checkouts. Their shared references are already in `tips`, so
+    // what this adds is each one's own `HEAD` and its worktree-private
+    // categories — `refs/bisect/*` above all, which is where a bisect in
+    // progress parks the commits it is testing.
+    for entry in std::fs::read_dir(common_dir.join("worktrees"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let registration = entry.path();
+        if registration == git_dir || !registration.join("HEAD").is_file() {
+            continue;
+        }
+        let other = gix_ref::file::Store::for_linked_worktree(
+            registration,
+            common_dir.to_path_buf(),
+            options(),
+        );
+        collect_tips(&other, objects, scan, &mut tips);
+    }
+
+    tips.sort();
+    tips.dedup();
+    tips
+}
+
+/// Adds every commit one reference store names to `tips`.
+///
+/// Split out so the same reading applies to this checkout's store and to every
+/// other worktree's, rather than the second being a second implementation.
+fn collect_tips(
+    store: &gix_ref::file::Store,
+    objects: &gix_odb::Handle,
+    scan: &mut Scan,
+    tips: &mut Vec<ObjectId>,
+) {
     let mut push = |mut reference: gix_ref::Reference, scan: &mut Scan| {
         let name = reference.name.as_bstr().to_string();
         // A symbolic reference whose target does not exist yet is an unborn
@@ -489,7 +548,7 @@ fn tips(
         {
             return;
         }
-        match reference.peel_to_id(&store, objects) {
+        match reference.peel_to_id(store, objects) {
             // A tag on a blob or a tree is a real thing — git.git carries
             // `junio-gpg-pub` — and it names no history at all. Queuing it would
             // make the commit walk fail to read a "commit" that was never one,
@@ -560,10 +619,6 @@ fn tips(
         // contradict the commit count printed three lines later.
         Err(err) => note_unresolved(scan, "HEAD", &format!("it could not be read ({err})")),
     }
-
-    tips.sort();
-    tips.dedup();
-    tips
 }
 
 /// Walks one tree, descending into subtrees and judging declared blobs.
@@ -848,6 +903,43 @@ mod tests {
         let scan = fixture.scan("secrets/\n");
 
         assert_eq!(paths(&scan), ["secrets/side.env"]);
+    }
+
+    #[test]
+    fn a_secret_named_only_by_another_worktrees_head_is_found() {
+        // A linked worktree's `HEAD` is reachability to git — measured on 2.55,
+        // a commit named only by `worktrees/wt/HEAD` survives
+        // `git gc --prune=now`. Before this, the scan opened only the store of
+        // the checkout it was run from, so the same repository reported
+        // `VERDICT: no findings` and exit 0 with the plaintext still in the
+        // object database.
+        let fixture = Fixture::new();
+        fixture.write("README.md", b"start\n");
+        fixture.commit("start");
+        fixture.git(&["checkout", "-q", "-b", "side"]);
+        fixture.write("secrets/parked.env", b"hunter2\n");
+        fixture.commit("on the side");
+        let head = fixture.git(&["rev-parse", "HEAD"]);
+        let head = String::from_utf8(head.stdout).expect("a hash");
+        let head = head.trim().to_string();
+        fixture.git(&["checkout", "-q", "main"]);
+
+        let elsewhere = tempfile::TempDir::new().expect("temporary directory");
+        let checkout = elsewhere.path().join("wt");
+        fixture.git(&[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            checkout.to_str().expect("a path"),
+            &head,
+        ]);
+        // The branch goes, so nothing under `refs/` names the commit any more.
+        fixture.git(&["branch", "-D", "side"]);
+
+        let scan = fixture.scan("secrets/\n");
+
+        assert_eq!(paths(&scan), ["secrets/parked.env"]);
     }
 
     #[test]

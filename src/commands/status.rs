@@ -574,14 +574,27 @@ pub fn run(repo: &Repo, fix: bool) -> Result<Report> {
     // Git takes the last matching attribute line, so one below the managed
     // section can turn the filter off for paths this tool believes it protects.
     // Named, not resolved — see `gitattributes::foreign_filter_lines`.
-    let foreign = gitattributes::foreign_filter_lines(&repo.attributes_path()).unwrap_or_default();
-    if !foreign.is_empty() {
+    // Every source git reads, not just the root file: a `.gitattributes` in a
+    // subdirectory and `.git/info/attributes` both outrank it, and looking only
+    // at the root let a `secrets/.gitattributes` holding `* -filter` pass
+    // unmentioned while `git add` stored the plaintext.
+    for (source, foreign) in gitattributes::foreign_filter_sources(
+        repo.work_tree(),
+        repo.git_dir(),
+        gitconfig::get(&config, "core.attributesFile")
+            .as_deref()
+            .map(std::path::Path::new),
+    ) {
         report.notes.push(format!(
             "{} carries {} line(s) of its own that set or unset `filter`, and git \
              takes the LAST match — so any declared path they reach is not \
              filtered by git-xcrypt, whatever this report says about it. Check \
              with `git check-attr filter -- <path>`:\n    {}",
-            crate::repo::ATTRIBUTES_FILE,
+            repo.relative(&source)
+                .unwrap_or(&source)
+                .display()
+                .to_string()
+                .replace('\\', "/"),
             foreign.len(),
             foreign.join("\n    ")
         ));
@@ -730,7 +743,18 @@ fn inspect_index(
     report: &mut Report,
 ) -> Result<()> {
     let index_path = repo.git_dir().join("index");
-    let entries = match gitindex::list(&index_path, hash)? {
+    // An I/O failure reading the index is the same *answer* as an index that
+    // will not parse — "nothing is known about what the next commit would
+    // store" — and used to be a different outcome: the `?` propagated out of
+    // `run`, so `status` printed no verdict at all and exited 1, "usage error or
+    // unclassified". Measured with `chmod 000 .git/index` on a repository that
+    // was genuinely exposed: no verdict, no leaked section, exit 1, and the
+    // message did not even name the file. A `.git` written by `sudo git` or a
+    // read-only mount reaches it.
+    let listed = gitindex::list(&index_path, hash).unwrap_or_else(|err| {
+        gitindex::Listed::Unavailable(format!("it could not be read ({err})"))
+    });
+    let entries = match listed {
         gitindex::Listed::Read(entries) => entries,
         gitindex::Listed::Unavailable(why) => {
             // Refusing outright would withhold the history scan, which needs no
@@ -937,7 +961,14 @@ fn restage(
         }
     }
 
-    match gitindex::restage(&repo.git_dir().join("index"), hash, &updates)? {
+    // Same reasoning as the read above: a lock that cannot be taken, or an index
+    // that cannot be replaced, means `--fix` did nothing — which is a warning
+    // beside a report that still has a history scan to deliver, not a reason to
+    // print nothing and exit 1. Measured with `chmod a-w .git`: the whole report
+    // vanished, exposures included.
+    let restaged = gitindex::restage(&repo.git_dir().join("index"), hash, &updates)
+        .unwrap_or_else(|err| gitindex::Restaged::Skipped(err.to_string()));
+    match restaged {
         gitindex::Restaged::Done(patched) => {
             // Which, not how many. A path the index spells differently than the
             // directory does — case folding on macOS and Windows, NFD against

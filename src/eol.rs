@@ -95,9 +95,19 @@ pub fn should_normalise(mode: TextMode, content: &[u8]) -> bool {
 ///
 /// **Not idempotent in general** — `\r\r\n` collapses to `\r\n` and would
 /// collapse again to `\n` on a second pass, exactly as git's own conversion
-/// does. It *is* idempotent on every input that reaches it, because content
-/// carrying a lone `CR` is classified binary by [`looks_binary`] and never
-/// normalised. That pairing is what keeps the round trip stable.
+/// does. Under `text=auto`, which is the default and so the mode almost every
+/// path is in, that never happens: content carrying a lone `CR` is classified
+/// binary by [`looks_binary`] and is never normalised at all.
+///
+/// **An explicit `text` bypasses that classifier**, so a path declared
+/// `secrets/*.sh text` whose content holds `\r\r\n` does not round-trip: clean
+/// stores `\r\n`, smudge writes it back, and the next clean collapses it again,
+/// so `git status` reports the file as modified for good. Git does the same
+/// thing with an explicit `text` attribute — this is what `core.safecrlf` warns
+/// about, and whether to reproduce that warning is Open Decision 8 in
+/// `context/foundation/zalozenia.md`. Recorded here rather than claimed away,
+/// because an earlier version of this comment asserted the invariant held
+/// everywhere.
 #[must_use]
 pub fn normalise_to_lf(content: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(content.len());
@@ -316,14 +326,24 @@ mod tests {
 
     #[test]
     fn every_git_spelling_of_true_means_crlf() {
-        for spelling in ["true", "TRUE", "yes", "on", "1", ""] {
+        // `""` is deliberately absent from this list, and `true` stands in for
+        // the value-less `[core]\n\tautocrlf` line — which is what
+        // `gitconfig::get` now hands over for it. Measured on git 2.55 with a
+        // repository whose file carries `* text`:
+        //
+        //   `autocrlf`     (no `=`)  → checkout writes CRLF
+        //   `autocrlf = `  (empty)   → checkout writes LF
+        //
+        // The two used to arrive here as the same empty string, so the second
+        // wrote CRLF where git writes LF — see the false half of this test.
+        for spelling in ["true", "TRUE", "yes", "on", "1"] {
             assert_eq!(
                 resolve_output(None, Some(spelling), None),
                 EolMode::Crlf,
                 "`core.autocrlf = {spelling}` is true to git and must be to us"
             );
         }
-        for spelling in ["false", "no", "off", "0"] {
+        for spelling in ["false", "no", "off", "0", ""] {
             assert_eq!(
                 resolve_output(None, Some(spelling), Some("lf")),
                 EolMode::Lf,

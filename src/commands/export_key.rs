@@ -65,16 +65,41 @@ pub fn run(repo: &Repo, destination: &Path, force: bool) -> Result<Report> {
 fn refuse_bad_destination(repo: &Repo, destination: &Path, force: bool) -> Result<PathBuf> {
     let here = std::env::current_dir()?;
     let resolved = resolve(&here, destination);
-    let work_tree = resolve(&here, repo.work_tree());
 
-    if resolved.starts_with(&work_tree) {
-        return Err(Error::Config(format!(
-            "refusing to write the repository key to {}: it is inside the working tree of {}, \
-             which is one `git add` away from a commit. Choose a path outside the repository, \
-             such as a directory only you can read.",
-            resolved.display(),
-            work_tree.display()
-        )));
+    // **Every** checkout, not just the one this command was run from. A linked
+    // worktree is a different directory that is not a prefix of this one, so a
+    // single comparison let `export-key ../linked/k.key` through — measured on
+    // git 2.55, the key landed in the sibling checkout's `git status` as an
+    // untracked file, which is the exact state this refusal exists to prevent.
+    for work_tree in repo.work_trees() {
+        let work_tree = resolve(&here, &work_tree);
+        if resolved.starts_with(&work_tree) {
+            return Err(Error::Config(format!(
+                "refusing to write the repository key to {}: it is inside the working tree of {}, \
+                 which is one `git add` away from a commit. Choose a path outside the repository, \
+                 such as a directory only you can read.",
+                resolved.display(),
+                work_tree.display()
+            )));
+        }
+    }
+
+    // The git directory is not always inside a working tree: with `git init
+    // --separate-git-dir` it sits somewhere else entirely, and the loop above
+    // then has nothing to say about it. Nothing legitimate writes an exported
+    // key in there, and the repository's own key already lives one directory
+    // down, where `--force` would overwrite it.
+    for private in [repo.git_dir(), repo.common_dir()] {
+        let private = resolve(&here, private);
+        if resolved.starts_with(&private) {
+            return Err(Error::Config(format!(
+                "refusing to write the repository key to {}: it is inside the git directory {}, \
+                 which is where this repository's own key lives. Choose a path outside the \
+                 repository, such as a directory only you can read.",
+                resolved.display(),
+                private.display()
+            )));
+        }
     }
 
     // `symlink_metadata`, not `exists`: a broken symlink is still an entry the
@@ -223,6 +248,77 @@ mod tests {
         let (_dir, _elsewhere, repo) = prepared();
         let path = repo.git_dir().join("exported.key");
         assert!(run(&repo, &path, false).is_err());
+    }
+
+    #[test]
+    fn a_destination_inside_another_checkout_of_the_same_repository_is_refused() {
+        // A linked worktree is a checkout of *this* repository, so a key written
+        // there is as committable as one written here — measured before this
+        // check existed: `export-key ../linked/k.key` exited 0 and the sibling's
+        // `git status` reported `?? k.key`.
+        let (dir, _elsewhere, repo) = prepared();
+        let linked = TempDir::new().expect("temporary directory");
+        let checkout = linked.path().join("linked");
+        let added = Command::new("git")
+            .args(["worktree", "add", "-q"])
+            .arg(&checkout)
+            .current_dir(dir.path())
+            .output()
+            .expect("git must be on PATH");
+        assert!(
+            added.status.success(),
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&added.stderr)
+        );
+
+        let path = checkout.join("stolen.key");
+        let error = run(&repo, &path, false)
+            .expect_err("the key must never land in any checkout of this repository");
+
+        assert_eq!(error.exit_code(), crate::exit::CONFIG);
+        assert!(!path.exists(), "the refusal still wrote the key");
+
+        // And the other direction: from the linked worktree back into the main
+        // checkout, which is not listed under `worktrees/` at all.
+        let from_linked = Repo::discover(&checkout).expect("discovery in the linked worktree");
+        assert_ne!(
+            from_linked.git_dir(),
+            from_linked.common_dir(),
+            "this is meant to be a linked worktree"
+        );
+        let path = dir.path().join("stolen-too.key");
+        assert!(
+            run(&from_linked, &path, false).is_err(),
+            "the main checkout was not recognised from a linked worktree"
+        );
+        assert!(!path.exists(), "the refusal still wrote the key");
+    }
+
+    #[test]
+    fn a_destination_inside_a_separate_git_directory_is_refused() {
+        // With `--separate-git-dir` the git directory is outside the working
+        // tree, so the working-tree comparison alone has nothing to say about
+        // it and the export used to succeed.
+        let dir = TempDir::new().expect("temporary directory");
+        let git_dir = TempDir::new().expect("temporary directory");
+        let work_tree = dir.path().join("tree");
+        let ok = Command::new("git")
+            .args(["init", "-q", "--separate-git-dir"])
+            .arg(git_dir.path().join("real"))
+            .arg(&work_tree)
+            .status()
+            .expect("git must be on PATH")
+            .success();
+        assert!(ok, "git init --separate-git-dir failed");
+
+        let repo = Repo::discover(&work_tree).expect("discovery");
+        crate::commands::init::run(&repo).expect("init must succeed");
+
+        let path = git_dir.path().join("real").join("exported.key");
+        let error = run(&repo, &path, false).expect_err("the git directory is never a destination");
+
+        assert_eq!(error.exit_code(), crate::exit::CONFIG);
+        assert!(!path.exists(), "the refusal still wrote the key");
     }
 
     #[test]

@@ -935,3 +935,133 @@ fn a_reference_that_will_not_resolve_is_named_not_merely_counted() {
     assert_eq!(output.status.code(), Some(EXPOSED), "{text}");
     assert!(text.contains("refs/heads/dangling"), "{text}");
 }
+
+#[test]
+fn an_attributes_file_below_the_root_that_turns_the_filter_off_is_named() {
+    // Git resolves attributes from every directory on a path, then from
+    // `.git/info/attributes`, with the LAST match winning. Looking only at the
+    // root file made `status` print `setup: git is configured to run the filter
+    // in this repository` and exit 0 for a repository where
+    // `git check-attr filter -- secrets/db.env` answered `unset` and the next
+    // `git add` stored the plaintext — measured on git 2.55.
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.write_file("secrets/db.env", b"hunter2\n");
+    repo.commit_all("secret");
+    repo.write_file("secrets/.gitattributes", b"* -filter\n");
+
+    assert_eq!(
+        repo.check_attr("filter", "secrets/db.env"),
+        "unset",
+        "the fixture must really take the filter off the declared path"
+    );
+
+    let text = report(&repo.xcrypt(["status"]));
+
+    assert!(
+        text.contains("secrets/.gitattributes"),
+        "the file that overrides the catch-all went unmentioned:\n{text}"
+    );
+}
+
+#[test]
+fn an_info_attributes_file_that_turns_the_filter_off_is_named() {
+    // `$GIT_DIR/info/attributes` is not versioned and outranks every
+    // `.gitattributes`, so it is the one an audit is least likely to look at.
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.write_file("secrets/db.env", b"hunter2\n");
+    repo.commit_all("secret");
+    std::fs::create_dir_all(repo.path().join(".git").join("info")).expect("directories");
+    std::fs::write(
+        repo.path().join(".git").join("info").join("attributes"),
+        b"secrets/** -filter\n",
+    )
+    .expect("writing");
+
+    assert_eq!(repo.check_attr("filter", "secrets/db.env"), "unset");
+
+    let text = report(&repo.xcrypt(["status"]));
+
+    assert!(
+        text.contains("info/attributes"),
+        "the highest-precedence attributes file went unmentioned:\n{text}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_index_that_cannot_be_read_still_leaves_a_report_and_a_verdict() {
+    // Both index calls used to be a bare `?`, so an I/O failure propagated out
+    // of `run` and `status` printed nothing at all and exited 1 — "usage error
+    // or unclassified" — for a repository that was genuinely exposed. A `.git`
+    // written by `sudo git`, or a read-only mount, reaches it.
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.write_file("README.md", b"public\n");
+    repo.commit_all("start");
+    // A secret committed before the pattern reached it: the history scan has a
+    // real finding to deliver, and it is the thing that must not go missing.
+    repo.write_xcrypt_config("*.pem\n");
+    repo.write_file("secrets/db.env", b"hunter2\n");
+    repo.commit_all("the leak");
+    repo.write_xcrypt_config("secrets/\n");
+
+    let index = repo.path().join(".git").join("index");
+    let restore = std::fs::metadata(&index).expect("index").permissions();
+    std::fs::set_permissions(&index, std::fs::Permissions::from_mode(0o000)).expect("closing");
+
+    let output = repo.xcrypt(["status"]);
+    std::fs::set_permissions(&index, restore).expect("reopening");
+
+    let text = report(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(EXPOSED),
+        "an unreadable index must not hide the history finding:\n{text}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        text.contains("leaked in history"),
+        "the finding that matters most went missing:\n{text}"
+    );
+    assert!(
+        text.contains("undetermined"),
+        "the unreadable index must be said out loud:\n{text}"
+    );
+}
+
+#[test]
+fn an_empty_required_value_is_reported_as_the_off_switch_git_reads_it_as() {
+    // `git config filter.git-xcrypt.required ""` writes `required = `, which git
+    // reads as **false** — measured on 2.55 with `git config --type=bool`, and
+    // measured end to end: a failing filter is then ignored, `git add` exits 0
+    // and the plaintext lands in the object database. `gix-config` reports that
+    // line and the value-less `required` identically once flattened, so calling
+    // the empty string true made this gate report `setup: git is configured to
+    // run the filter in this repository` and exit 0 over exactly that.
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.write_file("secrets/db.env", b"hunter2\n");
+    repo.commit_all("secret");
+    repo.git_ok(["config", "filter.git-xcrypt.required", ""]);
+
+    let output = repo.xcrypt(["status"]);
+    let text = report(&output);
+
+    assert_eq!(
+        output.status.code(),
+        Some(EXPOSED),
+        "the flag git reads as off must fail the gate:\n{text}"
+    );
+    assert!(
+        text.contains("filter.git-xcrypt.required"),
+        "the gap must name the key:\n{text}"
+    );
+}

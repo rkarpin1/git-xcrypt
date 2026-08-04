@@ -89,11 +89,23 @@ pub fn unset(config: &mut File, key: &str) -> Result<()> {
 /// Reads a dotted key, if present.
 ///
 /// A key written with no value at all — `[core]\n\tautocrlf` — is `true` to git,
-/// but has no raw value to return. It comes back as `Some("")` so callers can
-/// tell it from an absent key; every git spelling of true includes that one.
+/// but has no raw value to return, so it comes back as `Some("true")`: git's own
+/// reading of that line, spelled the way every caller already tests for.
+///
+/// **`Some("true")` rather than `Some("")`, and the difference is a security
+/// one.** `gix-config` reports `key` (no `=`) and `key =` (an empty value)
+/// identically — the first as `Err(KeyMissing)` from `raw_value`, the second as
+/// `Ok("")` — and git does not: measured on git 2.55, `git config --type=bool`
+/// reads the first as `true` and the second as **`false`**. Flattening both to
+/// the empty string and calling that true made `filter.git-xcrypt.required = `
+/// read as enabled, while git ignored the failing filter and stored the
+/// plaintext with `git add` exiting 0 — and `status`, the gate that exists to
+/// catch exactly that, reported no gap.
 #[must_use]
 pub fn get(config: &File, key: &str) -> Option<String> {
     if let Ok(value) = config.raw_value(key) {
+        // An explicit value, the empty string included. Git reads `key =` as
+        // false, so it must not be turned into a spelling of true below.
         return Some(value.to_string());
     }
 
@@ -108,20 +120,24 @@ pub fn get(config: &File, key: &str) -> Option<String> {
         .filter(|section| section.header().subsection_name() == subsection)
         .any(|section| section.value_names().any(|value_name| value_name == name));
 
-    present.then(String::new)
+    present.then(|| "true".to_string())
 }
 
 /// Whether a value is one of git's spellings of true.
 ///
-/// Git accepts `1`, `yes` and `on` beside `true`, and a key written with no
-/// value at all — which [`get`] reports as `Some("")` — is true as well. Every
+/// Git accepts `1`, `yes` and `on` beside `true`, case insensitively. Every
 /// caller that branches on a git boolean has to accept the same set, or a
 /// perfectly ordinary `required = 1` reads as "off".
+///
+/// The empty string is **not** in the set. Git reads `key =` as `false`
+/// (measured with `git config --type=bool` on 2.55), and the value-less
+/// `key` that git does read as true never arrives here as empty — [`get`]
+/// returns it as `"true"`.
 #[must_use]
 pub fn is_true(value: &str) -> bool {
     matches!(
         value.to_ascii_lowercase().as_str(),
-        "true" | "yes" | "on" | "1" | ""
+        "true" | "yes" | "on" | "1"
     )
 }
 
@@ -190,8 +206,35 @@ mod tests {
         std::fs::write(&path, "[core]\n\tautocrlf\n").expect("writing must succeed");
 
         let config = open_local(&path).expect("valid config");
-        assert_eq!(get(&config, "core.autocrlf").as_deref(), Some(""));
+        assert_eq!(get(&config, "core.autocrlf").as_deref(), Some("true"));
+        assert!(is_true(&get(&config, "core.autocrlf").expect("present")));
         assert!(get(&config, "core.eol").is_none());
+    }
+
+    #[test]
+    fn an_empty_value_is_false_to_git_and_must_be_false_here() {
+        // Measured on git 2.55: `git config --type=bool` reads `key` (no `=`) as
+        // `true` and `key = ` as `false`. `gix-config` reports the two
+        // identically once they are flattened to a string, so this is the one
+        // place the difference can be kept. Getting it wrong let
+        // `filter.git-xcrypt.required = ` read as enabled while git ignored the
+        // failing filter and stored the plaintext, and `status` saw no gap.
+        let dir = TempDir::new().expect("temporary directory");
+        let path = dir.path().join("config");
+        std::fs::write(
+            &path,
+            "[filter \"git-xcrypt\"]\n\trequired = \n[core]\n\tautocrlf =   \n",
+        )
+        .expect("writing must succeed");
+
+        let config = open_local(&path).expect("valid config");
+        for key in ["filter.git-xcrypt.required", "core.autocrlf"] {
+            let value = get(&config, key).unwrap_or_else(|| panic!("{key} must read as present"));
+            assert!(
+                !is_true(&value),
+                "{key} = `{value}` was taken for true, which git does not"
+            );
+        }
     }
 
     #[test]

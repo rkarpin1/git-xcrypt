@@ -21,7 +21,7 @@
 //! all. The two syntaxes make that harder than it sounds — see [`translate`].
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 use crate::repo::{ATTRIBUTES_FILE, CONFIG_FILE, DRIVER, KEY_ENVELOPE_DIR};
@@ -337,10 +337,30 @@ pub fn upsert(contents: &str, section: &str) -> Result<String> {
         )));
     };
 
+    // A *second* balanced pair is refused for the same reason an unbalanced one
+    // is: this function rewrites the first region and leaves the rest alone, so
+    // a duplicate survives every `sync` while `sync --check` compares the result
+    // against the input, finds them equal and reports "up to date". Git takes
+    // the **last** matching attribute line, so the copy nobody is maintaining is
+    // the one that decides — and a stale `!text` on a path the filter still
+    // encrypts is the CRLF corruption this module's opening comment describes.
+    // A merge conflict on `.gitattributes` resolved by keeping both sides
+    // produces exactly this shape.
+    let rest = &contents[begin + after_end..];
+    if marker_line(rest, BEGIN).is_some() || marker_line(rest, END).is_some() {
+        return Err(Error::Config(format!(
+            "{ATTRIBUTES}: it carries more than one git-xcrypt section. Only the first \
+             would be kept up to date, and git takes the last matching line, so the \
+             stale copy would win. Delete all but one by hand, then run \
+             `git-xcrypt sync`.",
+            ATTRIBUTES = crate::repo::ATTRIBUTES_FILE
+        )));
+    }
+
     let mut out = String::with_capacity(contents.len() + section.len());
     out.push_str(&contents[..begin]);
     out.push_str(section);
-    out.push_str(&contents[begin + after_end..]);
+    out.push_str(rest);
     Ok(out)
 }
 
@@ -468,6 +488,89 @@ pub fn foreign_filter_lines(path: &Path) -> Result<Vec<String>> {
     Ok(found)
 }
 
+/// Every attributes file git would consult here, and the `filter` lines in it.
+///
+/// **The root `.gitattributes` is not the only one git reads**, and looking only
+/// there made `status` claim a repository was filtered while git said otherwise.
+/// Measured on git 2.55, both of these:
+///
+/// ```text
+/// secrets/.gitattributes  →  `* -filter`
+/// .git/info/attributes    →  `secrets/** -filter`
+/// ```
+///
+/// In each case `git check-attr filter -- secrets/db.env` answered `unset`, the
+/// next `git add` stored the plaintext, and `status` reported
+/// `VERDICT: no findings` with `setup: git is configured to run the filter in
+/// this repository`. Git resolves attributes from every directory on a path,
+/// then `$GIT_DIR/info/attributes`, then `core.attributesFile`, with the last
+/// match winning.
+///
+/// Named rather than resolved, exactly as the single-file version was: deciding
+/// which of these lines actually reaches a declared path means reimplementing
+/// git's attribute matching, and a report that names the file and the line is
+/// something the user can check with `git check-attr`.
+///
+/// Sources that cannot be read are skipped. This answer only ever *adds* a
+/// warning, so a miss costs a message, never a false clean bill of health — the
+/// positive claim rests on the configuration check, not on this.
+#[must_use]
+pub fn foreign_filter_sources(
+    work_tree: &Path,
+    git_dir: &Path,
+    global: Option<&Path>,
+) -> Vec<(PathBuf, Vec<String>)> {
+    let mut sources: Vec<PathBuf> = Vec::new();
+    collect_attribute_files(work_tree, &mut sources);
+    sources.sort();
+    sources.push(git_dir.join("info").join("attributes"));
+    if let Some(global) = global {
+        sources.push(global.to_path_buf());
+    }
+
+    sources
+        .into_iter()
+        .filter_map(|path| match foreign_filter_lines(&path) {
+            Ok(lines) if lines.is_empty() => None,
+            Ok(lines) => Some((path, lines)),
+            Err(_) => None,
+        })
+        .collect()
+}
+
+/// Every `.gitattributes` under `root`, `.git` excluded.
+///
+/// Iterative rather than recursive, for the same reason the history walk is: a
+/// working tree may be arbitrarily deep and a diagnostic command must not be the
+/// thing that crashes on it. Directories that will not open are skipped; see the
+/// note on misses in [`foreign_filter_sources`].
+fn collect_attribute_files(root: &Path, out: &mut Vec<PathBuf>) {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            // Never followed: a symbolic link out of the working tree would walk
+            // somewhere that is not this repository, and one pointing back into
+            // it would loop.
+            if kind.is_symlink() {
+                continue;
+            }
+            if kind.is_dir() {
+                if entry.file_name() != std::ffi::OsStr::new(".git") {
+                    pending.push(entry.path());
+                }
+            } else if entry.file_name() == std::ffi::OsStr::new(crate::repo::ATTRIBUTES_FILE) {
+                out.push(entry.path());
+            }
+        }
+    }
+}
+
 /// The configuration keys `init` writes, for `status` to check for completeness.
 ///
 /// A clone that never ran `init` or `unlock` carries the catch-all attribute
@@ -536,6 +639,34 @@ mod tests {
     fn a_stray_closing_marker_is_refused() {
         let broken = format!("# mine\n{END}\n");
         assert!(upsert(&broken, &render_section(&[])).is_err());
+    }
+
+    #[test]
+    fn a_second_managed_section_is_refused_rather_than_left_to_win() {
+        // Balanced, so neither of the two checks above sees it, and `upsert`
+        // rewrites only the first region. Measured before this: `sync` reported
+        // "updated" and `sync --check` reported "up to date" with both copies
+        // still in the file — and git takes the *last* matching line, so the
+        // copy nobody maintains decides. `git checkout --conflict` on a
+        // `.gitattributes` merge produces this shape by hand.
+        let doubled = format!(
+            "{}{}",
+            render_section(&["*.env -text diff=git-xcrypt".into()]),
+            render_section(&["secrets/README.md !text !diff".into()])
+        );
+        assert_eq!(
+            doubled.matches(BEGIN).count(),
+            2,
+            "the fixture must really carry two sections"
+        );
+
+        let error = upsert(&doubled, &render_section(&[])).expect_err("a duplicate must be caught");
+
+        assert_eq!(error.exit_code(), crate::exit::CONFIG);
+        assert!(
+            error.to_string().contains("more than one"),
+            "the message must say what is wrong: {error}"
+        );
     }
 
     /// Parses a `.git-xcrypt` body and renders the cosmetic lines from it.

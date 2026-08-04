@@ -161,16 +161,31 @@ pub fn run(repo: &Repo, key_source: Option<&Path>) -> Result<Report> {
     // The same paths, spelled the way the index stores them.
     let mut rewritten: Vec<Vec<u8>> = Vec::new();
 
+    // **The loop stops at the first failure, but does not return from here.**
+    // Every step below used to be a bare `?`, which dropped the whole report
+    // together with the list of files already decrypted — and with it the stat
+    // refresh underneath. Measured, on a clone whose second declared file sat in
+    // a directory the user could not write: the first file was decrypted, the
+    // message was `i/o failure: Permission denied (os error 13)` naming nothing,
+    // and `git status` reported the decrypted file as modified for good, because
+    // a later run finds it already in the clear and so never refreshes it.
+    let mut stopped = None;
     for file in &encrypted {
         let relative = relative_to(repo, &file.path);
         let name = repo_relative_bytes(&relative);
-        let content = fs::read(&file.path)?;
+        let content = match fs::read(&file.path) {
+            Ok(content) => content,
+            Err(err) => {
+                stopped = Some(named_io(&relative, "read", &err));
+                break;
+            }
+        };
         let decision = config.decide(&name);
 
         // The very function the smudge path calls, on purpose: anything else
         // here would be a second implementation of line-ending handling, and the
         // two would drift into a working tree git reports as modified.
-        let outcome = decide::smudge(
+        let outcome = match decide::smudge(
             Some(&key),
             &name,
             &content,
@@ -178,8 +193,13 @@ pub fn run(repo: &Repo, key_source: Option<&Path>) -> Result<Report> {
             decision.eol,
             autocrlf.as_deref(),
             core_eol.as_deref(),
-        )
-        .map_err(|err| Error::Format(format!("{}: {err}", relative.display())))?;
+        ) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                stopped = Some(Error::Format(format!("{}: {err}", relative.display())));
+                break;
+            }
+        };
 
         if let Some(warning) = outcome.warning {
             report.warnings.push(warning);
@@ -196,7 +216,17 @@ pub fn run(repo: &Repo, key_source: Option<&Path>) -> Result<Report> {
         }
         // Atomic, and inheriting the file's own mode, so an interruption cannot
         // leave a half-written secret and an executable stays executable.
-        crate::atomic::write(&file.path, &plaintext)?;
+        match crate::atomic::write(&file.path, &plaintext) {
+            Ok(()) => {}
+            Err(Error::Io(err)) => {
+                stopped = Some(named_io(&relative, "replace", &err));
+                break;
+            }
+            Err(err) => {
+                stopped = Some(err);
+                break;
+            }
+        }
         rewritten.push(name);
         report.decrypted.push(relative);
     }
@@ -205,18 +235,70 @@ pub fn run(repo: &Repo, key_source: Option<&Path>) -> Result<Report> {
     // one it cached for the ciphertext, concludes the file changed and never
     // runs the filter to find out otherwise. `git status` would then report
     // every unlocked secret as modified, for good. See `crate::gitindex`.
-    match crate::gitindex::forget_stat(
+    //
+    // Run even when the loop stopped, and that is the point: the files already
+    // rewritten are the ones whose cached size is now wrong, and no later run
+    // will come back for them — they are plain text by then, so the walk does
+    // not select them at all.
+    let refreshed = crate::gitindex::forget_stat(
         &repo.git_dir().join("index"),
         crate::gitindex::object_hash(
             gitconfig::get(&git_config, "extensions.objectformat").as_deref(),
         ),
         &rewritten,
-    )? {
-        crate::gitindex::Outcome::Cleared(_) => {}
-        crate::gitindex::Outcome::Skipped(why) => report.warnings.push(why),
+    );
+    match refreshed {
+        Ok(crate::gitindex::Outcome::Cleared(_)) => {}
+        Ok(crate::gitindex::Outcome::Skipped(why)) => report.warnings.push(why),
+        Err(err) if stopped.is_none() => return Err(err),
+        // A second failure on top of the one that stopped the loop. The first is
+        // what the user has to act on; this one goes with it rather than
+        // replacing it.
+        Err(err) => report.warnings.push(err.to_string()),
+    }
+
+    if let Some(err) = stopped {
+        return Err(interrupted(&report, &encrypted, err));
     }
 
     Ok(report)
+}
+
+/// Puts a path and the operation in front of a bare I/O failure.
+///
+/// `Permission denied (os error 13)` names neither the file nor what was being
+/// done to it, which for a command part way through rewriting a working tree is
+/// the least useful message it could produce. Measured before this: a `unlock`
+/// stopped by one unwritable directory said exactly that and nothing else.
+fn named_io(relative: &Path, action: &str, err: &std::io::Error) -> Error {
+    Error::Io(std::io::Error::other(format!(
+        "{}: could not {action} it ({err})",
+        relative.display()
+    )))
+}
+
+/// Adds what was already done to an error that stopped the decryption pass.
+///
+/// The bare error drops the report, and with it the only record that part of the
+/// working tree is now in the clear and part of it is not. The same shape `lock`
+/// uses for the same reason — and, unlike `lock`, this one has to say that a
+/// second run will *not* revisit what already succeeded, because a file in the
+/// clear no longer carries the magic the walk selects on.
+fn interrupted(report: &Report, encrypted: &[Encrypted], err: Error) -> Error {
+    let done = report.decrypted.len();
+    let left = encrypted.len().saturating_sub(done);
+    let context = format!(
+        "\nunlock stopped part way: {done} file(s) are now in the clear and {left} \
+         are still encrypted. The key is in place, so running unlock again picks up \
+         the rest once the cause above is fixed."
+    );
+    match err {
+        Error::Format(message) => Error::Format(message + &context),
+        Error::Crypto(message) => Error::Crypto(message + &context),
+        Error::Config(message) => Error::Config(message + &context),
+        Error::Io(err) => Error::Io(std::io::Error::other(format!("{err}{context}"))),
+        other => other,
+    }
 }
 
 /// A working-tree file that carries our magic, and the header it carries.
@@ -479,6 +561,43 @@ mod tests {
             fs::read(repo.work_tree().join("README.md")).expect("reading"),
             b"public\n",
             "an ordinary file must not be touched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_will_not_be_written_names_itself_and_reports_what_was_done() {
+        // Every step of the loop used to be a bare `?`, so one unwritable
+        // directory dropped the whole report: the message was `i/o failure:
+        // Permission denied (os error 13)` naming no file, and the stat refresh
+        // for the files already decrypted never ran — which leaves `git status`
+        // reporting them as modified for good, since a later run finds them in
+        // the clear and so never selects them again.
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (_dir, repo) = prepared();
+        let key = repo.load_key().expect("key");
+        write_encrypted(&repo, "secrets/a-first.env", &key, b"one\n");
+        write_encrypted(&repo, "secrets/locked/z-second.env", &key, b"two\n");
+        let closed = repo.work_tree().join("secrets/locked");
+        fs::set_permissions(&closed, fs::Permissions::from_mode(0o555)).expect("closing");
+
+        let error = run(&repo, None).expect_err("an unwritable directory must be reported");
+
+        fs::set_permissions(&closed, fs::Permissions::from_mode(0o755)).expect("reopening");
+        let message = error.to_string();
+        assert!(
+            message.contains("z-second.env"),
+            "the failure must name the file: {message}"
+        );
+        assert!(
+            message.contains("1 file(s) are now in the clear"),
+            "the failure must say what was already done: {message}"
+        );
+        assert_eq!(
+            fs::read(repo.work_tree().join("secrets/a-first.env")).expect("reading"),
+            b"one\n",
+            "the file that succeeded must still be in the clear"
         );
     }
 
