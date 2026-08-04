@@ -3,6 +3,7 @@
 //! Nothing but file content may reach `stdout` on the filter path: git treats
 //! the filter's `stdout` as the file itself, so a stray `println!` corrupts it.
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -33,6 +34,19 @@ enum Command {
         check: bool,
     },
 
+    /// Write the repository key to a file, to carry it to another machine.
+    ///
+    /// The destination must be outside this repository's working tree. The key
+    /// is never printed, so redirecting this command's output captures nothing.
+    ExportKey {
+        /// Where to write the key. Must lie outside the working tree.
+        path: PathBuf,
+
+        /// Replace the destination if it already exists.
+        #[arg(long)]
+        force: bool,
+    },
+
     /// Serve git's long-running filter protocol. Registered by `init`.
     ///
     /// Not meant to be run by hand: everything it writes to stdout is protocol.
@@ -45,6 +59,7 @@ fn main() -> ExitCode {
     match cli.command {
         Command::Init => report(run_init()),
         Command::Sync { check } => run_sync(check),
+        Command::ExportKey { path, force } => report(run_export_key(&path, force)),
         Command::Process => report(commands::process::run()),
     }
 }
@@ -91,6 +106,28 @@ fn run_init() -> Result<()> {
     for warning in &report.warnings {
         eprintln!("git-xcrypt: {warning}");
     }
+    Ok(())
+}
+
+/// Runs `export-key`, reporting where the key went — never what it is.
+///
+/// The fingerprint is safe to print and is what the user needs in order to tell
+/// two exports apart. The key itself goes to the file and nowhere else: this
+/// command is the one place the product hands a key over, so `stdout` staying
+/// empty is what makes `git-xcrypt export-key > somewhere` capture nothing.
+fn run_export_key(path: &std::path::Path, force: bool) -> Result<()> {
+    let repo = Repo::discover_from_cwd()?;
+    let report = commands::export_key::run(&repo, path, force)?;
+
+    eprintln!(
+        "git-xcrypt: wrote key {} to {}",
+        git_xcrypt::format_key_id(&report.key_id),
+        report.path.display()
+    );
+    eprintln!(
+        "git-xcrypt: this file is the only way back into this repository's history — \
+         keep it somewhere you can still read it after this machine is gone"
+    );
     Ok(())
 }
 

@@ -2,7 +2,7 @@
 id: key-export-and-unlock
 title: Eksport klucza i odblokowanie po klonie
 roadmap_id: S-03
-status: planned
+status: implementing
 created: 2026-08-04
 updated: 2026-08-04
 ---

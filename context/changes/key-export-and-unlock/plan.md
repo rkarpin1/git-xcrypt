@@ -168,13 +168,13 @@ Po odszyfrowaniu stosuje końcówki linii zgodnie z bitem `flags` i konfiguracj�
 
 #### Automatyczne
 
-- [ ] 1.1 Round-trip formatu eksportu zachowuje `key_id`
-- [ ] 1.2 `export-key` do wnętrza repozytorium kończy się kodem `2` bez tworzenia pliku
-- [ ] 1.3 `export-key` bez klucza kończy się kodem `3`
-- [ ] 1.4 Plik eksportu ma `0600` (`#[cfg(unix)]`)
-- [ ] 1.5 `stdout` komendy jest pusty
-- [ ] 1.6 Nieznana wersja formatu eksportu kończy się błędem
-- [ ] 1.7 `cargo clippy --all-targets -- -D warnings`
+- [x] 1.1 Round-trip formatu eksportu zachowuje `key_id`
+- [x] 1.2 `export-key` do wnętrza repozytorium kończy się kodem `2` bez tworzenia pliku
+- [x] 1.3 `export-key` bez klucza kończy się kodem `3`
+- [x] 1.4 Plik eksportu ma `0600` (`#[cfg(unix)]`)
+- [x] 1.5 `stdout` komendy jest pusty
+- [x] 1.6 Nieznana wersja formatu eksportu kończy się błędem
+- [x] 1.7 `cargo clippy --all-targets -- -D warnings`
 
 ### Faza 2: `import-key` i `unlock`
 

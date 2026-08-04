@@ -14,12 +14,28 @@
 //! `rename` replaces the entry in one step on every platform this tool targets
 //! (`MoveFileEx` with `MOVEFILE_REPLACE_EXISTING` on Windows), so a reader sees
 //! either the old file or the new one.
+//!
+//! The key file goes through [`write_owner_only`] rather than [`write`]: it has
+//! the same half-written failure — a truncated key file is a repository nobody
+//! can decrypt again — but the opposite permission rule, since inheriting a
+//! loose mode from whatever was there before is exactly what a key must not do.
 
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::{Error, Result};
+
+/// How the replacement file's permissions are decided.
+#[derive(Debug, Clone, Copy)]
+enum Mode {
+    /// Keep whatever the target had. A file that did not exist gets the
+    /// process default, which is what git itself would have produced.
+    InheritTarget,
+    /// Owner-only, whatever the target had. For key material, where inheriting
+    /// a loose mode from a file that happened to be there is exactly wrong.
+    OwnerOnly,
+}
 
 /// Writes `contents` to `path`, replacing it in one step.
 ///
@@ -37,15 +53,51 @@ use crate::{Error, Result};
 /// [`Error::Io`] when the temporary file cannot be created, written, flushed or
 /// renamed. On failure the target is left exactly as it was.
 pub fn write(path: &Path, contents: &[u8]) -> Result<()> {
+    replace(path, contents, Mode::InheritTarget)
+}
+
+/// Writes `contents` to `path` with owner-only permissions, in one step.
+///
+/// The same replacement as [`write`], with two differences that matter only for
+/// key material: the file is narrowed to `0600` before a single byte reaches it,
+/// and the target's permissions are **not** inherited — a key file that was
+/// somehow left world readable must not stay that way.
+///
+/// On Windows there is no mode to set, so the file inherits the directory ACL.
+/// That is the protection git gives `.git/config`, and `.git/` is where the
+/// repository key lives, but it is weaker than `0600` and is recorded as such in
+/// `context/foundation/zalozenia.md`.
+///
+/// # Errors
+///
+/// As [`write`].
+pub fn write_owner_only(path: &Path, contents: &[u8]) -> Result<()> {
+    replace(path, contents, Mode::OwnerOnly)
+}
+
+fn replace(path: &Path, contents: &[u8], mode: Mode) -> Result<()> {
     let temporary = temporary_sibling(path)?;
 
     let result = (|| -> std::io::Result<()> {
         let mut file = fs::File::create(&temporary)?;
         // A fresh file gets 0666 minus the umask, so without this a deliberately
         // narrowed `.git/config` — the one that holds credential helpers and
-        // remote URLs — would come back world readable.
-        if let Ok(existing) = fs::metadata(path) {
-            file.set_permissions(existing.permissions())?;
+        // remote URLs — would come back world readable. Either way this happens
+        // before the first write, so there is no window in which the content is
+        // on disk under looser permissions than it asked for.
+        match mode {
+            Mode::InheritTarget => {
+                if let Ok(existing) = fs::metadata(path) {
+                    file.set_permissions(existing.permissions())?;
+                }
+            }
+            Mode::OwnerOnly => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+                }
+            }
         }
         file.write_all(contents)?;
         // Without this the rename can land before the content does, which on a
@@ -144,6 +196,25 @@ mod tests {
 
         let mode = fs::metadata(&path).expect("metadata").permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "the file was widened by the rewrite");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_owner_only_write_narrows_a_loose_target_instead_of_inheriting_it() {
+        // The opposite rule from the one above, and deliberately so: a key file
+        // that was left world readable must come back owner-only, never keep the
+        // mode it happened to have.
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = TempDir::new().expect("temporary directory");
+        let path = dir.path().join("default");
+        fs::write(&path, b"world readable placeholder").expect("writing must succeed");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        write_owner_only(&path, b"key material").expect("writing must succeed");
+
+        let mode = fs::metadata(&path).expect("metadata").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "a key file kept loose permissions");
     }
 
     #[test]

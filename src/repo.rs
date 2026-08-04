@@ -163,8 +163,15 @@ fn common_dir(git_dir: &Path) -> PathBuf {
 /// Resolves `.` and `..` without touching the filesystem.
 ///
 /// `commondir` holds a relative path such as `../..`, and leaving it in place
-/// would make every message name a path no user recognises.
-fn lexically_normal(path: &Path) -> PathBuf {
+/// would make every message name a path no user recognises. `export-key` needs
+/// the same thing for a destination that does not exist yet, which is why this
+/// is public: a path it cannot resolve is a path it cannot prove lies outside
+/// the repository.
+///
+/// Only safe on a path whose components are known not to be symlinks — popping
+/// on `..` is what a symlink would make wrong.
+#[must_use]
+pub fn lexically_normal(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {

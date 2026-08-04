@@ -10,6 +10,7 @@ unsafe_code = "forbid"
 
 [dependencies]
 aes-siv = "0.7"
+base64 = "0.23"
 bstr = "1.13.0"
 clap = { version = "4.6.5", features = ["derive"] }
 getrandom = "0.4.3"
