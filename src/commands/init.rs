@@ -232,21 +232,27 @@ pub(crate) fn register_driver(repo: &Repo) -> Result<bool> {
 /// # Errors
 ///
 /// [`Error::Config`] when `.git/config` cannot be read or written.
-pub(crate) fn register_driver_for_lock(repo: &Repo) -> Result<bool> {
+pub(crate) fn register_driver_for_lock(repo: &Repo) -> Result<LockRegistration> {
     let path = repo.config_path();
     let mut config = gitconfig::open_local(&path)?;
 
-    let mut changed = false;
+    // Kept apart from `repaired` on purpose. This one happens on every healthy
+    // lock, and folding it in made the command announce "repaired the filter
+    // registration" every single time — noise in the one output a user scans
+    // for signs of trouble before the key disappears, and a repair that no
+    // longer proves anything if the real one stops working.
+    let mut diff_driver_removed = false;
     for unwanted in [
         format!("diff.{DRIVER}.textconv"),
         format!("diff.{DRIVER}.cachetextconv"),
     ] {
         if gitconfig::get(&config, &unwanted).is_some() {
             gitconfig::unset(&mut config, &unwanted)?;
-            changed = true;
+            diff_driver_removed = true;
         }
     }
 
+    let mut changed = false;
     let process = format!("filter.{DRIVER}.process");
     if gitconfig::get(&config, &process).is_none_or(|value| value.trim().is_empty()) {
         gitconfig::set(
@@ -263,10 +269,22 @@ pub(crate) fn register_driver_for_lock(repo: &Repo) -> Result<bool> {
         changed = true;
     }
 
-    if changed {
+    if changed || diff_driver_removed {
         gitconfig::save_local(&path, &config)?;
     }
-    Ok(changed)
+    Ok(LockRegistration {
+        repaired: changed,
+        diff_driver_removed,
+    })
+}
+
+/// What [`register_driver_for_lock`] changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LockRegistration {
+    /// Something was missing and was put back — the abnormal case.
+    pub(crate) repaired: bool,
+    /// The diff driver was taken out — the normal case, on every lock.
+    pub(crate) diff_driver_removed: bool,
 }
 
 /// Creates `.git-xcrypt` if it is absent, reporting whether it did.

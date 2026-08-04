@@ -34,3 +34,16 @@ Zmierzone na git 2.55 przy implementacji, 2026-08-04:
   nie może odczytać. `unlock` i `import-key` rejestrują go z powrotem.
 - **`cachetextconv` jest aktywnie usuwane, nie tylko nieustawiane** — trzymałoby
   odszyfrowaną treść w refie notatek wewnątrz `.git/`, gdzie przeżyłaby `lock`.
+- **Gałąź deszyfrująca wypisuje postać gitową (LF), nie roboczą.** Plan nie
+  rozstrzygał końców linii. Ta gałąź jest osiągalna tylko wtedy, gdy smudge nie
+  zadziałał przed sterownikiem — a wtedy obie strony różnicy są ciphertextem i obie
+  przechodzą tą samą drogą, więc wyjście zależy wyłącznie od bloba, nie od
+  `core.autocrlf` maszyny.
+- **Podkomenda `diff` nie ma własnego `--help` i przyjmuje ścieżki zaczynające się
+  od myślnika.** Git podaje ścieżkę względną repozytorium bez `./` z przodu, więc
+  plik o nazwie `--help` w korzeniu wypisywał tekst pomocy na `stdout` z kodem `0`,
+  a git pokazywał go jako treść pliku; plik o nazwie `-w.env` przerywał `git diff`.
+- **`diff` odmawia dla ścieżek wewnątrz katalogu gita.** Plik klucza ma własne magic,
+  więc szedł gałęzią przepuszczającą — `git-xcrypt diff .git/git-xcrypt/keys/default`
+  wypisywał klucz główny na `stdout`. Reguła „klucz nigdy na `stdout` poza
+  `export-key`" nie ma wyjątków, więc guard rozwiązuje też dowiązania symboliczne.

@@ -23,46 +23,105 @@
 //! and the content is not a secret this command could protect anyway — it is
 //! already in the object database in the clear.
 //!
-//! **The output is git-form, never working-tree form.** Whatever the working
-//! tree holds, the bytes that were fed to the cipher were normalised to LF or
-//! not, and that is what the other side of the diff will be. Asking git's
-//! `core.autocrlf` here — the one thing the smudge path *does* do — would emit
-//! CRLF against an LF counterpart and report every line of the file as changed.
+//! **The output is git-form, never working-tree form.** The decrypting branch is
+//! only reached when the smudge filter did *not* run first — a repository where
+//! the diff driver is registered and the filter is not. Both sides of such a
+//! diff arrive as ciphertext, so emitting the bytes that were fed to the cipher
+//! keeps them comparable, and it makes the output a function of the blob alone
+//! rather than of the machine's `core.autocrlf`.
 //!
 //! **The key is fetched only when the content needs it.** A clone with no key
 //! can still run `git log -p` over history from before the repository was
 //! configured, and `git diff` on an ordinary file never touches the key at all.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::Result;
 use crate::config::EolMode;
 use crate::decide::{self, Outcome};
 use crate::format::looks_encrypted;
 use crate::key::MasterKey;
 use crate::repo::Repo;
+use crate::{Error, Result};
 
 /// Reads `path` and returns the text git should diff.
 ///
 /// # Errors
 ///
-/// [`Error::Io`](crate::Error::Io) when the file cannot be read,
-/// [`Error::NoKey`](crate::Error::NoKey) when it is ours and no key is loaded,
+/// [`Error::Config`] for a path inside the git directory, [`Error::Io`] when the
+/// file cannot be read, [`Error::NoKey`] when it is ours and no key is loaded,
 /// and the errors [`crate::crypto::decrypt`] reports for content that is ours
 /// but belongs to another key, is truncated or fails authentication.
 pub fn run(path: &Path) -> Result<Outcome> {
-    let content = fs::read(path)?;
+    // Discovered once, up front, because both branches want it: one to refuse a
+    // path this command must never print, the other to find the key.
+    let repo = Repo::discover_from_cwd();
+    if let Ok(repo) = &repo {
+        refuse_private_path(repo, path)?;
+    }
 
-    // Looked at before the repository is even discovered, so the branch that
-    // needs nothing carries no cost and cannot fail for a reason of its own.
+    let content = fs::read(path).map_err(|err| named_io(path, &err))?;
+
     let key = if looks_encrypted(&content) {
-        Some(Repo::discover_from_cwd()?.load_key()?)
+        Some(repo?.load_key()?)
     } else {
         None
     };
 
     convert(key.as_ref(), &name_of(path), &content)
+}
+
+/// Refuses to print anything from inside the git directory.
+///
+/// The key file lives there and carries its own magic, one byte different from
+/// the data magic, so [`looks_encrypted`] says no and the pass-through branch
+/// would hand the repository's master key to `stdout` — where
+/// `git-xcrypt diff .git/git-xcrypt/keys/default > k` puts it in the working
+/// tree, one `git add -A` from a commit. That is the leak `export-key` guards
+/// against by hand, and the rule behind it has no exception: a key reaches
+/// `stdout` from `export-key` and from nowhere else.
+///
+/// Git never asks for a path in there, so nothing legitimate is lost.
+fn refuse_private_path(repo: &Repo, path: &Path) -> Result<()> {
+    let Some(target) = resolved(path) else {
+        return Ok(());
+    };
+
+    for private in [repo.git_dir(), repo.common_dir()] {
+        if resolved(private).is_some_and(|private| target.starts_with(private)) {
+            return Err(Error::Config(format!(
+                "{}: this is inside the git directory, which this command never prints. \
+                 To carry the repository key to another machine, use `git-xcrypt export-key`.",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// An absolute path with symlinks resolved, so the check above cannot be walked
+/// around by pointing a link in the working tree at the key.
+///
+/// Falls back to a lexical answer for a path that does not exist — the caller
+/// then fails on the read instead, which is the same outcome.
+fn resolved(path: &Path) -> Option<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    Some(fs::canonicalize(&absolute).unwrap_or_else(|_| crate::repo::lexically_normal(&absolute)))
+}
+
+/// Puts the path in front of a bare I/O failure.
+///
+/// `No such file or directory (os error 2)` names nothing, and here the path is
+/// usually one git invented rather than one the user typed.
+fn named_io(path: &Path, err: &std::io::Error) -> Error {
+    Error::Io(std::io::Error::other(format!(
+        "{}: could not read it ({err})",
+        path.display()
+    )))
 }
 
 /// Turns one file's bytes into the text git should diff.
@@ -84,9 +143,11 @@ pub fn convert(key: Option<&MasterKey>, name: &[u8], content: &[u8]) -> Result<O
         });
     }
 
-    // `EolMode::Lf` rather than git's configuration: see the module comment.
-    // Content recorded as binary is unaffected either way — `smudge` writes it
-    // out verbatim, because its header says it never went through a conversion.
+    // `EolMode::Lf` rather than git's configuration: see the module comment. It
+    // makes the output a function of the blob alone, which is what keeps the two
+    // sides of a diff comparable on the one path that reaches here. Content
+    // recorded as binary is unaffected either way — `smudge` writes it out
+    // verbatim, because its header says it never went through a conversion.
     // `selected` is false because it only governs a warning on the branch above,
     // which the header has already ruled out.
     decide::smudge(key, name, content, false, Some(EolMode::Lf), None, None)

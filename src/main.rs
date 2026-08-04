@@ -88,8 +88,22 @@ enum Command {
     /// Registered by `init` as `diff.git-xcrypt.textconv`. Content that is not
     /// ours is printed unchanged, so `git log -p` still works over history from
     /// before the repository was configured.
+    ///
+    /// Its own `--help` is switched off, because git passes a repository
+    /// relative path with no `./` in front of it: a file named `--help` at the
+    /// root would otherwise print usage text to `stdout` and exit 0, and git
+    /// would show that as the file's content. `git-xcrypt help diff` still
+    /// works, and so does the help for every other subcommand.
+    #[command(disable_help_flag = true)]
     Diff {
         /// The file git wants read. Usually one it wrote to a temporary path.
+        ///
+        /// Never parsed as an option, whatever it is called. Git hands over the
+        /// working-tree path verbatim, so a file named `-w.env` would otherwise
+        /// abort `git diff` — and one named `--help` was measured printing
+        /// clap's usage text to `stdout` with exit code 0, which git then
+        /// rendered as that file's content.
+        #[arg(allow_hyphen_values = true)]
         path: PathBuf,
     },
 }
@@ -323,6 +337,14 @@ fn lock_and_describe(assume_yes: bool) -> Result<ExitCode> {
         eprintln!(
             "git-xcrypt: repaired the filter registration in {}",
             repo.config_path().display()
+        );
+    }
+    if report.diff_driver_removed {
+        // Said out loud rather than done quietly: it is a capability the user
+        // had a moment ago, and `unlock` is what brings it back.
+        eprintln!(
+            "git-xcrypt: unregistered the diff driver; `git diff` will report \
+             `Binary files differ` until this repository is unlocked again"
         );
     }
     if report.attributes_written {

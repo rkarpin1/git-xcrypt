@@ -68,6 +68,11 @@ pub struct Report {
     pub swept: Vec<PathBuf>,
     /// The filter registration was written or repaired.
     pub config_written: bool,
+    /// The diff driver was deregistered — which happens on every healthy lock.
+    ///
+    /// Separate from [`Report::config_written`], which means "something was
+    /// broken and I fixed it". Merging them made every lock claim a repair.
+    pub diff_driver_removed: bool,
     /// The managed `.gitattributes` section was written or repaired.
     pub attributes_written: bool,
     /// The key file is gone.
@@ -317,6 +322,7 @@ pub fn run(repo: &Repo, confirm: &mut dyn Confirm) -> Result<Outcome> {
         encrypted: Vec::new(),
         swept: Vec::new(),
         config_written: false,
+        diff_driver_removed: false,
         attributes_written: false,
         key_removed: false,
         warnings: config.pointless_eol.clone(),
@@ -359,7 +365,9 @@ pub fn run(repo: &Repo, confirm: &mut dyn Confirm) -> Result<Outcome> {
     // The same call takes the diff driver back *out*: with no key, textconv
     // drags the smudge filter into every `git log -p` and aborts it. See
     // `init::register_driver_for_lock`.
-    report.config_written = super::init::register_driver_for_lock(repo)?;
+    let registration = super::init::register_driver_for_lock(repo)?;
+    report.config_written = registration.repaired;
+    report.diff_driver_removed = registration.diff_driver_removed;
     report.attributes_written = write_catch_all_if_missing(repo, &config)?;
 
     // Before the encryption pass, so nothing we are about to write is mistaken

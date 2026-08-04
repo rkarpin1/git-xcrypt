@@ -253,3 +253,123 @@ fn unlocking_puts_the_diff_driver_back() {
     let diff = text(&repo.git_ok(["--no-pager", "diff", "--", "a.env"]).stdout);
     assert!(diff.contains("+api_key = rotated"), "{diff}");
 }
+
+#[test]
+fn a_healthy_lock_does_not_claim_to_have_repaired_anything() {
+    // Deregistering the driver happens on every lock, so reporting it as a
+    // repaired registration would put a false alarm in the one output a user
+    // reads for signs of trouble before the key disappears — and would leave
+    // the real repair with nothing proving it still works.
+    let repo = prepared();
+    repo.write_file("a.env", b"api_key = hunter2\n");
+    repo.commit_all("first");
+
+    let said = text(&repo.xcrypt_ok(["lock", "--yes"]).stderr);
+
+    assert!(
+        !said.contains("repaired"),
+        "a healthy lock claimed a repair: {said}"
+    );
+    assert!(
+        said.contains("unregistered the diff driver"),
+        "the lost capability went unmentioned: {said}"
+    );
+}
+
+#[test]
+fn a_file_named_like_an_option_is_still_a_file() {
+    // Git hands over the repository-relative path with no `./` in front of it,
+    // so the driver is invoked as `git-xcrypt diff --help`. Measured before the
+    // fix: clap printed its usage text to stdout and exited 0, and git showed
+    // that as the file's content — content invented out of nothing, on the one
+    // path where stdout is data. A leading `-` aborted `git diff` outright.
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("*.env\n--help\n");
+    repo.xcrypt_ok(["sync"]);
+    repo.write_file("-w.env", b"first hyphen\n");
+    repo.write_file("--help", b"first help\n");
+    repo.commit_all("first");
+    repo.write_file("-w.env", b"second hyphen\n");
+    repo.write_file("--help", b"second help\n");
+
+    let output = repo.git_ok(["--no-pager", "diff"]);
+    let diff = text(&output.stdout);
+
+    assert!(diff.contains("-first hyphen"), "{diff}");
+    assert!(diff.contains("+second hyphen"), "{diff}");
+    assert!(diff.contains("-first help"), "{diff}");
+    assert!(diff.contains("+second help"), "{diff}");
+    assert!(
+        !diff.contains("Usage:"),
+        "usage text was rendered as file content: {diff}"
+    );
+}
+
+#[test]
+fn the_driver_refuses_to_print_anything_out_of_the_git_directory() {
+    // The key file does not carry the data magic, so without this guard it
+    // takes the pass-through branch and lands on stdout — one redirection away
+    // from the working tree, and one `git add -A` from a commit.
+    let repo = prepared();
+    let key_path = Repo::discover(repo.path()).expect("discovery").key_path();
+    assert!(fs::read(&key_path).expect("the key must exist").len() > 8);
+
+    let output = repo.xcrypt(["diff", &key_path.to_string_lossy()]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(i32::from(git_xcrypt::exit::CONFIG)),
+        "stderr: {}",
+        text(&output.stderr)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "the repository key reached stdout"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symbolic_link_into_the_git_directory_is_refused_too() {
+    // Otherwise the guard above is one `ln -s` away from being decorative.
+    let repo = prepared();
+    let key_path = Repo::discover(repo.path()).expect("discovery").key_path();
+    std::os::unix::fs::symlink(&key_path, repo.path().join("bait")).expect("symlink");
+
+    let output = repo.xcrypt(["diff", "bait"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(i32::from(git_xcrypt::exit::CONFIG)),
+        "stderr: {}",
+        text(&output.stderr)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "the key reached stdout via a link"
+    );
+}
+
+#[test]
+fn ciphertext_reaches_the_driver_when_no_filter_stands_in_front_of_it() {
+    // The decrypting branch, driven by git rather than by hand. Git normally
+    // materialises each side through the smudge filter first, so the driver
+    // sees plaintext; with the filter unregistered and the key still here — a
+    // half-configured repository — the blobs arrive as they are stored.
+    let repo = prepared();
+    repo.write_file("a.env", b"api_key = one\n");
+    repo.commit_all("first");
+    repo.write_file("a.env", b"api_key = two\n");
+    repo.commit_all("second");
+
+    repo.git_ok(["config", "--unset", "filter.git-xcrypt.process"]);
+    repo.git_ok(["config", "--unset", "filter.git-xcrypt.required"]);
+
+    let output = repo.git_ok(["--no-pager", "show", "HEAD", "--", "a.env"]);
+    let shown = text(&output.stdout);
+
+    assert!(shown.contains("-api_key = one"), "{shown}");
+    assert!(shown.contains("+api_key = two"), "{shown}");
+    assert!(!carries_magic(&output.stdout));
+}
