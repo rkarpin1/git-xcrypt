@@ -47,6 +47,25 @@ enum Command {
         force: bool,
     },
 
+    /// Put a key carried from another machine into this repository.
+    ///
+    /// Refuses when the repository already holds a different key; importing the
+    /// same one again does nothing.
+    ImportKey {
+        /// A file written by `export-key`.
+        path: PathBuf,
+    },
+
+    /// Decrypt this repository's working tree, and register the filter.
+    ///
+    /// With a key file it imports the key first, which is what a fresh clone
+    /// needs. Without one it uses the key already here. Safe to run twice: a
+    /// file that is already in the clear is left alone.
+    Unlock {
+        /// A file written by `export-key`. Omit to use the key already here.
+        key: Option<PathBuf>,
+    },
+
     /// Serve git's long-running filter protocol. Registered by `init`.
     ///
     /// Not meant to be run by hand: everything it writes to stdout is protocol.
@@ -60,6 +79,8 @@ fn main() -> ExitCode {
         Command::Init => report(run_init()),
         Command::Sync { check } => run_sync(check),
         Command::ExportKey { path, force } => report(run_export_key(&path, force)),
+        Command::ImportKey { path } => report(run_import_key(&path)),
+        Command::Unlock { key } => report(run_unlock(key.as_deref())),
         Command::Process => report(commands::process::run()),
     }
 }
@@ -128,6 +149,62 @@ fn run_export_key(path: &std::path::Path, force: bool) -> Result<()> {
         "git-xcrypt: this file is the only way back into this repository's history — \
          keep it somewhere you can still read it after this machine is gone"
     );
+    Ok(())
+}
+
+/// Runs `import-key`, saying which key is now in place — never what it is.
+fn run_import_key(path: &std::path::Path) -> Result<()> {
+    let repo = Repo::discover_from_cwd()?;
+    let report = commands::import_key::run(&repo, path)?;
+
+    let key_id = git_xcrypt::format_key_id(&report.key_id);
+    if report.imported {
+        eprintln!("git-xcrypt: imported key {key_id}");
+    } else {
+        eprintln!("git-xcrypt: key {key_id} was already here; nothing to import");
+    }
+    if report.config_written {
+        eprintln!(
+            "git-xcrypt: registered the filter in {}",
+            repo.config_path().display()
+        );
+    }
+    Ok(())
+}
+
+/// Runs `unlock` and reports what changed.
+///
+/// The file list goes to `stderr` like everything else. It names paths, which
+/// are not secret — the contents never appear.
+fn run_unlock(key: Option<&std::path::Path>) -> Result<()> {
+    let repo = Repo::discover_from_cwd()?;
+    let report = commands::unlock::run(&repo, key)?;
+
+    let key_id = git_xcrypt::format_key_id(&report.key_id);
+    if report.key_imported {
+        eprintln!("git-xcrypt: imported key {key_id}");
+    }
+    if report.config_written {
+        eprintln!(
+            "git-xcrypt: registered the filter in {}",
+            repo.config_path().display()
+        );
+    }
+    for warning in &report.warnings {
+        eprintln!("git-xcrypt: {warning}");
+    }
+
+    if report.decrypted.is_empty() {
+        eprintln!("git-xcrypt: unlocked with key {key_id}; nothing was encrypted");
+    } else {
+        for path in &report.decrypted {
+            eprintln!("git-xcrypt: decrypted {}", path.display());
+        }
+        eprintln!(
+            "git-xcrypt: unlocked with key {key_id}; {} file(s) are now in the clear",
+            report.decrypted.len()
+        );
+    }
     Ok(())
 }
 

@@ -20,6 +20,7 @@ pub mod filter;
 pub mod format;
 pub mod gitattributes;
 pub mod gitconfig;
+pub mod gitindex;
 pub mod key;
 pub mod keyfile;
 pub mod pktline;

@@ -5,6 +5,8 @@
 //! whole purpose is to produce output.
 
 pub mod export_key;
+pub mod import_key;
 pub mod init;
 pub mod process;
 pub mod sync;
+pub mod unlock;

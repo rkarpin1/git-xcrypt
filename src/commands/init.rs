@@ -155,7 +155,15 @@ fn refuse_if_previously_configured(repo: &Repo) -> Result<()> {
 /// S-05, and pointing `diff.git-xcrypt.textconv` at a subcommand this build does
 /// not have would break `git diff` the moment S-02 emits the cosmetic
 /// `diff=git-xcrypt` lines.
-fn register_driver(repo: &Repo) -> Result<bool> {
+///
+/// Shared with `import-key` and `unlock` rather than copied: a clone has the
+/// catch-all line in `.gitattributes` and no driver behind it, and every command
+/// that puts a key into such a repository has to close that gap the same way.
+///
+/// # Errors
+///
+/// [`Error::Config`] when `.git/config` cannot be read or written.
+pub(crate) fn register_driver(repo: &Repo) -> Result<bool> {
     let path = repo.config_path();
     let mut config = gitconfig::open_local(&path)?;
     let binary = current_executable()?;

@@ -422,6 +422,7 @@ dependencies = [
  "gix-config",
  "gix-discover",
  "gix-glob",
+ "gix-hash",
  "hkdf",
  "sha2",
  "tempfile",
@@ -556,6 +557,7 @@ dependencies = [
  "faster-hex",
  "gix-features",
  "sha1-checked",
+ "sha2",
  "thiserror",
 ]
 

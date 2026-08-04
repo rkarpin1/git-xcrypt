@@ -168,27 +168,27 @@ Po odszyfrowaniu stosuje końcówki linii zgodnie z bitem `flags` i konfiguracj�
 
 #### Automatyczne
 
-- [x] 1.1 Round-trip formatu eksportu zachowuje `key_id`
-- [x] 1.2 `export-key` do wnętrza repozytorium kończy się kodem `2` bez tworzenia pliku
-- [x] 1.3 `export-key` bez klucza kończy się kodem `3`
-- [x] 1.4 Plik eksportu ma `0600` (`#[cfg(unix)]`)
-- [x] 1.5 `stdout` komendy jest pusty
-- [x] 1.6 Nieznana wersja formatu eksportu kończy się błędem
-- [x] 1.7 `cargo clippy --all-targets -- -D warnings`
+- [x] 1.1 Round-trip formatu eksportu zachowuje `key_id` — afde7b2
+- [x] 1.2 `export-key` do wnętrza repozytorium kończy się kodem `2` bez tworzenia pliku — afde7b2
+- [x] 1.3 `export-key` bez klucza kończy się kodem `3` — afde7b2
+- [x] 1.4 Plik eksportu ma `0600` (`#[cfg(unix)]`) — afde7b2
+- [x] 1.5 `stdout` komendy jest pusty — afde7b2
+- [x] 1.6 Nieznana wersja formatu eksportu kończy się błędem — afde7b2
+- [x] 1.7 `cargo clippy --all-targets -- -D warnings` — afde7b2
 
 ### Faza 2: `import-key` i `unlock`
 
 #### Automatyczne
 
-- [ ] 2.1 Pełny przepływ US-01 daje treść bajt w bajt równą oryginałowi
-- [ ] 2.2 `git status` po `unlock` jest czysty
-- [ ] 2.3 `unlock` z niewłaściwym kluczem daje kod `4` i nie zmienia plików
-- [ ] 2.4 Powtórzony `unlock` jest bezpieczny
-- [ ] 2.5 `unlock` uzupełnia `filter.git-xcrypt.*` w klonie
-- [ ] 2.6 `import-key` z identycznym kluczem to pusty sukces, z innym kod `2`
-- [ ] 2.7 Klon bez `unlock` pokazuje ciphertext
-- [ ] 2.8 `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`
+- [x] 2.1 Pełny przepływ US-01 daje treść bajt w bajt równą oryginałowi
+- [x] 2.2 `git status` po `unlock` jest czysty
+- [x] 2.3 `unlock` z niewłaściwym kluczem daje kod `4` i nie zmienia plików
+- [x] 2.4 Powtórzony `unlock` jest bezpieczny
+- [x] 2.5 `unlock` uzupełnia `filter.git-xcrypt.*` w klonie
+- [x] 2.6 `import-key` z identycznym kluczem to pusty sukces, z innym kod `2`
+- [x] 2.7 Klon bez `unlock` pokazuje ciphertext
+- [x] 2.8 `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`
 
 #### Ręczne
 
-- [ ] 2.9 Komunikat przy niezgodnym `key_id` jest zrozumiały
+- [x] 2.9 Komunikat przy niezgodnym `key_id` jest zrozumiały
