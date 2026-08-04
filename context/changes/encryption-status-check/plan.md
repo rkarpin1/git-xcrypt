@@ -208,15 +208,15 @@ niezerowy. Sprawdzenie musi być tanie: pojedynczy odczyt, żadnego przejścia p
 
 #### Automatyczne
 
-- [x] 3.1 `status --fix` szyfruje pliki leżące jawnie
-- [x] 3.2 `--fix` nie zmienia historii i mówi o tym wprost
-- [x] 3.3 Po `--fix` ekspozycja w historii nadal daje kod `5`
-- [x] 3.4 Pierwszy `git add` pliku jawnego w `HEAD` wypisuje ostrzeżenie
-- [x] 3.5 Ostrzeżenie nie przerywa `git add`
-- [x] 3.6 Ostrzeżenie nie pojawia się dla pliku spoza `HEAD`
-- [x] 3.7 `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`
+- [x] 3.1 `status --fix` szyfruje pliki leżące jawnie — 479ad22
+- [x] 3.2 `--fix` nie zmienia historii i mówi o tym wprost — 479ad22
+- [x] 3.3 Po `--fix` ekspozycja w historii nadal daje kod `5` — 479ad22
+- [x] 3.4 Pierwszy `git add` pliku jawnego w `HEAD` wypisuje ostrzeżenie — 479ad22
+- [x] 3.5 Ostrzeżenie nie przerywa `git add` — 479ad22
+- [x] 3.6 Ostrzeżenie nie pojawia się dla pliku spoza `HEAD` — 479ad22
+- [x] 3.7 `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` — 479ad22
 
 #### Ręczne
 
-- [x] 3.8 Raport nie sugeruje, że po `--fix` sekret jest bezpieczny — zautomatyzowane testem `fix_says_it_changed_nothing_about_the_past`
+- [x] 3.8 Raport nie sugeruje, że po `--fix` sekret jest bezpieczny — zautomatyzowane testem `fix_says_it_changed_nothing_about_the_past` — 479ad22
 - [ ] 3.9 Ostrzeżenie filtra widoczne w oknie Git w IDE — **nierozstrzygnięte**: wymaga człowieka przy otwartym RustRoverze; nie da się sprawdzić automatycznie i nie zgadujemy
