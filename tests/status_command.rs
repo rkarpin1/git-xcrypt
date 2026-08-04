@@ -322,6 +322,13 @@ fn a_locked_repository_can_still_be_scanned() {
 
 /// A repository with `secrets/db.env` committed in the clear before anything
 /// declared it — the state `--fix` and the filter warning both exist for.
+///
+/// The file is rewritten after the declaration, deliberately. Git decides
+/// whether to re-run the clean filter from the `stat` it cached, and only
+/// within the same second does its racy-clean rule make it re-read anyway — so
+/// a fixture that left the file untouched would exercise the check-in path only
+/// when the test happened to run fast enough. What the untouched case really
+/// does has a test of its own below, and is the reason `--fix` exists at all.
 fn leaked_before_the_declaration() -> TestRepo {
     let repo = TestRepo::init();
     repo.init_xcrypt();
@@ -329,6 +336,7 @@ fn leaked_before_the_declaration() -> TestRepo {
     repo.write_file("secrets/db.env", b"hunter2\n");
     repo.commit_all("before anyone declared anything");
     repo.write_xcrypt_config("secrets/\n");
+    repo.write_file("secrets/db.env", b"hunter2\n");
     repo
 }
 
@@ -486,6 +494,10 @@ fn one_git_command_warns_once_per_path() {
     // Measured on git 2.55: a single `git status` cleans the same file four
     // times. Four copies of a message teach a reader to skip it.
     let repo = leaked_before_the_declaration();
+    // Rewritten so the cached `stat` no longer matches and git has to run the
+    // clean filter rather than take its shortcut — otherwise this test would
+    // pass by never exercising the path at all.
+    repo.write_file("secrets/db.env", b"hunter2\n");
 
     let output = repo.git(["status", "--porcelain"]);
 
@@ -494,4 +506,157 @@ fn one_git_command_warns_once_per_path() {
         .filter(|line| line.contains("HEAD already holds"))
         .count();
     assert_eq!(warnings, 1, "{}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn a_sha256_repository_is_scanned_and_fixed_rather_than_crashed_on() {
+    // Measured before `objects()` was given the hash: `gix-odb` asserts on the
+    // id length rather than adapting, so `status` panicked with exit 101 — and
+    // so did the filter on the check-in path, where `required = true` turns a
+    // panic into "every git operation in this repository fails".
+    let repo = TestRepo::init_sha256();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("# nothing declared yet\n");
+    repo.write_file("secrets/db.env", b"hunter2\n");
+    repo.commit_all("leak");
+    repo.write_xcrypt_config("secrets/\n");
+
+    let output = repo.xcrypt(["status"]);
+    assert_eq!(
+        output.status.code(),
+        Some(EXPOSED),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        report(&output).contains("leaked in history"),
+        "{}",
+        report(&output)
+    );
+
+    let fixed = repo.xcrypt(["status", "--fix"]);
+    assert_eq!(
+        fixed.status.code(),
+        Some(EXPOSED),
+        "stderr: {}",
+        String::from_utf8_lossy(&fixed.stderr)
+    );
+
+    repo.git_ok(["add", ".git-xcrypt"]);
+    repo.git_ok(["commit", "-q", "-m", "after fix"]);
+    assert!(
+        repo.blob_bytes("secrets/db.env")
+            .starts_with(b"\0GITXCRYPT\0")
+    );
+    repo.assert_status_clean();
+}
+
+#[test]
+fn a_split_index_is_reported_as_undetermined_rather_than_silently_skipped() {
+    // `features.manyFiles=true` turns this on wholesale, so it is not exotic.
+    // The history scan needs no index and still runs; what must not happen is
+    // "nothing found" over an index this build could not read.
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.write_file("secrets/db.env", b"hunter2\n");
+    repo.commit_all("secret");
+    repo.git_ok(["update-index", "--split-index"]);
+
+    let output = repo.xcrypt(["status"]);
+    let text = report(&output);
+
+    assert_eq!(output.status.code(), Some(EXPOSED), "{text}");
+    assert!(text.contains("undetermined"), "{text}");
+    assert!(text.contains("split index"), "{text}");
+}
+
+#[test]
+fn packed_objects_are_scanned_as_well_as_loose_ones() {
+    // A repository anyone has cloned or garbage-collected keeps its history in
+    // pack files. A scan that only read loose objects would report the oldest
+    // and most exposed history as clean.
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("# nothing declared yet\n");
+    repo.write_file("secrets/db.env", b"hunter2\n");
+    repo.commit_all("leak");
+    repo.git_ok(["gc", "--quiet", "--aggressive", "--prune=now"]);
+    repo.write_xcrypt_config("secrets/\n");
+
+    let output = repo.xcrypt(["status"]);
+
+    assert_eq!(output.status.code(), Some(EXPOSED));
+    assert!(
+        report(&output).contains("leaked in history"),
+        "{}",
+        report(&output)
+    );
+}
+
+#[test]
+fn a_repository_with_no_commits_yet_reports_nothing_alarming() {
+    // Between `git init` and the first commit, `HEAD` is symbolic and points at
+    // a branch that does not exist. That is every new repository, and greeting
+    // it with "HEAD could not be resolved" is a bug report waiting to be filed.
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+
+    let output = repo.xcrypt(["status"]);
+
+    assert_eq!(output.status.code(), Some(0), "{}", report(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("could not be resolved"),
+        "an unborn branch was reported as a failure:\n{stderr}"
+    );
+    assert!(report(&output).contains("scanned 0 commit(s)"));
+}
+
+#[test]
+fn a_declaration_added_later_does_not_reach_an_untouched_file_and_status_says_so() {
+    // The gap this whole command exists to close, measured rather than assumed.
+    // Git decides whether to re-run the clean filter from its cached `stat`, so
+    // adding a pattern for a file that is already committed and is not then
+    // edited changes nothing: `git add -A` skips it, the next commit stores the
+    // plain text again, and the exit code is 0 with no warning anywhere.
+    //
+    // `.git-xcrypt` really is read on every `git add` — the filter does consult
+    // it — but git never asks the filter about a file it has decided is
+    // unchanged. So `status` has to catch this, and `--fix` has to repair it.
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("# nothing declared yet\n");
+    repo.write_file("secrets/db.env", b"hunter2\n");
+    repo.commit_all("before anyone declared anything");
+
+    // Past git's racy-clean window, where it re-reads regardless of the stat.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    repo.git_ok(["update-index", "--refresh"]);
+    repo.write_xcrypt_config("secrets/\n");
+    repo.commit_all("declared, but the file itself did not change");
+
+    assert_eq!(
+        repo.blob_bytes("secrets/db.env"),
+        b"hunter2\n",
+        "this test is documenting git's stat shortcut; if the blob is now \
+         ciphertext, git changed and the note in status.rs needs revisiting"
+    );
+
+    // Which is exactly what this command is for.
+    let output = repo.xcrypt(["status"]);
+    let text = report(&output);
+    assert_eq!(output.status.code(), Some(EXPOSED), "{text}");
+    assert!(text.contains("in the clear:"), "{text}");
+    assert!(text.contains("leaked in history"), "{text}");
+
+    let fixed = repo.xcrypt(["status", "--fix"]);
+    assert_eq!(fixed.status.code(), Some(EXPOSED), "{}", report(&fixed));
+    repo.git_ok(["commit", "-q", "-m", "after fix"]);
+    assert!(
+        repo.blob_bytes("secrets/db.env")
+            .starts_with(b"\0GITXCRYPT\0"),
+        "--fix did not repair what git's shortcut left behind"
+    );
 }

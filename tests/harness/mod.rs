@@ -33,13 +33,30 @@ impl TestRepo {
     /// The rest of the git configuration is deliberately inherited from the
     /// machine — see the plan's Open Risks.
     pub fn init() -> Self {
+        Self::init_with(&[])
+    }
+
+    /// Creates an empty SHA-256 repository.
+    ///
+    /// Every path that reads an object id has to be told which hash to expect:
+    /// `gix-odb` asserts on it rather than adapting, so a build that guesses
+    /// SHA-1 panics here — and a panic on the filter path aborts every git
+    /// operation in the repository.
+    pub fn init_sha256() -> Self {
+        Self::init_with(&["--object-format=sha256"])
+    }
+
+    /// Creates an empty repository, passing `extra` to `git init`.
+    pub fn init_with(extra: &[&str]) -> Self {
         require_git();
 
         let dir = TempDir::new().expect("could not create a temporary directory");
         let path = dir.path().to_path_buf();
         let repo = Self { _dir: dir, path };
 
-        repo.git_ok(["init", "-q", "-b", "main"]);
+        let mut args = vec!["init", "-q", "-b", "main"];
+        args.extend_from_slice(extra);
+        repo.git_ok(args);
         repo.git_ok(["config", "user.name", "git-xcrypt tests"]);
         repo.git_ok(["config", "user.email", "tests@git-xcrypt.invalid"]);
         repo

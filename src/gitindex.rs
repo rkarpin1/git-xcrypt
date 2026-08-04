@@ -179,6 +179,13 @@ pub fn forget_stat(index_path: &Path, hash: gix_hash::Kind, paths: &[Vec<u8>]) -
 /// rewriting one side of a conflict to point at a blob nobody asked for would be
 /// the worst kind of help.
 ///
+/// Reports the paths it actually repointed, not how many. A count cannot say
+/// *which*, and the difference is not cosmetic: a path the index spells
+/// differently than the directory does — case folding on macOS and Windows, NFD
+/// against NFC — is silently not found, and a caller left to subtract counts
+/// would name the wrong file as fixed while the real one vanished from the
+/// "still in the clear" list.
+///
 /// # Errors
 ///
 /// [`Error::Io`] when the index cannot be read or replaced. [`Error::Config`]
@@ -188,10 +195,10 @@ pub fn restage(
     index_path: &Path,
     hash: gix_hash::Kind,
     updates: &[(Vec<u8>, Vec<u8>)],
-) -> Result<Outcome> {
+) -> Result<Restaged> {
     let hash_len = hash.len_in_bytes();
     if updates.is_empty() {
-        return Ok(Outcome::Cleared(0));
+        return Ok(Restaged::Done(Vec::new()));
     }
     for (path, id) in updates {
         if id.len() != hash_len {
@@ -208,7 +215,7 @@ pub fn restage(
     // a `git add` in another terminal between our read and our write would be
     // silently reverted by a stale buffer, taking its staged changes with it.
     let Some(lock) = Lock::acquire(index_path)? else {
-        return Ok(Outcome::Skipped(format!(
+        return Ok(Restaged::Skipped(format!(
             "{}.lock is held by another git process, so nothing was re-staged. \
              Try again, or run `git add` on the reported paths yourself.",
             index_path.display()
@@ -218,7 +225,7 @@ pub fn restage(
     let data = match fs::read(index_path) {
         Ok(data) => data,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Outcome::Skipped(format!(
+            return Ok(Restaged::Skipped(format!(
                 "{} does not exist, so there is nothing staged to re-stage",
                 index_path.display()
             )));
@@ -234,38 +241,46 @@ pub fn restage(
         skip_hash,
     } = match inspect(data, hash) {
         Ok(index) => index,
-        Err(why) => return Ok(skipped(index_path, &why)),
+        Err(why) => return Ok(Restaged::Skipped(why_skipped(index_path, &why))),
     };
 
-    let mut edits: Vec<(usize, &[u8])> = Vec::new();
+    // The name comes back with the offset, so what was patched is known rather
+    // than inferred from a count.
+    let mut edits: Vec<(usize, &[u8], Vec<u8>)> = Vec::new();
     let walked = walk(&data[..body_len], version, count, hash_len, &mut |entry| {
         if entry.stage != 0 {
             return;
         }
-        if let Some((_, id)) = updates.iter().find(|(path, _)| path == entry.name) {
-            edits.push((entry.start, id.as_slice()));
+        if let Some((path, id)) = updates.iter().find(|(path, _)| path == entry.name) {
+            edits.push((entry.start, id.as_slice(), path.clone()));
         }
     });
 
     let layout = match walked {
-        None => return Ok(skipped(index_path, "its entries did not parse")),
+        None => {
+            return Ok(Restaged::Skipped(why_skipped(
+                index_path,
+                "its entries did not parse",
+            )));
+        }
         Some(walked) if walked.split_index => {
-            return Ok(skipped(
+            return Ok(Restaged::Skipped(why_skipped(
                 index_path,
                 "this repository uses a split index, whose entries live in a shared \
                  file this build does not patch",
-            ));
+            )));
         }
         Some(walked) => walked,
     };
     if edits.is_empty() {
-        return Ok(Outcome::Cleared(0));
+        return Ok(Restaged::Done(Vec::new()));
     }
 
-    let count = edits.len();
-    for (start, id) in edits {
+    let mut patched = Vec::with_capacity(edits.len());
+    for (start, id, path) in edits {
         data[start + ID_FIELD..start + ID_FIELD + hash_len].copy_from_slice(id);
         data[start + SIZE_FIELD..start + SIZE_FIELD + 4].fill(0);
+        patched.push(path);
     }
 
     // **The cache tree has to go, and this is not housekeeping.** `TREE` caches
@@ -294,14 +309,28 @@ pub fn restage(
         rebuilt.extend_from_slice(&vec![0u8; hash_len]);
     } else {
         let Some(digest) = checksum(&rebuilt, hash) else {
-            return Ok(skipped(index_path, "its checksum could not be computed"));
+            return Ok(Restaged::Skipped(why_skipped(
+                index_path,
+                "its checksum could not be computed",
+            )));
         };
         rebuilt.extend_from_slice(&digest);
     }
     debug_assert!(body_len >= layout.extensions_at);
 
     lock.commit(&rebuilt)?;
-    Ok(Outcome::Cleared(count))
+    Ok(Restaged::Done(patched))
+}
+
+/// What [`restage`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Restaged {
+    /// The paths whose entries were repointed, in the order the index stores
+    /// them. A path the caller asked about and that is missing here was **not**
+    /// re-staged, whatever the reason.
+    Done(Vec<Vec<u8>>),
+    /// Nothing was written, and why.
+    Skipped(String),
 }
 
 /// What the index says about a set of paths.
@@ -534,6 +563,18 @@ fn skipped(index_path: &Path, why: &str) -> Outcome {
          `git status` shows them as modified, `git add --renormalize .` settles it.",
         index_path.display()
     ))
+}
+
+/// The same refusal for [`restage`], whose caller has a different repair.
+///
+/// `git add --renormalize` is the wrong advice here: nothing was rewritten in
+/// the working tree, so what the user needs is to stage the paths themselves.
+fn why_skipped(index_path: &Path, why: &str) -> String {
+    format!(
+        "{} was left alone because {why}, so nothing was re-staged. \
+         `git add` on the reported paths does the same job.",
+        index_path.display()
+    )
 }
 
 /// The index checksum over `body`.
@@ -1274,7 +1315,7 @@ mod tests {
 
             assert_eq!(
                 outcome,
-                Outcome::Cleared(1),
+                Restaged::Done(vec![b"deep/nested/b.txt".to_vec()]),
                 "index version {version} was not patched"
             );
             assert_eq!(
@@ -1331,7 +1372,7 @@ mod tests {
         )
         .expect("re-staging must succeed");
 
-        assert_eq!(outcome, Outcome::Cleared(0));
+        assert_eq!(outcome, Restaged::Done(Vec::new()));
         assert_eq!(before, fs::read(index_of(&dir)).expect("reading the index"));
     }
 
@@ -1371,10 +1412,31 @@ mod tests {
         .expect("a split index is not our failure");
 
         match outcome {
-            Outcome::Skipped(message) => assert!(message.contains("split index"), "{message}"),
+            Restaged::Skipped(message) => assert!(message.contains("split index"), "{message}"),
             other => panic!("a split index must not be reported as done: {other:?}"),
         }
         assert_eq!(git_status(&dir), "", "the index was left unusable");
+    }
+
+    #[test]
+    fn a_restage_reports_which_paths_it_patched_not_how_many() {
+        // A count cannot say *which*. With a name the index does not carry mixed
+        // into the request, subtracting counts would have named the wrong file
+        // as fixed and dropped the real one from every list.
+        let dir = repo_with_index(2);
+        let id = vec![0xabu8; 20];
+
+        let outcome = restage(
+            &index_of(&dir),
+            gix_hash::Kind::Sha1,
+            &[
+                (b"a.txt".to_vec(), id.clone()),
+                (b"NEVER-EXISTED".to_vec(), id),
+            ],
+        )
+        .expect("re-staging must succeed");
+
+        assert_eq!(outcome, Restaged::Done(vec![b"a.txt".to_vec()]));
     }
 
     #[test]

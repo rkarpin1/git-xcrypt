@@ -55,6 +55,14 @@ impl Outcome {
 /// carries our magic and our key is handed back unchanged, which determinism
 /// makes exactly equal to re-encrypting it.
 ///
+/// A pure function of `(key, config, path, content)`, and kept that way. S-06
+/// wanted a warning here — "this path is already in `HEAD` in the clear" — and
+/// it lives in [`crate::filter`] instead, because answering it needs the object
+/// database and a repository handle, which neither this signature nor `lock`,
+/// the other caller, has any business carrying. `lock` depends on this function
+/// producing exactly the bytes git stores; the fewer things it can reach, the
+/// longer that stays true.
+///
 /// # Errors
 ///
 /// [`Error::NoKey`] when a path needs encrypting and no key is present,

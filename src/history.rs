@@ -162,12 +162,29 @@ pub fn scan(
 /// about history in one run, and two handles would mean two sets of open packs
 /// for the same objects.
 ///
+/// **`hash` is not optional and `gix_odb::at` is not usable.** That convenience
+/// wrapper takes the default hash, which is SHA-1, and the store *asserts* the
+/// hash of every id handed to it. Measured on git 2.55 in a repository created
+/// with `--object-format=sha256`: `git-xcrypt status` panicked inside
+/// `gix-odb`, and so did the filter on the check-in path — which with
+/// `required = true` aborts every git operation in the repository. A tool this
+/// build already reads SHA-256 indexes for must not fall over on the object
+/// database.
+///
 /// # Errors
 ///
 /// [`Error::Config`] when the database cannot be opened at all.
-pub fn objects(common_dir: &Path) -> Result<gix_odb::Handle> {
+pub fn objects(common_dir: &Path, hash: gix_hash::Kind) -> Result<gix_odb::Handle> {
     let path = common_dir.join("objects");
-    gix_odb::at(&path).map_err(|err| {
+    gix_odb::at_opts(
+        &path,
+        Vec::new(),
+        gix_odb::store::init::Options {
+            object_hash: hash,
+            ..gix_odb::store::init::Options::default()
+        },
+    )
+    .map_err(|err| {
         Error::Config(format!(
             "the object database at {} could not be opened ({err}), so this \
              repository cannot be inspected",
@@ -226,7 +243,7 @@ impl HeadLookup {
     /// repository that should stop accepting commits over it.
     #[must_use]
     pub fn open(git_dir: &Path, common_dir: &Path, hash: gix_hash::Kind) -> Option<Self> {
-        let objects = objects(common_dir).ok()?;
+        let objects = objects(common_dir, hash).ok()?;
         let options = gix_ref::store::init::Options {
             object_hash: hash,
             ..gix_ref::store::init::Options::default()
@@ -375,6 +392,16 @@ fn tips(
     let mut tips = Vec::new();
     let mut push = |mut reference: gix_ref::Reference, scan: &mut Scan| {
         let name = reference.name.as_bstr().to_string();
+        // A symbolic reference whose target does not exist yet is an unborn
+        // branch — the state of every repository between `git init` and its
+        // first commit, and of `git checkout --orphan`. It is not a failure and
+        // must not be reported as one: a fresh repository greeting the user with
+        // "HEAD could not be resolved" is a bug report waiting to be filed.
+        if let Some(target) = reference.target.try_name()
+            && matches!(store.try_find(target), Ok(None))
+        {
+            return;
+        }
         match reference.peel_to_id(&store, objects) {
             Ok(id) => tips.push(id),
             Err(err) => scan.warnings.push(format!(
@@ -580,7 +607,8 @@ mod tests {
         fn scan(&self, declarations: &str) -> Scan {
             let config = Config::parse(declarations).expect("the declarations must parse");
             let git_dir = self.dir.path().join(".git");
-            let objects = super::objects(&git_dir).expect("the object database must open");
+            let objects = super::objects(&git_dir, gix_hash::Kind::Sha1)
+                .expect("the object database must open");
             super::scan(&objects, &git_dir, &git_dir, gix_hash::Kind::Sha1, &config)
                 .expect("the scan must succeed")
         }

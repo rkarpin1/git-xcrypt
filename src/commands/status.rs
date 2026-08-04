@@ -12,6 +12,26 @@
 //! the next `git add` on a secret exits 0 and stores the plaintext. Nothing in
 //! that sequence produces a signal. Asking for one is what this command is for.
 //!
+//! The second job is `--fix`, and there is a measured reason it has to exist.
+//! The founding document says a pattern added to `.git-xcrypt` "works
+//! immediately, with no synchronising command", and that is true of the filter:
+//! it re-reads the declaration on every call. It is **not** true of git. Git
+//! decides from its cached `stat` whether to call the filter at all, so a file
+//! that was already committed and is not then edited is skipped — measured on
+//! git 2.55, past the racy-clean window:
+//!
+//! ```text
+//! git add -A && git commit            # before the pattern existed
+//! printf 'secrets/\n' > .git-xcrypt
+//! git add -A && git commit            # exit 0, no warning
+//! git cat-file blob HEAD:secrets/db.env  → hunter2
+//! ```
+//!
+//! Nothing in that sequence is wrong from git's point of view, and nothing in
+//! it tells the user. So this command reports the state and `--fix` repairs it,
+//! which is the whole reason the fix operates on the index rather than merely
+//! printing advice.
+//!
 //! The exit code is part of the contract: `5` on any finding, so the command
 //! works as a CI gate and so "the repository has a problem" is distinguishable
 //! from "the tool broke".
@@ -132,6 +152,18 @@ impl Report {
 /// the moment of printing gives up on them.
 fn show(path: &[u8]) -> String {
     bstr::BStr::new(path).to_string()
+}
+
+/// A path as a shell argument, for the command the report tells a user to run.
+///
+/// Single quotes stop the shell expanding anything; a literal quote is closed,
+/// escaped and reopened — the same escape `init` uses for the binary path it
+/// registers. Without it a file called `it's.env` would produce a command that
+/// either fails to parse or, worse, parses as something else. The report is
+/// printed and never executed by this tool, which makes correctness here a
+/// matter of not handing a user a broken instruction, not of injection.
+fn shell_quoted(path: &[u8]) -> String {
+    format!("'{}'", show(path).replace('\'', r"'\''"))
 }
 
 /// Renders the whole report, sections and remedies included.
@@ -328,7 +360,7 @@ impl Report {
         )?;
         write!(f, "\x20      git filter-repo --invert-paths")?;
         for exposure in &self.leaked {
-            write!(f, " --path '{}'", show(&exposure.path))?;
+            write!(f, " --path {}", shell_quoted(&exposure.path))?;
         }
         writeln!(f)?;
         writeln!(
@@ -418,7 +450,7 @@ pub fn run(repo: &Repo, fix: bool) -> Result<Report> {
     report.warnings.extend(declarations.pointless_eol.clone());
 
     let hash = gitindex::object_hash(gitconfig::get(&config, "extensions.objectformat").as_deref());
-    let objects = history::objects(repo.common_dir())?;
+    let objects = history::objects(repo.common_dir(), hash)?;
 
     inspect_index(repo, &declarations, &objects, hash, &mut report)?;
     if fix {
@@ -552,7 +584,7 @@ fn restage(
     let mut kept: Vec<Vec<u8>> = Vec::new();
 
     for name in std::mem::take(&mut report.in_the_clear) {
-        let path = repo.work_tree().join(std::path::Path::new(&show(&name)));
+        let path = repo.work_tree().join(working_tree_path(&name));
         let content = match std::fs::read(&path) {
             Ok(content) => zeroize::Zeroizing::new(content),
             Err(err) => {
@@ -582,30 +614,35 @@ fn restage(
     }
 
     match gitindex::restage(&repo.git_dir().join("index"), hash, &updates)? {
-        gitindex::Outcome::Cleared(count) if count == updates.len() => {
-            report.fixed = updates.into_iter().map(|(name, _)| name).collect();
+        gitindex::Restaged::Done(patched) => {
+            // Which, not how many. A path the index spells differently than the
+            // directory does — case folding on macOS and Windows, NFD against
+            // NFC — is simply not found, and subtracting counts would name the
+            // wrong file as fixed while the real one disappeared from both
+            // lists. Everything that was asked for and did not come back stays
+            // in `in_the_clear`, where it belongs.
+            let missed: Vec<Vec<u8>> = updates
+                .into_iter()
+                .map(|(name, _)| name)
+                .filter(|name| !patched.contains(name))
+                .collect();
+            if !missed.is_empty() {
+                report.warnings.push(format!(
+                    "{} path(s) were not found in the index under the name they \
+                     have on disk, so they were left as they were: {}. `git add` \
+                     on them by hand settles it.",
+                    missed.len(),
+                    missed
+                        .iter()
+                        .map(|name| show(name))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                kept.extend(missed);
+            }
+            report.fixed = patched;
         }
-        // A short count means the index spells one of these paths differently
-        // than the directory does — case folding on macOS and Windows, NFD
-        // against NFC. Those entries were not touched, so they are still in the
-        // clear and must not be reported as fixed.
-        gitindex::Outcome::Cleared(count) => {
-            report.warnings.push(format!(
-                "{} of {} path(s) were not found in the index under the name they \
-                 have on disk, so they were left as they were. `git add` on them \
-                 by hand settles it.",
-                updates.len() - count,
-                updates.len()
-            ));
-            report.undetermined.push(
-                "some paths could not be re-staged, so this repository is not in \
-                 the state --fix reports"
-                    .into(),
-            );
-            report.fixed = updates.into_iter().map(|(name, _)| name).collect();
-            report.fixed.truncate(count);
-        }
-        gitindex::Outcome::Skipped(why) => {
+        gitindex::Restaged::Skipped(why) => {
             report.warnings.push(why);
             kept.extend(updates.into_iter().map(|(name, _)| name));
         }
@@ -615,6 +652,27 @@ fn restage(
     report.in_the_clear.sort();
     report.fixed.sort();
     Ok(())
+}
+
+/// The working-tree path an index entry names, without decoding it.
+///
+/// The index spells paths as raw bytes with forward slashes, and on Unix that
+/// is what a filename is — going through a lossy `String` would turn any byte
+/// that is not UTF-8 into U+FFFD and open a file that does not exist, or worse,
+/// a different one. The same mistake was found and fixed on the filter path in
+/// the S-01 review; [`show`] is for messages only.
+fn working_tree_path(name: &[u8]) -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        std::path::PathBuf::from(std::ffi::OsStr::from_bytes(name))
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows filenames are UTF-16 and git spells them as UTF-8 here, so
+        // there is no lossless byte route and nothing is lost by this one.
+        std::path::PathBuf::from(String::from_utf8_lossy(name).into_owned())
+    }
 }
 
 /// Puts a path in front of an error that only knew about content.
@@ -683,6 +741,39 @@ mod tests {
         super::super::init::run(&repo).expect("init must succeed");
         fs::write(repo.xcrypt_config_path(), "secrets/\n").expect("declarations");
         (dir, repo)
+    }
+
+    #[test]
+    fn a_quote_in_a_path_does_not_break_the_command_the_report_hands_out() {
+        // The rewrite command is printed for a user to paste. A file called
+        // `it's.env` would otherwise produce a line the shell parses as
+        // something else entirely.
+        assert_eq!(shell_quoted(b"secrets/db.env"), "'secrets/db.env'");
+        assert_eq!(shell_quoted(b"secrets/it's.env"), r"'secrets/it'\''s.env'");
+    }
+
+    #[test]
+    fn a_working_tree_path_is_built_from_bytes_not_from_a_decoded_string() {
+        // On Unix a filename is an arbitrary byte string, and a lossy decode
+        // turns a stray byte into U+FFFD — a name no file has. The S-01 review
+        // found the same mistake on the filter path, where it meant a secret was
+        // judged under a name it did not have. Not reachable through the
+        // filesystem on macOS, which rejects non-UTF-8 names outright, so the
+        // conversion itself is what is pinned here.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            let raw = b"secrets/bad\xff.env";
+            assert_eq!(
+                working_tree_path(raw).as_os_str().as_bytes(),
+                raw,
+                "the path was decoded on its way to the filesystem"
+            );
+        }
+        assert_eq!(
+            working_tree_path(b"secrets/db.env"),
+            std::path::PathBuf::from("secrets/db.env")
+        );
     }
 
     #[test]
