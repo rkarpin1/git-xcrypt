@@ -1,9 +1,12 @@
 //! `sync` against a real git, which is the only authority on whether the
 //! generated lines mean anything.
 //!
-//! The lines are cosmetic — a stale section costs a worse `git diff`, never a
-//! secret — but "cosmetic" is not "unverified": the two files spell patterns
-//! differently, and a line git silently ignores would be worse than no line.
+//! The lines are called cosmetic because a stale section never stores a secret
+//! in the clear — but "cosmetic" has never meant "optional" here. `-text` is
+//! what keeps git's own CRLF conversion off the ciphertext, and its absence was
+//! measured eating bytes out of a committed blob and costing the file at
+//! checkout. The two files also spell patterns differently, so a rendered line
+//! git silently ignores would be worse than no line.
 
 mod harness;
 

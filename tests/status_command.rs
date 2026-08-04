@@ -1065,3 +1065,69 @@ fn an_empty_required_value_is_reported_as_the_off_switch_git_reads_it_as() {
         "the gap must name the key:\n{text}"
     );
 }
+
+#[test]
+fn a_stale_section_is_reported_as_the_corruption_it_risks_not_as_a_tidiness_nag() {
+    // A pattern added to `.git-xcrypt` takes effect for *selection* at once —
+    // the filter reads that file, not `.gitattributes` — so it is easy to read
+    // the managed lines as decoration and never run `sync`. They are not.
+    //
+    // Measured on git 2.55 and reproduced below: in that state, any other
+    // attribute source declaring the same path `text` makes git run its own
+    // CRLF conversion over the *ciphertext*. `git add` exits 0, the damaged
+    // blob is committed, and the file is gone at checkout — permanently, since
+    // nothing can authenticate the stored bytes again.
+    //
+    // The note used to say only that a clone's `unlock` would leave `git
+    // status` dirty. The wording is part of the safeguard here, so it has to
+    // name the outcome that actually costs something.
+    let secret: Vec<u8> = (0..2 * 1024 * 1024u32)
+        .map(|index| u8::try_from(index % 251).expect("a byte"))
+        .collect();
+
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    // A pattern the managed section does not know about yet: `init` rendered
+    // the section for an empty declaration, and `sync` is deliberately not run.
+    repo.write_xcrypt_config("secrets/\n");
+
+    let attributes = repo.worktree_bytes(".gitattributes");
+    let mut with_user_line = b"secrets/** text\n".to_vec();
+    with_user_line.extend_from_slice(&attributes);
+    repo.write_file(".gitattributes", &with_user_line);
+
+    repo.write_file("secrets/deep.env", &secret);
+    repo.commit_all("a secret committed before the section caught up");
+
+    // First: the risk is real, not a story the message tells.
+    assert_ne!(
+        repo.blob_bytes("secrets/deep.env").len(),
+        38 + secret.len(),
+        "this test no longer reproduces the corruption it exists to describe; \
+         if git stopped converting here, the note below should be re-examined \
+         rather than kept"
+    );
+    std::fs::remove_file(repo.path().join("secrets/deep.env")).expect("could not remove");
+    let checkout = repo.git(["checkout", "--", "secrets/deep.env"]);
+    assert!(
+        !repo.path().join("secrets/deep.env").is_file(),
+        "the damaged blob must fail to check out:\n{}",
+        String::from_utf8_lossy(&checkout.stderr)
+    );
+
+    // Second: `status` says so, in those terms.
+    let output = repo.xcrypt(["status"]);
+    let text = report(&output);
+    assert!(
+        text.contains("-text"),
+        "the note must name the attribute whose absence does the damage:\n{text}"
+    );
+    assert!(
+        text.contains("corrupt"),
+        "the note must name corruption, not only a dirty `git status`:\n{text}"
+    );
+    assert!(
+        text.contains("git-xcrypt sync"),
+        "the note must say what settles it:\n{text}"
+    );
+}

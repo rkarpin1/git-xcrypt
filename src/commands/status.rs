@@ -1046,21 +1046,34 @@ fn named(name: &[u8], err: crate::Error) -> crate::Error {
 
 /// Mentions a `.gitattributes` section that no longer matches `.git-xcrypt`.
 ///
-/// A note, never a gap: the cosmetic lines are `sync`'s job and letting them go
-/// stale never stores a secret in the clear. But `sync --check` exits 1 on this
-/// state while `status` exited 0 and said nothing, and the two commands
-/// disagreeing about the same repository is its own kind of wrong — the more so
-/// because a clone of it runs `unlock`, which rewrites the section and leaves
-/// `git status` dirty, against the founding document's own acceptance criterion.
+/// A note, never a gap: nothing here stores a secret in the clear, and code `5`
+/// means an exposure. But the note used to call the consequence a dirty `git
+/// status` after a clone's `unlock`, and that understates it badly enough to be
+/// its own defect — the wording is part of the safeguard, not decoration.
+///
+/// Measured on git 2.55. A declared path whose managed `-text` line is missing
+/// still gets encrypted (the filter reads `.git-xcrypt`, not `.gitattributes`),
+/// but git then applies **its own** CRLF conversion to the ciphertext whenever
+/// any other attribute source declares that path `text`. On a 2 MB file that ate
+/// 34 `CR` bytes: `git add` exited 0, the commit succeeded, and the later
+/// checkout failed the authentication tag and left no file at all. The blob in
+/// history cannot be decrypted by anyone, ever.
+///
+/// It takes a foreign `text` attribute to fire — our own magic starts with NUL,
+/// so `text=auto` and `core.autocrlf` alone see binary and leave it be — which
+/// is why this stays a note rather than a gap. It is not, however, cosmetic.
 fn stale_section_note(repo: &Repo, declarations: &Config) -> Option<String> {
     let lines = gitattributes::render_lines(declarations);
     let (existing, desired) = gitattributes::desired(&repo.attributes_path(), &lines).ok()?;
     (existing != desired).then(|| {
         format!(
             "{} no longer matches {} — the per-pattern lines are out of date. \
-             Nothing is stored in the clear over this, but a clone's `unlock` \
-             will rewrite them and leave `git status` dirty. `git-xcrypt sync` \
-             settles it.",
+             Nothing is stored in the clear over this, but the missing `-text` \
+             lets git apply its own CRLF conversion to the ciphertext of any \
+             path some other attribute declares `text`, which corrupts the blob \
+             silently and costs the file at checkout. A clone's `unlock` will \
+             also rewrite the section and leave `git status` dirty. \
+             `git-xcrypt sync` settles both.",
             crate::repo::ATTRIBUTES_FILE,
             crate::repo::CONFIG_FILE
         )
