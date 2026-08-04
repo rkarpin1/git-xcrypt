@@ -11,6 +11,11 @@ use harness::TestRepo;
 /// The exit code the frozen table gives to "an exposure was found".
 const EXPOSED: i32 = 5;
 
+/// Everything `status` printed to `stdout`, which is where the report belongs.
+fn report(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
 #[test]
 fn a_repository_that_was_just_initialised_passes() {
     let repo = TestRepo::init();
@@ -135,4 +140,182 @@ fn status_outside_a_repository_reports_a_configuration_error_not_an_exposure() {
         output.stdout.is_empty(),
         "a failure must not print a report"
     );
+}
+
+#[test]
+fn a_secret_committed_before_the_pattern_existed_is_found_in_history() {
+    // The failure mode the whole element exists for. Nothing in the working
+    // tree shows it, and the blob is still at the hosting provider.
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("# nothing declared yet\n");
+    repo.write_file("secrets/db.env", b"hunter2\n");
+    repo.commit_all("before anyone declared anything");
+
+    repo.write_xcrypt_config("secrets/\n");
+    let output = repo.xcrypt(["status"]);
+
+    assert_eq!(output.status.code(), Some(EXPOSED));
+    let text = report(&output);
+    assert!(text.contains("leaked in history"), "{text}");
+    assert!(text.contains("secrets/db.env"), "{text}");
+}
+
+#[test]
+fn the_history_report_puts_rotation_before_rewriting() {
+    // The wording is part of the safeguard: a rewrite cleans the repository and
+    // does not revoke the leak, so rotation has to come first and say why.
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("# nothing declared yet\n");
+    repo.write_file("secrets/db.env", b"hunter2\n");
+    repo.commit_all("leak");
+    repo.write_xcrypt_config("secrets/\n");
+
+    let text = report(&repo.xcrypt(["status"]));
+
+    let rotate = text
+        .find("ROTATE THE SECRET")
+        .unwrap_or_else(|| panic!("no rotation step:\n{text}"));
+    let rewrite = text
+        .find("git filter-repo")
+        .unwrap_or_else(|| panic!("no rewriting command:\n{text}"));
+    assert!(
+        rotate < rewrite,
+        "rewriting was offered before rotation:\n{text}"
+    );
+    assert!(
+        text.contains("does NOT undo this"),
+        "the report must not let a rewrite read as a fix:\n{text}"
+    );
+    assert!(
+        text.contains("--path 'secrets/db.env'"),
+        "the ready-made command must name the path:\n{text}"
+    );
+}
+
+#[test]
+fn a_secret_deleted_from_head_is_still_found() {
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("# nothing declared yet\n");
+    repo.write_file("secrets/db.env", b"hunter2\n");
+    repo.commit_all("the secret");
+
+    std::fs::remove_file(repo.path().join("secrets/db.env")).expect("removing");
+    repo.write_xcrypt_config("secrets/\n");
+    repo.commit_all("and gone again");
+
+    let output = repo.xcrypt(["status"]);
+
+    assert_eq!(output.status.code(), Some(EXPOSED));
+    assert!(report(&output).contains("secrets/db.env"));
+}
+
+#[test]
+fn a_repository_encrypted_from_the_first_commit_passes() {
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n*.env\n");
+    repo.write_file("secrets/db.env", b"hunter2\n");
+    repo.write_file("README.md", b"public\n");
+    repo.commit_all("all encrypted");
+
+    let output = repo.xcrypt(["status"]);
+    let text = report(&output);
+
+    assert_eq!(output.status.code(), Some(0), "{text}");
+    assert!(text.contains("encrypted: 1 declared path"), "{text}");
+    assert!(!text.contains("leaked in history"), "{text}");
+}
+
+#[test]
+fn a_file_no_pattern_reaches_is_never_reported() {
+    // The documented boundary. A secret nobody declared is invisible here, and
+    // the report says so rather than implying a clean repository is a safe one.
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.write_file("notes/passwords.txt", b"nobody declared this\n");
+    repo.commit_all("undeclared");
+
+    let output = repo.xcrypt(["status"]);
+    let text = report(&output);
+
+    assert_eq!(output.status.code(), Some(0), "{text}");
+    assert!(!text.contains("passwords.txt"), "{text}");
+    assert!(
+        text.contains("not whether"),
+        "the boundary must be stated:\n{text}"
+    );
+}
+
+#[test]
+fn a_negated_path_is_listed_apart_and_does_not_fail_the_gate() {
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n!secrets/README.md\n");
+    repo.write_file("secrets/db.env", b"hunter2\n");
+    repo.write_file("secrets/README.md", b"public on purpose\n");
+    repo.commit_all("with an exception");
+
+    let output = repo.xcrypt(["status"]);
+    let text = report(&output);
+
+    assert_eq!(output.status.code(), Some(0), "{text}");
+    assert!(text.contains("in the clear by choice"), "{text}");
+    assert!(text.contains("secrets/README.md"), "{text}");
+    assert!(!text.contains("leaked in history"), "{text}");
+}
+
+#[test]
+fn a_declared_file_staged_in_the_clear_is_reported_as_such() {
+    // A clone that was never unlocked stages plain text with exit code 0. The
+    // index is the thing that says what the next commit would push.
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.commit_all("setup");
+
+    let clone = repo.clone_without_filter();
+    clone.write_file("secrets/db.env", b"hunter2\n");
+    clone.git_ok(["add", "-A"]);
+
+    let output = clone.xcrypt(["status"]);
+    let text = report(&output);
+
+    assert_eq!(output.status.code(), Some(EXPOSED), "{text}");
+    assert!(text.contains("in the clear:"), "{text}");
+    assert!(text.contains("secrets/db.env"), "{text}");
+}
+
+#[test]
+fn a_missing_declaration_is_reported_as_undetermined_rather_than_clean() {
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    std::fs::remove_file(repo.path().join(".git-xcrypt")).expect("removing");
+
+    let output = repo.xcrypt(["status"]);
+    let text = report(&output);
+
+    assert_eq!(output.status.code(), Some(EXPOSED), "{text}");
+    assert!(text.contains("undetermined"), "{text}");
+}
+
+#[test]
+fn a_locked_repository_can_still_be_scanned() {
+    // No key, no decryption: the scan reads eleven bytes of magic per blob, so
+    // it works exactly where a user is least able to look for themselves.
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.write_file("secrets/db.env", b"hunter2\n");
+    repo.commit_all("secret");
+    repo.xcrypt_ok(["lock", "--yes"]);
+
+    let output = repo.xcrypt(["status"]);
+    let text = report(&output);
+
+    assert_eq!(output.status.code(), Some(0), "{text}");
+    assert!(text.contains("encrypted: 1 declared path"), "{text}");
 }

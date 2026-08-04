@@ -1,0 +1,675 @@
+//! Walking every reachable commit, looking for declared paths stored in the clear.
+//!
+//! This is the answer to the product's largest real risk: a secret committed
+//! **before** the pattern that covers it existed. Nothing in the working tree
+//! shows it, `HEAD` need not show it either — deleting the file does not delete
+//! the blob — and it is still sitting at the hosting provider. A shallow check
+//! would report such a repository as clean, which is worse than no check at all.
+//!
+//! Three properties shape the implementation.
+//!
+//! **No decryption, and no key.** The verdict per blob is the eleven bytes of
+//! magic at its start, so `status` works in a locked repository and in a clone
+//! that was never unlocked — which is exactly where a user most needs to ask.
+//!
+//! **Every object is looked at once.** A tree shared by a thousand commits is
+//! walked once, a blob appearing under a thousand commits is read once. Without
+//! that the cost would be quadratic in the history rather than linear in the
+//! object count, and the founding document's premise — "the cost depends on the
+//! number of objects, not their size" — would not hold. The premise holds only
+//! *approximately*, and the gap is worth naming: reading a blob through the
+//! object database decompresses all of it, not the first eleven bytes, because
+//! neither a loose object nor a packed delta can be truncated part way. The
+//! deduplication is what keeps that bounded.
+//!
+//! **Nothing here fails the scan over one bad object.** A repository with a
+//! missing object is broken in a way this command did not cause and cannot fix,
+//! and refusing outright would withhold the findings from every object that
+//! *did* read. Such objects are counted and reported, so "nothing found" and
+//! "nothing found in what I could read" never look the same.
+
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+
+use gix_hash::ObjectId;
+use gix_object::{Find as _, FindExt as _};
+use gix_ref::file::ReferenceExt as _;
+
+use crate::config::Config;
+use crate::format;
+use crate::{Error, Result};
+
+/// One declared path that reachable history holds in the clear.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Exposure {
+    /// Repository-relative path, exactly as the tree spells it.
+    pub path: Vec<u8>,
+    /// Distinct plaintext blobs stored under it, with a commit holding each.
+    pub sightings: Vec<Sighting>,
+}
+
+/// One plaintext blob, and a commit that contains it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sighting {
+    /// The blob itself.
+    pub blob: ObjectId,
+    /// A commit whose tree contains it.
+    ///
+    /// *A* commit, not the list of them: trees are deduplicated across the walk,
+    /// so the first commit to reach a given tree is the one recorded. Naming one
+    /// is what makes the finding checkable; the remedy is per path anyway, since
+    /// history rewriting takes paths and not commits.
+    pub commit: ObjectId,
+}
+
+/// What one scan found.
+#[derive(Debug, Default)]
+pub struct Scan {
+    /// Declared paths held in the clear, sorted by path.
+    pub exposed: Vec<Exposure>,
+    /// How many commits were visited.
+    pub commits: usize,
+    /// How many distinct blobs under a declared path were inspected.
+    pub blobs: usize,
+    /// Objects that could not be read, so could not be judged.
+    ///
+    /// Separate from [`Scan::warnings`] because the count changes what the
+    /// report means: a scan that skipped something has not proved anything about
+    /// it, and must not be summarised as though it had.
+    pub unreadable: usize,
+    /// Anything worth saying once, carried out so the binary owns the messages.
+    pub warnings: Vec<String>,
+}
+
+/// The most detail any single message carries about unreadable objects.
+///
+/// One line per missing object in a repository whose pack is gone would be the
+/// whole terminal; the count in [`Scan::unreadable`] carries the rest.
+const MAX_UNREADABLE_WARNINGS: usize = 5;
+
+/// Scans everything reachable in the repository at `git_dir` / `common_dir`.
+///
+/// `config` decides which paths are worth reading a blob for; everything else is
+/// skipped without touching the object database.
+///
+/// # Errors
+///
+/// [`Error::Config`] when the object database or the reference store cannot be
+/// opened at all — "cannot tell" must never be reported as "nothing is wrong" by
+/// the one command whose whole job is to tell.
+pub fn scan(
+    objects: &gix_odb::Handle,
+    git_dir: &Path,
+    common_dir: &Path,
+    hash: gix_hash::Kind,
+    config: &Config,
+) -> Result<Scan> {
+    let mut scan = Scan::default();
+    let tips = tips(git_dir, common_dir, hash, objects, &mut scan);
+
+    let mut queue: Vec<ObjectId> = tips;
+    let mut seen_commits: HashSet<ObjectId> = HashSet::new();
+    // Keyed by (tree, path it sits at): the same tree object can appear at two
+    // different paths — two directories with identical contents is ordinary —
+    // and the path is half of what the patterns match on.
+    let mut seen_trees: HashSet<(ObjectId, Vec<u8>)> = HashSet::new();
+    let mut verdicts: HashMap<ObjectId, bool> = HashMap::new();
+    let mut found: HashMap<Vec<u8>, Vec<Sighting>> = HashMap::new();
+
+    let mut buffer = Vec::new();
+    while let Some(commit) = queue.pop() {
+        if !seen_commits.insert(commit) {
+            continue;
+        }
+
+        let mut iter = match objects.find_commit_iter(&commit, &mut buffer) {
+            Ok(iter) => iter,
+            Err(err) => {
+                note_unreadable(&mut scan, &commit, &err.to_string());
+                continue;
+            }
+        };
+        let Ok(tree) = iter.tree_id() else {
+            note_unreadable(&mut scan, &commit, "its tree could not be read");
+            continue;
+        };
+        // Collected before the tree walk, which reuses the buffer this iterator
+        // borrows.
+        let parents: Vec<ObjectId> = iter.parent_ids().collect();
+
+        scan.commits += 1;
+        walk_tree(
+            objects,
+            config,
+            tree,
+            commit,
+            &mut seen_trees,
+            &mut verdicts,
+            &mut found,
+            &mut scan,
+        );
+        queue.extend(parents);
+    }
+
+    scan.blobs = verdicts.len();
+    scan.exposed = collect(found);
+    Ok(scan)
+}
+
+/// Opens the repository's object database.
+///
+/// Shared rather than opened per question: `status` asks about the index and
+/// about history in one run, and two handles would mean two sets of open packs
+/// for the same objects.
+///
+/// # Errors
+///
+/// [`Error::Config`] when the database cannot be opened at all.
+pub fn objects(common_dir: &Path) -> Result<gix_odb::Handle> {
+    let path = common_dir.join("objects");
+    gix_odb::at(&path).map_err(|err| {
+        Error::Config(format!(
+            "the object database at {} could not be opened ({err}), so this \
+             repository cannot be inspected",
+            path.display()
+        ))
+    })
+}
+
+/// Whether the blob `id` is stored without our magic.
+///
+/// `None` when the object is not there to be judged, which a caller has to
+/// report rather than read as "fine": the whole point of this command is that
+/// silence and safety are different things.
+#[must_use]
+pub fn stored_in_the_clear(objects: &gix_odb::Handle, id: &gix_hash::oid) -> Option<bool> {
+    let mut buffer = Vec::new();
+    match objects.try_find(id, &mut buffer) {
+        Ok(Some(data)) => Some(!format::looks_encrypted(data.data)),
+        Ok(None) | Err(_) => None,
+    }
+}
+
+/// Turns the gathered sightings into a stable, sorted report.
+fn collect(found: HashMap<Vec<u8>, Vec<Sighting>>) -> Vec<Exposure> {
+    let mut exposed: Vec<Exposure> = found
+        .into_iter()
+        .map(|(path, mut sightings)| {
+            sightings.sort_by_key(|sighting| sighting.blob);
+            Exposure { path, sightings }
+        })
+        .collect();
+    exposed.sort_by(|left, right| left.path.cmp(&right.path));
+    exposed
+}
+
+/// Every commit reachable from a reference, `HEAD` included.
+///
+/// Failures are per reference: a repository with one broken tag still has a
+/// history worth scanning, and refusing the whole command over it would hide
+/// every finding in the rest.
+fn tips(
+    git_dir: &Path,
+    common_dir: &Path,
+    hash: gix_hash::Kind,
+    objects: &dyn gix_object::Find,
+    scan: &mut Scan,
+) -> Vec<ObjectId> {
+    let options = gix_ref::store::init::Options {
+        object_hash: hash,
+        ..gix_ref::store::init::Options::default()
+    };
+    // A linked worktree keeps its own `HEAD` beside the shared `refs/`, so the
+    // store has to be told about both. Opening it at the git directory alone
+    // would leave every branch invisible and report a repository with plenty of
+    // history as having none.
+    let store = if git_dir == common_dir {
+        gix_ref::file::Store::at(git_dir.to_path_buf(), options)
+    } else {
+        gix_ref::file::Store::for_linked_worktree(
+            git_dir.to_path_buf(),
+            common_dir.to_path_buf(),
+            options,
+        )
+    };
+
+    let mut tips = Vec::new();
+    let mut push = |mut reference: gix_ref::Reference, scan: &mut Scan| {
+        let name = reference.name.as_bstr().to_string();
+        match reference.peel_to_id(&store, objects) {
+            Ok(id) => tips.push(id),
+            Err(err) => scan.warnings.push(format!(
+                "{name}: not scanned, it could not be resolved ({err})"
+            )),
+        }
+    };
+
+    match store.iter() {
+        Ok(platform) => match platform.all() {
+            Ok(references) => {
+                for reference in references {
+                    match reference {
+                        Ok(reference) => push(reference, scan),
+                        Err(err) => scan
+                            .warnings
+                            .push(format!("a reference could not be read ({err})")),
+                    }
+                }
+            }
+            Err(err) => scan
+                .warnings
+                .push(format!("the references could not be listed ({err})")),
+        },
+        Err(err) => scan
+            .warnings
+            .push(format!("packed-refs could not be read ({err})")),
+    }
+
+    // `HEAD` is a pseudo-reference and is not part of `all()`. On a detached
+    // checkout it is the only thing naming the current commit, so leaving it out
+    // would make exactly the state a bisect leaves you in unscannable.
+    match store.try_find("HEAD") {
+        Ok(Some(head)) => push(head, scan),
+        // An unborn branch: a fresh repository with no commit yet.
+        Ok(None) => {}
+        Err(err) => scan
+            .warnings
+            .push(format!("HEAD could not be read ({err})")),
+    }
+
+    tips.sort();
+    tips.dedup();
+    tips
+}
+
+/// Walks one tree, descending into subtrees and judging declared blobs.
+///
+/// Iterative rather than recursive: a repository is free to contain a path
+/// thousands of directories deep, and a stack overflow in a diagnostic command
+/// would be a crash where a report belongs.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one walk with one set of caches; splitting the state would mean \
+              threading a struct that exists only to satisfy the count"
+)]
+fn walk_tree(
+    objects: &gix_odb::Handle,
+    config: &Config,
+    root: ObjectId,
+    commit: ObjectId,
+    seen_trees: &mut HashSet<(ObjectId, Vec<u8>)>,
+    verdicts: &mut HashMap<ObjectId, bool>,
+    found: &mut HashMap<Vec<u8>, Vec<Sighting>>,
+    scan: &mut Scan,
+) {
+    let mut pending = vec![(root, Vec::new())];
+
+    while let Some((tree, prefix)) = pending.pop() {
+        if !seen_trees.insert((tree, prefix.clone())) {
+            continue;
+        }
+
+        let mut buffer = Vec::new();
+        let entries = match objects.find_tree_iter(&tree, &mut buffer) {
+            Ok(entries) => entries,
+            Err(err) => {
+                note_unreadable(scan, &tree, &err.to_string());
+                continue;
+            }
+        };
+
+        for entry in entries {
+            let Ok(entry) = entry else {
+                note_unreadable(scan, &tree, "one of its entries did not parse");
+                break;
+            };
+
+            let mut path = prefix.clone();
+            if !path.is_empty() {
+                path.push(b'/');
+            }
+            path.extend_from_slice(entry.filename);
+
+            if entry.mode.is_tree() {
+                pending.push((entry.oid.to_owned(), path));
+                continue;
+            }
+            // Symlinks and submodule gitlinks are never filtered by git, so
+            // there is nothing about them a declaration could have enforced.
+            if !entry.mode.is_blob() {
+                continue;
+            }
+            if !config.decide(&path).encrypt {
+                continue;
+            }
+
+            let id = entry.oid.to_owned();
+            let clear = match verdicts.get(&id) {
+                Some(clear) => *clear,
+                None => {
+                    let Some(clear) = is_clear(objects, &id, scan) else {
+                        continue;
+                    };
+                    verdicts.insert(id, clear);
+                    clear
+                }
+            };
+
+            if clear {
+                let sightings = found.entry(path).or_default();
+                if !sightings.iter().any(|sighting| sighting.blob == id) {
+                    sightings.push(Sighting { blob: id, commit });
+                }
+            }
+        }
+    }
+}
+
+/// Whether a blob is stored without our magic, or `None` if it could not be read.
+fn is_clear(objects: &gix_odb::Handle, id: &ObjectId, scan: &mut Scan) -> Option<bool> {
+    let mut buffer = Vec::new();
+    match objects.try_find(id, &mut buffer) {
+        Ok(Some(data)) => Some(!format::looks_encrypted(data.data)),
+        Ok(None) => {
+            note_unreadable(scan, id, "it is not in this repository's object database");
+            None
+        }
+        Err(err) => {
+            note_unreadable(scan, id, &err.to_string());
+            None
+        }
+    }
+}
+
+/// Records an object the scan could not judge.
+fn note_unreadable(scan: &mut Scan, id: &ObjectId, why: &str) {
+    scan.unreadable += 1;
+    if scan.warnings.len() < MAX_UNREADABLE_WARNINGS {
+        scan.warnings.push(format!("{id}: not scanned, {why}"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto;
+    use crate::key::{MASTER_KEY_LEN, MasterKey};
+    use std::fs;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    /// Drives a real repository: only git's own objects prove any of this.
+    struct Fixture {
+        dir: TempDir,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let dir = TempDir::new().expect("temporary directory");
+            let fixture = Self { dir };
+            fixture.git(&["init", "-q", "-b", "main"]);
+            fixture.git(&["config", "user.name", "t"]);
+            fixture.git(&["config", "user.email", "t@t.invalid"]);
+            fixture
+        }
+
+        fn git(&self, args: &[&str]) -> std::process::Output {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(self.dir.path())
+                .output()
+                .expect("git must be on PATH");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        }
+
+        fn write(&self, relative: &str, content: &[u8]) {
+            let path = self.dir.path().join(relative);
+            fs::create_dir_all(path.parent().expect("a parent")).expect("directories");
+            fs::write(path, content).expect("writing");
+        }
+
+        fn commit(&self, message: &str) {
+            self.git(&["add", "-A"]);
+            self.git(&["commit", "-q", "-m", message]);
+        }
+
+        fn scan(&self, declarations: &str) -> Scan {
+            let config = Config::parse(declarations).expect("the declarations must parse");
+            let git_dir = self.dir.path().join(".git");
+            let objects = super::objects(&git_dir).expect("the object database must open");
+            super::scan(&objects, &git_dir, &git_dir, gix_hash::Kind::Sha1, &config)
+                .expect("the scan must succeed")
+        }
+    }
+
+    fn key() -> MasterKey {
+        MasterKey::from_bytes([7u8; MASTER_KEY_LEN])
+    }
+
+    fn paths(scan: &Scan) -> Vec<String> {
+        scan.exposed
+            .iter()
+            .map(|exposure| String::from_utf8_lossy(&exposure.path).into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_secret_committed_before_the_pattern_existed_is_found() {
+        let fixture = Fixture::new();
+        fixture.write("secrets/db.env", b"hunter2\n");
+        fixture.commit("before anyone declared anything");
+
+        let scan = fixture.scan("secrets/\n");
+
+        assert_eq!(paths(&scan), ["secrets/db.env"]);
+        assert_eq!(scan.exposed[0].sightings.len(), 1);
+    }
+
+    #[test]
+    fn a_secret_deleted_from_head_is_still_found() {
+        // The case that makes a shallow check worthless: the working tree is
+        // clean, `HEAD` shows nothing, and the blob is still at the host.
+        let fixture = Fixture::new();
+        fixture.write("secrets/db.env", b"hunter2\n");
+        fixture.commit("the secret");
+        fs::remove_file(fixture.dir.path().join("secrets/db.env")).expect("removing");
+        fixture.write("README.md", b"nothing to see\n");
+        fixture.commit("and gone again");
+
+        let scan = fixture.scan("secrets/\n");
+
+        assert_eq!(paths(&scan), ["secrets/db.env"]);
+    }
+
+    #[test]
+    fn a_history_that_was_encrypted_throughout_is_clean() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "secrets/db.env",
+            &crypto::encrypt(&key(), 0, b"hunter2\n").expect("encryption"),
+        );
+        fixture.commit("stored as ciphertext");
+
+        let scan = fixture.scan("secrets/\n");
+
+        assert!(scan.exposed.is_empty(), "{:?}", paths(&scan));
+        assert_eq!(scan.unreadable, 0);
+    }
+
+    #[test]
+    fn a_path_no_pattern_reaches_is_invisible() {
+        // The documented boundary of the command: it answers "are my
+        // declarations enforced", not "are there secrets here".
+        let fixture = Fixture::new();
+        fixture.write("notes.txt", b"not declared\n");
+        fixture.commit("ordinary");
+
+        let scan = fixture.scan("secrets/\n");
+
+        assert!(scan.exposed.is_empty(), "{:?}", paths(&scan));
+    }
+
+    #[test]
+    fn a_negated_path_is_not_reported_as_an_exposure() {
+        let fixture = Fixture::new();
+        fixture.write("secrets/README.md", b"public on purpose\n");
+        fixture.commit("the exception");
+
+        let scan = fixture.scan("secrets/\n!secrets/README.md\n");
+
+        assert!(scan.exposed.is_empty(), "{:?}", paths(&scan));
+    }
+
+    #[test]
+    fn a_secret_on_a_branch_that_head_never_saw_is_found() {
+        // "Reachable history" is every reference, not the current one.
+        let fixture = Fixture::new();
+        fixture.write("README.md", b"start\n");
+        fixture.commit("start");
+        fixture.git(&["checkout", "-q", "-b", "side"]);
+        fixture.write("secrets/side.env", b"hunter2\n");
+        fixture.commit("on the side");
+        fixture.git(&["checkout", "-q", "main"]);
+
+        let scan = fixture.scan("secrets/\n");
+
+        assert_eq!(paths(&scan), ["secrets/side.env"]);
+    }
+
+    #[test]
+    fn a_secret_reachable_only_through_a_tag_is_found() {
+        // An annotated tag is an object of its own; without peeling it, the
+        // commit behind it would never enter the walk.
+        let fixture = Fixture::new();
+        fixture.write("README.md", b"start\n");
+        fixture.commit("start");
+        fixture.write("secrets/tagged.env", b"hunter2\n");
+        fixture.commit("tagged");
+        fixture.git(&["tag", "-a", "v1", "-m", "release"]);
+        fixture.git(&["reset", "-q", "--hard", "HEAD~1"]);
+
+        let scan = fixture.scan("secrets/\n");
+
+        assert_eq!(paths(&scan), ["secrets/tagged.env"]);
+    }
+
+    #[test]
+    fn a_detached_head_is_still_scanned() {
+        let fixture = Fixture::new();
+        fixture.write("README.md", b"start\n");
+        fixture.commit("start");
+        fixture.write("secrets/db.env", b"hunter2\n");
+        fixture.commit("the secret");
+        let head = fixture.git(&["rev-parse", "HEAD"]);
+        let head = String::from_utf8(head.stdout).expect("a hash");
+        fixture.git(&["checkout", "-q", "--detach", head.trim()]);
+        // The branch is moved off the secret afterwards, so `HEAD` is the only
+        // reference that still reaches it.
+        fixture.git(&["branch", "-q", "-f", "main", "HEAD~1"]);
+
+        let scan = fixture.scan("secrets/\n");
+
+        assert_eq!(paths(&scan), ["secrets/db.env"]);
+    }
+
+    #[test]
+    fn a_repository_with_no_commits_scans_to_nothing() {
+        let fixture = Fixture::new();
+
+        let scan = fixture.scan("secrets/\n");
+
+        assert!(scan.exposed.is_empty());
+        assert_eq!(scan.commits, 0);
+        assert_eq!(scan.unreadable, 0);
+    }
+
+    #[test]
+    fn the_same_blob_under_many_commits_is_reported_once() {
+        let fixture = Fixture::new();
+        fixture.write("secrets/db.env", b"hunter2\n");
+        fixture.commit("one");
+        fixture.write("README.md", b"a\n");
+        fixture.commit("two");
+        fixture.write("README.md", b"b\n");
+        fixture.commit("three");
+
+        let scan = fixture.scan("secrets/\n");
+
+        assert_eq!(paths(&scan), ["secrets/db.env"]);
+        assert_eq!(
+            scan.exposed[0].sightings.len(),
+            1,
+            "the same blob was counted once per commit"
+        );
+    }
+
+    #[test]
+    fn two_different_plaintexts_under_one_path_are_both_reported() {
+        let fixture = Fixture::new();
+        fixture.write("secrets/db.env", b"first\n");
+        fixture.commit("one");
+        fixture.write("secrets/db.env", b"second\n");
+        fixture.commit("two");
+
+        let scan = fixture.scan("secrets/\n");
+
+        assert_eq!(paths(&scan), ["secrets/db.env"]);
+        assert_eq!(scan.exposed[0].sightings.len(), 2);
+    }
+
+    #[test]
+    fn a_submodule_gitlink_is_not_mistaken_for_a_blob() {
+        // A gitlink entry names a commit in another repository. Reading it as a
+        // blob would report the parent as exposed over a file it does not hold.
+        let inner = Fixture::new();
+        inner.write("secrets/theirs.env", b"not ours\n");
+        inner.commit("inner");
+
+        let outer = Fixture::new();
+        outer.write("README.md", b"outer\n");
+        outer.commit("outer");
+        let inner_path = inner.dir.path().to_string_lossy().into_owned();
+        outer.git(&[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "--quiet",
+            "add",
+            &inner_path,
+            "vendor/sub",
+        ]);
+        outer.commit("with a submodule");
+
+        let scan = outer.scan("vendor/\n");
+
+        assert!(
+            scan.exposed.is_empty(),
+            "a gitlink was read as content: {:?}",
+            paths(&scan)
+        );
+        assert_eq!(scan.unreadable, 0);
+    }
+
+    #[test]
+    fn a_symlink_is_not_judged() {
+        // Git never filters a symlink, so no declaration could have covered it.
+        let fixture = Fixture::new();
+        fixture.write("secrets/real.env", b"x\n");
+        std::os::unix::fs::symlink("real.env", fixture.dir.path().join("secrets/link.env"))
+            .expect("symlink");
+        fixture.commit("a link");
+
+        let scan = fixture.scan("*.env\n");
+
+        assert_eq!(
+            paths(&scan),
+            ["secrets/real.env"],
+            "the symlink was judged as content"
+        );
+    }
+}

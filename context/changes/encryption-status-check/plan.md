@@ -187,22 +187,22 @@ niezerowy. Sprawdzenie musi być tanie: pojedynczy odczyt, żadnego przejścia p
 
 #### Automatyczne
 
-- [x] 1.1 Świeży klon bez `unlock` daje kod `5` i wskazuje braki
-- [x] 1.2 Repozytorium po `init` daje kod `0`
-- [x] 1.3 Usunięcie `required = true` jest wykrywane
-- [x] 1.4 `cargo clippy --all-targets -- -D warnings`
+- [x] 1.1 Świeży klon bez `unlock` daje kod `5` i wskazuje braki — 1787073
+- [x] 1.2 Repozytorium po `init` daje kod `0` — 1787073
+- [x] 1.3 Usunięcie `required = true` jest wykrywane — 1787073
+- [x] 1.4 `cargo clippy --all-targets -- -D warnings` — 1787073
 
 ### Faza 2: Skan historii
 
 #### Automatyczne
 
-- [ ] 2.1 Sekret sprzed dopisania wzorca jest wykrywany
-- [ ] 2.2 Sekret usunięty z `HEAD` nadal jest wykrywany
-- [ ] 2.3 Repozytorium szyfrowane od początku daje kod `0`
-- [ ] 2.4 Plik spoza wzorców nie jest raportowany
-- [ ] 2.5 Negacje raportowane osobno, nie jako błąd
-- [ ] 2.6 Raport zawiera zdanie o rotacji sekretu
-- [ ] 2.7 `cargo clippy --all-targets -- -D warnings`
+- [x] 2.1 Sekret sprzed dopisania wzorca jest wykrywany
+- [x] 2.2 Sekret usunięty z `HEAD` nadal jest wykrywany
+- [x] 2.3 Repozytorium szyfrowane od początku daje kod `0`
+- [x] 2.4 Plik spoza wzorców nie jest raportowany
+- [x] 2.5 Negacje raportowane osobno, nie jako błąd
+- [x] 2.6 Raport zawiera zdanie o rotacji sekretu
+- [x] 2.7 `cargo clippy --all-targets -- -D warnings`
 
 ### Faza 3: `--fix` i ostrzeżenie na ścieżce filtra
 

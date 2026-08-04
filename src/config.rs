@@ -229,6 +229,31 @@ impl Config {
         self.decide_ignoring_exclusions(path)
     }
 
+    /// Whether a negation is what keeps `path` out of the encrypted set.
+    ///
+    /// `status` reports such paths in a section of their own rather than leaving
+    /// them out. A `!secrets/README.md` under a `secrets/` line is a deliberate
+    /// hole in the declaration, and the founding document is explicit that a
+    /// deliberate hole must never be an invisible one — silence here reads as
+    /// "everything under `secrets/` is covered", which is the belief that lets a
+    /// secret be filed under the exception by mistake.
+    ///
+    /// False for a path no pattern reaches at all: that is not an exception, it
+    /// is simply a file nobody declared.
+    #[must_use]
+    pub fn negated(&self, path: &[u8]) -> bool {
+        if is_never_encrypted(path) {
+            // Not an exception either. These are excluded by the tool, not by
+            // anything the user wrote, and listing them as "in the clear by
+            // choice" would attribute a decision nobody made.
+            return false;
+        }
+        self.rules
+            .iter()
+            .rfind(|rule| matches(&rule.pattern, path))
+            .is_some_and(|rule| rule.pattern.is_negative())
+    }
+
     /// What the patterns alone say, with the bootstrap exclusions set aside.
     ///
     /// Only one caller wants this: rendering `.gitattributes` has to know
@@ -411,6 +436,29 @@ mod tests {
         let config = config("secrets/\n!secrets/README.md\n");
         assert!(config.decide(b"secrets/password").encrypt);
         assert!(!config.decide(b"secrets/README.md").encrypt);
+    }
+
+    #[test]
+    fn a_negation_is_distinguishable_from_never_having_matched() {
+        // `status` lists the first as a deliberate hole and says nothing about
+        // the second. Collapsing the two would either hide an exception the user
+        // wrote or report every ordinary file as one.
+        let with_exception = config("secrets/\n!secrets/README.md\n");
+        assert!(with_exception.negated(b"secrets/README.md"));
+        assert!(!with_exception.negated(b"secrets/password"));
+        assert!(
+            !with_exception.negated(b"README.md"),
+            "a path no pattern reaches is not an exception"
+        );
+        assert!(
+            !config("*\n").negated(ATTRIBUTES_FILE.as_bytes()),
+            "the bootstrap files are excluded by the tool, not by anything a \
+             user wrote"
+        );
+        assert!(
+            !config("!secrets/README.md\nsecrets/\n").negated(b"secrets/README.md"),
+            "a later selection overrules the negation, so it is not an exception"
+        );
     }
 
     #[test]

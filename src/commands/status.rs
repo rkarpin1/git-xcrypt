@@ -18,8 +18,9 @@
 
 use std::fmt;
 
+use crate::config::Config;
 use crate::repo::{DRIVER, Repo};
-use crate::{Result, gitattributes, gitconfig};
+use crate::{Result, gitattributes, gitconfig, gitindex, history};
 
 /// One reason git would not be filtering this repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,16 +61,49 @@ impl fmt::Display for SetupGap {
 }
 
 /// What `status` found.
+///
+/// Four sections, deliberately separate, because the remedies are four different
+/// things and a single list would hide which one applies.
 #[derive(Debug, Default)]
 pub struct Report {
     /// Reasons git is not filtering here. Any of these means the guarantee is off.
     pub setup: Vec<SetupGap>,
     /// Whether a repository key is present at all.
     pub has_key: bool,
+    /// Declared paths the index already stores as ciphertext. The good case.
+    pub encrypted: Vec<Vec<u8>>,
+    /// Declared paths the index stores **in the clear** — what a commit made now
+    /// would push. This is the set `--fix` repairs.
+    pub in_the_clear: Vec<Vec<u8>>,
+    /// Declared paths that reachable history holds in the clear.
+    ///
+    /// Nothing local repairs this. The report says so in as many words.
+    pub leaked: Vec<crate::history::Exposure>,
+    /// Paths a negation deliberately keeps in the clear.
+    ///
+    /// Listed rather than left out: a hole a user wrote on purpose must not be
+    /// invisible, or the declaration reads as covering more than it does.
+    pub by_choice: Vec<Vec<u8>>,
+    /// Things this build could not determine, and why.
+    ///
+    /// These fail the gate. "I could not tell" reported as a pass is the one
+    /// answer a command like this must never give.
+    pub undetermined: Vec<String>,
+    /// How much history was walked, for the closing line.
+    pub scanned: Scanned,
     /// Notes that describe a lesser problem and never change the exit code.
     pub notes: Vec<String>,
     /// Anything worth saying once, carried out so the binary owns the messages.
     pub warnings: Vec<String>,
+}
+
+/// How much of the repository the scan covered.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Scanned {
+    /// Commits visited.
+    pub commits: usize,
+    /// Distinct blobs under a declared path that were read.
+    pub blobs: usize,
 }
 
 impl Report {
@@ -77,7 +111,19 @@ impl Report {
     #[must_use]
     pub fn exposed(&self) -> bool {
         !self.setup.is_empty()
+            || !self.in_the_clear.is_empty()
+            || !self.leaked.is_empty()
+            || !self.undetermined.is_empty()
     }
+}
+
+/// A repository-relative path as a message shows it.
+///
+/// Lossy on purpose and only here: a path is arbitrary bytes on Unix, so the
+/// decision paths — matching, hashing, index lookup — keep the bytes, and only
+/// the moment of printing gives up on them.
+fn show(path: &[u8]) -> String {
+    bstr::BStr::new(path).to_string()
 }
 
 /// Renders the whole report, sections and remedies included.
@@ -111,8 +157,164 @@ impl fmt::Display for Report {
             }
         }
 
+        self.write_undetermined(f)?;
+        self.write_encrypted(f)?;
+        self.write_in_the_clear(f)?;
+        self.write_leaked(f)?;
+        self.write_by_choice(f)?;
+
         for note in &self.notes {
             writeln!(f, "\nnote: {note}")?;
+        }
+
+        writeln!(
+            f,
+            "\nscanned {} commit(s) and {} distinct blob(s) under a declared path. \
+             `status` answers whether your declarations are enforced, not whether \
+             this repository holds secrets: a path no pattern ever matched is \
+             invisible to it.",
+            self.scanned.commits, self.scanned.blobs
+        )
+    }
+}
+
+impl Report {
+    /// What could not be determined, and therefore what nothing here proves.
+    fn write_undetermined(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.undetermined.is_empty() {
+            return Ok(());
+        }
+        writeln!(
+            f,
+            "\nundetermined: this run could not answer the following, so nothing \
+             below is a clean bill of health."
+        )?;
+        for reason in &self.undetermined {
+            writeln!(f, "  - {reason}")?;
+        }
+        Ok(())
+    }
+
+    /// The good case: declared and already stored as ciphertext.
+    fn write_encrypted(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.encrypted.is_empty() {
+            return Ok(());
+        }
+        writeln!(
+            f,
+            "\nencrypted: {} declared path(s) are stored as ciphertext.",
+            self.encrypted.len()
+        )?;
+        for path in &self.encrypted {
+            writeln!(f, "  {}", show(path))?;
+        }
+        Ok(())
+    }
+
+    /// Declared, and stored in the clear right now.
+    fn write_in_the_clear(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.in_the_clear.is_empty() {
+            return Ok(());
+        }
+        writeln!(
+            f,
+            "\nin the clear: {} declared path(s) are stored unencrypted right now, \
+             so a commit made from here would push the plain text.",
+            self.in_the_clear.len()
+        )?;
+        for path in &self.in_the_clear {
+            writeln!(f, "  {}", show(path))?;
+        }
+        writeln!(
+            f,
+            "\n  `git add` on each of them re-stages the content through the filter, \
+             and `git-xcrypt status --fix` does exactly that for all of them at once. \
+             It changes what the NEXT commit stores. It does not touch history, and \
+             any plain text already committed stays where it is."
+        )
+    }
+
+    /// Declared, and somewhere in reachable history in the clear.
+    ///
+    /// The wording is load-bearing. Rewriting history does not undo a leak — the
+    /// plaintext is in every clone, fork, cache and CI log that ever saw it — so
+    /// the procedure has to open with rotation and say why. A user who reads
+    /// "cleaned up" here has been told the wrong thing.
+    fn write_leaked(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.leaked.is_empty() {
+            return Ok(());
+        }
+        writeln!(
+            f,
+            "\nleaked in history: {} declared path(s) sat in this repository in the \
+             clear at some point, and the blobs are still here.",
+            self.leaked.len()
+        )?;
+        for exposure in &self.leaked {
+            writeln!(
+                f,
+                "  {} — {} plaintext blob(s)",
+                show(&exposure.path),
+                exposure.sightings.len()
+            )?;
+            for sighting in &exposure.sightings {
+                writeln!(
+                    f,
+                    "      blob {} in commit {}",
+                    sighting.blob, sighting.commit
+                )?;
+            }
+        }
+
+        writeln!(
+            f,
+            "\n  Rewriting history does NOT undo this. If the repository was ever \
+             pushed, the plain text is in every clone, fork, cache and CI log that \
+             saw it. In order:"
+        )?;
+        writeln!(
+            f,
+            "\n  1. ROTATE THE SECRET. This is the only step that actually revokes \
+             the exposure, and it is worth doing even if you do nothing else."
+        )?;
+        writeln!(
+            f,
+            "  2. Re-stage the current content so future commits are encrypted:\n\
+             \x20      git-xcrypt status --fix"
+        )?;
+        writeln!(
+            f,
+            "  3. Only then, and only if you also want the old blobs gone, rewrite \
+             history with the external git-filter-repo. git-xcrypt does not rewrite \
+             history and will not pretend to:"
+        )?;
+        write!(f, "\x20      git filter-repo --invert-paths")?;
+        for exposure in &self.leaked {
+            write!(f, " --path '{}'", show(&exposure.path))?;
+        }
+        writeln!(f)?;
+        writeln!(
+            f,
+            "     That deletes the file from every commit. To keep the file and drop \
+             only its history, remove it, rewrite, then add it back through the \
+             filter. Either way everyone with a clone has to re-clone."
+        )
+    }
+
+    /// Paths a negation keeps in the clear on purpose.
+    fn write_by_choice(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.by_choice.is_empty() {
+            return Ok(());
+        }
+        writeln!(
+            f,
+            "\nin the clear by choice: {} path(s) a `!` line in {} takes back out, \
+             so they are stored unencrypted on purpose.",
+            self.by_choice.len(),
+            crate::repo::CONFIG_FILE
+        )?;
+        for path in &self.by_choice {
+            writeln!(f, "  {}", show(path))?;
         }
         Ok(())
     }
@@ -161,7 +363,113 @@ pub fn run(repo: &Repo) -> Result<Report> {
     }
 
     report.notes.extend(diff_driver_note(repo, &config));
+
+    let declarations = Config::load(&repo.xcrypt_config_path())?;
+    if declarations.missing {
+        // Without the declaration nothing below can be answered at all, and the
+        // check-in path refuses on the same state — so this repository is not
+        // leaking, it is simply unusable until the file comes back.
+        report.undetermined.push(format!(
+            "{} is missing, so nothing here declares what to encrypt. Every \
+             `git add` in this repository refuses until it is restored; \
+             `git-xcrypt init` creates one.",
+            crate::repo::CONFIG_FILE
+        ));
+        return Ok(report);
+    }
+    report.warnings.extend(declarations.pointless_eol.clone());
+
+    let hash = gitindex::object_hash(gitconfig::get(&config, "extensions.objectformat").as_deref());
+    let objects = history::objects(repo.common_dir())?;
+
+    inspect_index(repo, &declarations, &objects, hash, &mut report)?;
+
+    let scan = history::scan(
+        &objects,
+        repo.git_dir(),
+        repo.common_dir(),
+        hash,
+        &declarations,
+    )?;
+    report.scanned = Scanned {
+        commits: scan.commits,
+        blobs: scan.blobs,
+    };
+    report.warnings.extend(scan.warnings);
+    if scan.unreadable > 0 {
+        report.undetermined.push(format!(
+            "{} object(s) in this repository could not be read, so they were not \
+             judged. A history scan that skipped something has proved nothing \
+             about it; `git fsck` says what is missing.",
+            scan.unreadable
+        ));
+    }
+    report.leaked = scan.exposed;
+
     Ok(report)
+}
+
+/// Reads what the index would have the next commit store.
+///
+/// The index rather than `HEAD`, because that is the question with a remedy: a
+/// declared path whose staged blob is plain text is what a commit made now would
+/// push, and `git add` fixes exactly that. `HEAD` is covered by the history scan,
+/// which reaches it along with everything else.
+fn inspect_index(
+    repo: &Repo,
+    declarations: &Config,
+    objects: &gix_odb::Handle,
+    hash: gix_hash::Kind,
+    report: &mut Report,
+) -> Result<()> {
+    let index_path = repo.git_dir().join("index");
+    let entries = match gitindex::list(&index_path, hash)? {
+        gitindex::Listed::Read(entries) => entries,
+        gitindex::Listed::Unavailable(why) => {
+            // Refusing outright would withhold the history scan, which needs no
+            // index at all and carries the finding that matters most. Failing
+            // the gate over it keeps "could not tell" from reading as "fine".
+            report.undetermined.push(format!(
+                "{} could not be used because {why}, so nothing is known about what \
+                 the next commit would store. For a split index, \
+                 `git update-index --no-split-index` converts it back.",
+                index_path.display()
+            ));
+            return Ok(());
+        }
+    };
+
+    for (name, id) in entries {
+        if declarations.negated(&name) {
+            report.by_choice.push(name);
+            continue;
+        }
+        if !declarations.decide(&name).encrypt {
+            continue;
+        }
+
+        let Ok(id) = gix_hash::oid::try_from_bytes(&id) else {
+            report.undetermined.push(format!(
+                "{}: the index records an object id this build cannot read",
+                show(&name)
+            ));
+            continue;
+        };
+        match history::stored_in_the_clear(objects, id) {
+            Some(true) => report.in_the_clear.push(name),
+            Some(false) => report.encrypted.push(name),
+            None => report.undetermined.push(format!(
+                "{}: the index names object {id}, which is not in this repository's \
+                 object database, so what it holds is unknown",
+                show(&name)
+            )),
+        }
+    }
+
+    report.encrypted.sort();
+    report.in_the_clear.sort();
+    report.by_choice.sort();
+    Ok(())
 }
 
 /// Mentions an absent diff driver, without letting it fail the gate.

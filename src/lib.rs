@@ -21,6 +21,7 @@ pub mod format;
 pub mod gitattributes;
 pub mod gitconfig;
 pub mod gitindex;
+pub mod history;
 pub mod key;
 pub mod keyfile;
 pub mod pktline;

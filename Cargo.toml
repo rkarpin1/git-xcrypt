@@ -18,6 +18,14 @@ gix-config = "0.59.0"
 gix-discover = { version = "0.54.0", features = ["sha1"] }
 gix-glob = "0.27.0"
 gix-hash = { version = "0.26", features = ["sha1", "sha256"] }
+# The history scan needs to read the object database itself: `status` has to
+# answer whether a declared path ever sat in a commit in the clear, and no
+# amount of working-tree inspection can. Both hash kinds, because `gitindex`
+# already handles SHA-256 repositories and a scan that quietly skipped them
+# would be the wrong kind of silence.
+gix-object = { version = "0.63.0", features = ["sha1", "sha256"] }
+gix-odb = { version = "0.83.0", features = ["sha1", "sha256"] }
+gix-ref = { version = "0.66.0", features = ["sha1", "sha256"] }
 hkdf = "0.13.0"
 sha2 = "0.11.0"
 thiserror = "2.0.19"

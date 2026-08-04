@@ -241,6 +241,74 @@ pub fn staged_ids(index_path: &Path, hash: gix_hash::Kind, paths: &[Vec<u8>]) ->
     }
 }
 
+/// Every stage-0 entry in the index, or why it could not be read.
+///
+/// The same distinction [`Staged`] draws, and for the same reason: an index this
+/// build cannot parse is not evidence that nothing is tracked.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Listed {
+    /// Path and object id of every stage-0 entry, in the order the index stores
+    /// them.
+    Read(Vec<(Vec<u8>, Vec<u8>)>),
+    /// The index could not be read, and why.
+    Unavailable(String),
+}
+
+/// Lists what the index records, without being told the paths in advance.
+///
+/// [`staged_ids`] answers about paths a caller already knows; `status` needs the
+/// other direction — "which declared paths would the next commit store, and as
+/// what" — and can only get there by enumerating. Both go through the one parser
+/// in this module, so there is never a second reading of the same bytes.
+///
+/// # Errors
+///
+/// [`Error::Io`] when the index exists but cannot be read. An index that does
+/// not exist yet is not an error: nothing is tracked, so the list is empty.
+pub fn list(index_path: &Path, hash: gix_hash::Kind) -> Result<Listed> {
+    let data = match fs::read(index_path) {
+        Ok(data) => data,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Listed::Read(Vec::new()));
+        }
+        Err(err) => return Err(Error::Io(err)),
+    };
+
+    let index = match inspect(data, hash) {
+        Ok(index) => index,
+        Err(why) => return Ok(Listed::Unavailable(why)),
+    };
+
+    let mut entries = Vec::with_capacity(index.count);
+    let walked = walk(
+        &index.data[..index.body_len],
+        index.version,
+        index.count,
+        hash.len_in_bytes(),
+        &mut |entry| {
+            // Stage 0 only, as in `staged_ids`: a path mid-merge has no settled
+            // content, and reporting whichever side came last as "what this
+            // repository stores" would be a guess presented as a fact.
+            if entry.stage == 0 {
+                entries.push((entry.name.to_vec(), entry.id.to_vec()));
+            }
+        },
+    );
+
+    // Published only on a complete walk, exactly as `staged_ids` does: a partial
+    // list reads as "these are the tracked paths" while quietly omitting the
+    // rest, and here the omission would be a declared path reported as safe.
+    match walked {
+        None => Ok(Listed::Unavailable("its entries did not parse".into())),
+        Some(true) => Ok(Listed::Unavailable(
+            "this repository uses a split index, whose entries live in a shared \
+             file this build does not read"
+                .into(),
+        )),
+        Some(false) => Ok(Listed::Read(entries)),
+    }
+}
+
 /// The object id git stores for `content` as a blob.
 ///
 /// Git hashes `blob <length>\0` followed by the bytes. Deterministic encryption
