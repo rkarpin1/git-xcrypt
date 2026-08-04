@@ -217,6 +217,10 @@ zapisuje plik objęty wzorcem w `.gitattributes` (z `-text`, zgodnie z `zalozeni
 §Integracja z git), commituje i sprawdza, że bajty bloba różnią się od bajtów pliku
 roboczego oraz że są równe oczekiwanej transformacji.
 
+Drugi test w tym samym pliku sprawdza stronę odwrotną: plik **spoza** wzorca ląduje
+w obiekcie gita bez zmian. Bez niego pierwszy test przechodziłby również wtedy, gdyby
+filtr działał na wszystkim, a nie tylko na ścieżkach objętych wzorcem.
+
 ### Success Criteria:
 
 #### Automated Verification:
@@ -287,8 +291,10 @@ bufor binarny w komunikacie błędu jest nieczytelny.
    i `required = true` — `git add` kończy się **niezerowym kodem**, a `git ls-files --stage`
    dla tej ścieżki jest **pusty**,
 6. **plaintext nie wycieka przy awarii**: po nieudanym `git add` w bazie obiektów nie istnieje
-   blob o treści jawnej — sprawdzane przez `git cat-file --batch-all-objects --batch-check`
-   i porównanie z hashem policzonym przez `git hash-object` z treści jawnej.
+   blob o treści jawnej — hash treści jawnej liczy `git hash-object -t blob --stdin`, a jego
+   obecność sprawdza `git cat-file -e`. Treść idzie przez stdin, nie przez plik pomocniczy:
+   zapisanie poszukiwanego plaintextu do drzewa roboczego, choćby na moment, stawiałoby go
+   o jedno `git add -A` od commita, którego ten test zabrania.
 
 ### Success Criteria:
 

@@ -11,8 +11,9 @@
 
 use std::ffi::OsStr;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use tempfile::TempDir;
 
@@ -106,18 +107,18 @@ impl TestRepo {
 
     /// Whether the object database holds a blob with exactly `contents`.
     ///
-    /// Used to prove that a failed filter left no plaintext behind.
+    /// Used to prove that a failed filter left no plaintext behind. The content
+    /// goes in over stdin rather than through a scratch file: writing the
+    /// plaintext we are hunting for into the working tree — even briefly —
+    /// would put it one `git add -A` away from the commit this very test says
+    /// must never happen.
     pub fn object_exists_for(&self, contents: &[u8]) -> bool {
-        let probe = self.path.join(".git-crypt-plaintext-probe");
-        fs::write(&probe, contents).expect("could not write the probe file");
-        let hashed = self.git_ok([
-            OsStr::new("hash-object"),
-            OsStr::new("-t"),
-            OsStr::new("blob"),
-            OsStr::new("--no-filters"),
-            probe.as_os_str(),
-        ]);
-        fs::remove_file(&probe).expect("could not remove the probe file");
+        let hashed = self.git_with_stdin(["hash-object", "-t", "blob", "--stdin"], contents);
+        assert!(
+            hashed.status.success(),
+            "git hash-object failed: {}",
+            String::from_utf8_lossy(&hashed.stderr)
+        );
 
         let hash = String::from_utf8(hashed.stdout).expect("git printed a non-UTF-8 hash");
         self.git(["cat-file", "-e", &format!("{}^{{blob}}", hash.trim())])
@@ -164,6 +165,31 @@ impl TestRepo {
             .args(args)
             .output()
             .expect("could not run git")
+    }
+
+    /// Runs git with `input` on stdin and returns the full output.
+    pub fn git_with_stdin<I, S>(&self, args: I, input: &[u8]) -> Output
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let mut child = Command::new("git")
+            .current_dir(&self.path)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("could not run git");
+        child
+            .stdin
+            .take()
+            .expect("git stdin was not captured")
+            .write_all(input)
+            .expect("could not write to git stdin");
+        child
+            .wait_with_output()
+            .expect("could not collect git output")
     }
 
     /// Runs git and panics unless it succeeded.
@@ -256,14 +282,17 @@ fn assert_bytes_eq(actual: &[u8], expected: &[u8], label: &str) {
 
 /// The command git runs as the filter.
 ///
-/// The path is quoted because git hands the value to a shell, and backslashes
-/// become forward slashes because git accepts those on Windows while treating
-/// a backslash in a config value as an escape.
+/// Git hands the value to a shell, so the path is single-quoted: inside single
+/// quotes a POSIX shell expands nothing, while double quotes would still let a
+/// `$` or a backtick in a project path through. A literal quote is closed,
+/// escaped and reopened. Backslashes become forward slashes first, because git
+/// accepts those on Windows and treats a backslash in a config value as an
+/// escape — doing it in this order keeps the escape we introduce intact.
 fn filter_command(extra_argument: Option<&str>) -> String {
-    let binary = BIN.replace('\\', "/");
+    let binary = BIN.replace('\\', "/").replace('\'', r"'\''");
     match extra_argument {
-        Some(argument) => format!("\"{binary}\" __test-filter {argument}"),
-        None => format!("\"{binary}\" __test-filter"),
+        Some(argument) => format!("'{binary}' __test-filter {argument}"),
+        None => format!("'{binary}' __test-filter"),
     }
 }
 

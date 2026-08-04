@@ -33,7 +33,7 @@ Clippy runs with `-D warnings`. Errors via `thiserror`; no `unwrap()` on user-in
 
 ## Testing
 
-`tests/` does not exist yet. Tests must drive real git repositories in a temp dir — only git's stored objects prove these rules hold. Format vectors stay frozen once shipped.
+Tests must drive real git repositories in a temp dir — only git's stored objects prove these rules hold. `tests/harness/mod.rs` does that: it stands up a repo, registers the binary as a filter and returns raw blob bytes. Integration test files pull it in with `mod harness;`. Format vectors stay frozen once shipped.
 
 ## Commits and PRs
 
