@@ -195,6 +195,19 @@ impl TestRepo {
         clone
     }
 
+    /// Adds a linked worktree and returns it as a repository in its own right.
+    ///
+    /// Linked worktrees are the case where "the git directory" and "the
+    /// directory git reads configuration from" stop being the same place.
+    pub fn add_worktree(&self, name: &str) -> Self {
+        let dir = TempDir::new().expect("could not create a temporary directory");
+        let path = dir.path().join(name);
+
+        self.git_ok(["worktree", "add", "-q", "-b", name, &path.to_string_lossy()]);
+
+        Self { _dir: dir, path }
+    }
+
     /// Runs git in this repository and returns the full output, failure included.
     pub fn git<I, S>(&self, args: I) -> Output
     where

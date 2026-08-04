@@ -75,6 +75,17 @@ impl Default for Decision {
     }
 }
 
+/// One line of `.git-xcrypt`, as the `.gitattributes` renderer sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PatternView<'a> {
+    /// The pattern as written, without a leading `!`.
+    pub source: &'a str,
+    /// Whether this line takes paths back out.
+    pub negated: bool,
+    /// Whether it declared `binary`, which also means "no diff driver".
+    pub suppress_diff: bool,
+}
+
 /// One line of the file.
 #[derive(Debug)]
 struct Rule {
@@ -183,39 +194,24 @@ impl Config {
         }
     }
 
-    /// The patterns a negation takes back out, in file order, without the `!`.
+    /// Every pattern in file order, with the `!` stripped from the negations.
     ///
-    /// Rendered into `.gitattributes` as `!text !diff`, which restores git's
-    /// defaults for those paths. Leaving them out instead would keep `-text` on
-    /// a file that is stored in the clear, so git would stop managing its line
-    /// endings — the very direction the attributes exist to control.
+    /// File order is what the caller needs rather than a convenience: selection
+    /// is resolved by last match, so a rendered `.gitattributes` only agrees
+    /// with [`Config::decide`] if it keeps the lines in the order they were
+    /// written. Splitting them into "selecting" and "negated" lists loses
+    /// exactly the information that decides the answer.
     #[must_use]
-    pub fn negated_patterns(&self) -> Vec<&str> {
+    pub fn patterns(&self) -> Vec<PatternView<'_>> {
         self.rules
             .iter()
-            .filter(|rule| rule.pattern.is_negative())
-            .filter_map(|rule| rule.source.strip_prefix('!'))
-            .collect()
-    }
-
-    /// The patterns that select paths, in file order.
-    ///
-    /// Used to render the per-pattern `.gitattributes` lines.
-    #[must_use]
-    pub fn selecting_patterns(&self) -> Vec<(&str, Decision)> {
-        self.rules
-            .iter()
-            .filter(|rule| !rule.pattern.is_negative())
-            .map(|rule| {
-                (
-                    rule.source.as_str(),
-                    Decision {
-                        encrypt: true,
-                        text: rule.declared.text.unwrap_or_default(),
-                        eol: rule.declared.eol,
-                        suppress_diff: rule.declared.suppress_diff,
-                    },
-                )
+            .map(|rule| PatternView {
+                source: rule
+                    .source
+                    .strip_prefix('!')
+                    .unwrap_or(rule.source.as_str()),
+                negated: rule.pattern.is_negative(),
+                suppress_diff: rule.declared.suppress_diff,
             })
             .collect()
     }
@@ -230,7 +226,17 @@ impl Config {
         if is_never_encrypted(path) {
             return Decision::default();
         }
+        self.decide_ignoring_exclusions(path)
+    }
 
+    /// What the patterns alone say, with the bootstrap exclusions set aside.
+    ///
+    /// Only one caller wants this: rendering `.gitattributes` has to know
+    /// whether a pattern reaches a file that [`is_never_encrypted`] then rescues,
+    /// because such a file needs a line putting git's defaults back. Everything
+    /// else must go through [`Config::decide`].
+    #[must_use]
+    pub fn decide_ignoring_exclusions(&self, path: &[u8]) -> Decision {
         let mut decision = Decision::default();
         let mut selected = false;
 
@@ -514,13 +520,42 @@ mod tests {
     }
 
     #[test]
-    fn selecting_patterns_skip_negations() {
-        let config = config("secrets/\n*.env text\n!secrets/README.md\n");
-        let patterns: Vec<&str> = config
-            .selecting_patterns()
-            .into_iter()
-            .map(|(text, _)| text)
-            .collect();
-        assert_eq!(patterns, vec!["secrets/", "*.env"]);
+    fn the_patterns_come_back_in_file_order_with_their_polarity() {
+        // File order is what the `.gitattributes` renderer needs: selection is
+        // decided by the last matching line, so a view that sorted or split the
+        // patterns would lose the answer.
+        let config = config("secrets/\n!secrets/README.md\n*.env binary\n");
+        let patterns = config.patterns();
+
+        assert_eq!(
+            patterns
+                .iter()
+                .map(|pattern| pattern.source)
+                .collect::<Vec<_>>(),
+            ["secrets/", "secrets/README.md", "*.env"],
+            "the `!` is stripped, the position is not"
+        );
+        assert_eq!(
+            patterns
+                .iter()
+                .map(|pattern| pattern.negated)
+                .collect::<Vec<_>>(),
+            [false, true, false]
+        );
+        assert!(patterns[2].suppress_diff);
+    }
+
+    #[test]
+    fn the_exclusion_free_view_reports_what_the_patterns_alone_say() {
+        // The renderer needs this: a bootstrap file that a pattern reaches has
+        // to be given git's defaults back explicitly, and `decide` hides that it
+        // was ever reached.
+        let config = config("*\n");
+        assert!(!config.decide(ATTRIBUTES_FILE.as_bytes()).encrypt);
+        assert!(
+            config
+                .decide_ignoring_exclusions(ATTRIBUTES_FILE.as_bytes())
+                .encrypt
+        );
     }
 }

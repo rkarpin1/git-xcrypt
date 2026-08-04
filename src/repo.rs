@@ -25,6 +25,7 @@ pub const DRIVER: &str = "git-xcrypt";
 #[derive(Debug)]
 pub struct Repo {
     git_dir: PathBuf,
+    common_dir: PathBuf,
     work_tree: PathBuf,
 }
 
@@ -43,8 +44,10 @@ impl Repo {
             Error::Config("this is a bare repository, so there is nothing to encrypt".into())
         })?;
 
+        let git_dir = absolute(&git_dir);
         Ok(Self {
-            git_dir: absolute(&git_dir),
+            common_dir: common_dir(&git_dir),
+            git_dir,
             work_tree: absolute(&work_tree),
         })
     }
@@ -71,16 +74,34 @@ impl Repo {
         &self.work_tree
     }
 
-    /// Where the repository key lives. Never versioned, never committed.
+    /// The directory shared by every worktree — the real `.git`.
+    ///
+    /// The same as [`Repo::git_dir`] outside a linked worktree.
     #[must_use]
-    pub fn key_path(&self) -> PathBuf {
-        self.git_dir.join(DRIVER).join("keys").join("default")
+    pub fn common_dir(&self) -> &Path {
+        &self.common_dir
     }
 
-    /// The repository-local config file.
+    /// Where the repository key lives. Never versioned, never committed.
+    ///
+    /// In the common directory, so every linked worktree of a repository reads
+    /// the same key — the alternative is a per-worktree key, which cannot
+    /// decrypt what the other worktrees committed.
+    #[must_use]
+    pub fn key_path(&self) -> PathBuf {
+        self.common_dir.join(DRIVER).join("keys").join("default")
+    }
+
+    /// The config file git actually reads for this repository.
+    ///
+    /// In the common directory, again: a linked worktree's own git dir has a
+    /// `config` file, but git ignores it unless `extensions.worktreeConfig` is
+    /// set. Registering the driver there left git with no filter at all —
+    /// measured on git 2.55, `git add` on a secret from a linked worktree exited
+    /// 0 and stored the plaintext.
     #[must_use]
     pub fn config_path(&self) -> PathBuf {
-        self.git_dir.join("config")
+        self.common_dir.join("config")
     }
 
     /// The versioned list of what to encrypt.
@@ -118,6 +139,45 @@ impl Repo {
     pub fn relative<'a>(&self, path: &'a Path) -> Option<&'a Path> {
         path.strip_prefix(&self.work_tree).ok()
     }
+}
+
+/// The directory every worktree of this repository shares.
+///
+/// A linked worktree's git dir is `.git/worktrees/<name>`, and it names the real
+/// one in a `commondir` file. Everything that belongs to the repository rather
+/// than to one checkout — the key, the filter registration — lives there.
+fn common_dir(git_dir: &Path) -> PathBuf {
+    let Ok(text) = std::fs::read_to_string(git_dir.join("commondir")) else {
+        return git_dir.to_path_buf();
+    };
+    let target = Path::new(text.trim_end_matches(['\n', '\r']));
+    if target.as_os_str().is_empty() {
+        return git_dir.to_path_buf();
+    }
+    if target.is_absolute() {
+        return target.to_path_buf();
+    }
+    lexically_normal(&git_dir.join(target))
+}
+
+/// Resolves `.` and `..` without touching the filesystem.
+///
+/// `commondir` holds a relative path such as `../..`, and leaving it in place
+/// would make every message name a path no user recognises.
+fn lexically_normal(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Makes a path absolute without touching the filesystem when it already is.

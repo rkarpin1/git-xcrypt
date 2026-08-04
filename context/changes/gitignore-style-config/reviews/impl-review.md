@@ -4,8 +4,11 @@
 - **Plan**: `context/changes/gitignore-style-config/plan.md`
 - **Zakres**: Fazy 1–2 z 2 (obie ukończone)
 - **Data**: 2026-08-04
-- **Werdykt**: ODRZUCONY po pierwszym przebiegu → ZAAKCEPTOWANY po naprawach
-- **Ustalenia**: przebieg 1 — 1 krytyczne, 3 ostrzeżenia, 5 obserwacji
+- **Werdykt**: ODRZUCONY po pierwszym przebiegu → ODRZUCONY po drugim → ZAAKCEPTOWANY
+- **Ustalenia**: przebieg 1 — 1 krytyczne, 3 ostrzeżenia, 5 obserwacji;
+  przebieg 2 — 2 krytyczne, 3 ostrzeżenia, 3 obserwacje
+- **Przebiegi**: dwa. Drugi znalazł **dwie regresje wprowadzone naprawami z
+  pierwszego** (G1, G2) oraz krytyczny błąd odziedziczony po S-01 (G5)
 
 ## Werdykty
 
@@ -19,7 +22,25 @@
 | Kryteria sukcesu | PASS | PASS |
 
 Bramka jakości po naprawach: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`
-i `cargo test` (178 testów) przechodzą.
+i `cargo test` (186 testów) przechodzą.
+
+Sekcja, którą generuje dziś `sync` dla konfiguracji z negacją, `binary` i klasą
+znaków — każdy werdykt sprawdzony przeciw `git check-attr` na git 2.55:
+
+```
+# >>> git-xcrypt >>>
+* filter=git-xcrypt
+**/secrets/** -text diff=git-xcrypt
+*.env -text diff=git-xcrypt
+**/*.env/** -text diff=git-xcrypt
+secrets/README.md !text !diff
+secrets/README.md/** !text !diff
+secrets/key.p12 -text diff=git-xcrypt
+secrets/key.p12/** -text diff=git-xcrypt
+secrets/key.p12 -diff
+secrets/key.p12/** -diff
+# <<< git-xcrypt <<<
+```
 
 ## Ustalenie krytyczne
 
@@ -166,6 +187,144 @@ i `cargo test` (178 testów) przechodzą.
   innego nie jest skonfigurowane. Niegroźne (niezdefiniowany filtr to dla gita
   brak filtra), a kompletność konfiguracji jest zadaniem `status` z S-06.
 - **Decyzja**: ZAAKCEPTOWANE
+
+## Drugi przebieg — regresje po naprawach i to, co umknęło
+
+Metoda: eksperyment różnicowy przeciw prawdziwemu gitowi 2.55 — ~60 sond
+ścieżkowych na 26 konfiguracjach, porównanie „czy blob zaczyna się od magic"
+z `git check-attr text diff`.
+
+### G1 — cytowanie `[attr]` nie działało, a fix z F6 tak twierdził
+
+- **Ważność**: ❌ KRYTYCZNE (regresja naprawy F6) · **Lokalizacja**: `src/gitattributes.rs:231` (przed naprawą)
+- **Szczegóły**: F6 zakładało, że git sprawdza prefiks makra **po** zdjęciu
+  cudzysłowów. Jest odwrotnie. Zmierzone: `"[attr]x" -text diff=zz`,
+  `[attr]x -text diff=zz` i `\[attr\]x -text diff=zz` dają dla ścieżki `ax`
+  identyczne `text: unspecified` — wszystkie trzy są dla gita definicją makra.
+  Plik w korzeniu nie dostawał więc żadnej linii, a stąd wracał tryb awarii F1:
+  przy `ax text` w pliku użytkownika i pliku 2 MiB blob wyszedł o 34 bajty
+  krótszy, `git add` kod `0`, `git checkout` → `authentication failed`, plik
+  zniknął.
+- **Naprawa**: nie cytowanie, tylko pisownia — `**/[attr]x` dla wzorca
+  pływającego i `/[attr]x/y` dla zakotwiczonego. Oba znaczą w korzeniu
+  dokładnie to samo co wersja bez prefiksu i nie trafiają w gałąź makra.
+- **Testy**: `a_pattern_opening_with_attr_is_kept_out_of_gits_macro_branch`,
+  `tests/sync_command.rs::a_character_class_pattern_stays_a_pattern`.
+- **Decyzja**: NAPRAWIONE. Lekcja: naprawa oparta na przeczytanym kodzie C
+  gita, a nie na pomiarze, myliła się co do kolejności dwóch gałęzi parsera.
+
+### G2 — negacje na końcu sekcji odwracały selekcję
+
+- **Ważność**: ⚠️ OSTRZEŻENIE (regresja naprawy F2) · **Lokalizacja**: `src/gitattributes.rs:98` (przed naprawą)
+- **Szczegóły**: F2 renderowało wszystkie negacje w grupie na końcu, bo tak
+  wymaga **oś atrybutów**. Ale selekcja rozstrzyga się **ostatnim dopasowaniem**
+  — i w gicie, i w `Config::decide` (pilnuje tego test S-01
+  `the_last_selecting_line_wins`). Konfiguracja `!secrets/README.md` **nad**
+  `secrets/` szyfruje ten plik, a wygenerowana sekcja kończyła się na
+  `!text !diff`. Zmierzone: blob zaczyna się od magic, a `git check-attr` mówi
+  `text: unspecified` — czyli zaszyfrowany plik bez `-text`, dokładnie to, przed
+  czym broni F1. Przed F2 ta ścieżka była poprawna.
+- **Naprawa**: linie selekcji i negacji idą teraz **w kolejności pliku**, tak jak
+  rozstrzyga git. Na oś atrybutów zostaje osobna, końcowa grupa `<wzorzec> -diff`
+  dla wzorców z `binary` — nazywa tylko `diff`, więc ustalone wyżej `-text`
+  przeżywa. `Config::selecting_patterns`/`negated_patterns` zastąpione jednym
+  widokiem `Config::patterns()` zachowującym pozycję.
+- **Testy**: `a_negation_a_later_pattern_overrules_does_not_reach_the_bottom_of_the_section`,
+  `tests/sync_command.rs::a_negation_a_later_pattern_overrules_keeps_the_attributes_of_an_encrypted_file`.
+- **Decyzja**: NAPRAWIONE
+
+### G3 — pliki bootstrapowe dostawały `-text` mimo że leżą jawnie
+
+- **Ważność**: ⚠️ OSTRZEŻENIE · **Lokalizacja**: `src/gitattributes.rs:59`
+- **Szczegóły**: `render_lines` renderowało z surowych wzorców i nic nie
+  wiedziało o `config::is_never_encrypted`. Zmierzone przy `core.autocrlf=true`
+  i wzorcu `secrets/`: `secrets/.gitattributes` leży w bazie jawnie (poprawnie),
+  ale `text: unset` — git przestał normalizować jego końce linii. Naprawa F1
+  pogłębiła zasięg: `**/secrets/**` trafia teraz w każdy poziom, wcześniej tylko
+  w korzeń. Zagnieżdżony `.gitattributes` to nie egzotyka — ma go każde repo
+  ustawiające atrybuty per katalog.
+- **Naprawa**: `Config::decide_ignoring_exclusions` plus końcowe linie
+  `**/.gitattributes !text !diff`, `/.git-xcrypt !text !diff`,
+  `/.git-xcrypt-keys/** !text !diff`, emitowane **tylko** gdy któryś wzorzec
+  faktycznie w nie trafia — zwykła konfiguracja ich nie nosi, więc nie nadpisują
+  atrybutów, które użytkownik ustawił sobie sam.
+- **Testy**: `a_broad_pattern_gives_the_bootstrap_files_their_defaults_back`,
+  `tests/sync_command.rs::a_broad_pattern_leaves_the_bootstrap_files_to_git`.
+- **Decyzja**: NAPRAWIONE
+
+### G4 — zapis atomowy gubił uprawnienia pliku
+
+- **Ważność**: ⚠️ OSTRZEŻENIE (regresja naprawy F3) · **Lokalizacja**: `src/atomic.rs:37`
+- **Szczegóły**: `fs::write` otwierało **istniejący** plik, więc tryb przeżywał.
+  `File::create` tworzy nowy z `0666 & ~umask`, a `rename` podmienia razem z
+  trybem. Zmierzone na macOS przy umask 022: `chmod 600 .git/config` + `init` →
+  `-rw-r--r--`. `.git/config` rutynowo trzyma `[credential]` i URL-e zdalne z
+  tokenami, więc rozszerzenie go do world-readable to realna, choć wąska,
+  ekspozycja. Plik klucza **nie** jest dotknięty — `keyfile::write_owner_only`
+  ma własną ścieżkę z jawnym `0600`.
+- **Naprawa**: uprawnienia istniejącego celu są kopiowane na plik tymczasowy
+  przed `rename`.
+- **Test**: `src/atomic.rs::a_narrowed_target_keeps_its_permissions`.
+- **Decyzja**: NAPRAWIONE
+
+### G5 — `init` w podłączonym worktree cicho zapisywał plaintext
+
+- **Ważność**: ❌ KRYTYCZNE (odziedziczone po S-01, **poza zakresem planu**) · **Lokalizacja**: `src/repo.rs:83`
+- **Szczegóły**: git dir podłączonego worktree to `.git/worktrees/<nazwa>`, a
+  `Repo::config_path()` sklejało `config` właśnie z nim. Git ignoruje ten plik,
+  dopóki nie ustawiono `extensions.worktreeConfig`. Zmierzone na git 2.55:
+
+  ```
+  git worktree add ../wt && cd ../wt && git-xcrypt init
+  → „registered the filter in .../worktrees/wt/config"
+  git config --get filter.git-xcrypt.process   → (nic)
+  git add secrets/p && git commit
+  git cat-file blob HEAD:secrets/p → TOPSECRET
+  ```
+
+  `init` raportował sukces, klucz powstawał, `.gitattributes` dostawał linię
+  catch-all — i każdy sekret commitowany z tego worktree lądował jawnie. Klucz
+  też był per worktree, więc nie odszyfrowałby tego, co zacommitowały pozostałe.
+- **Naprawa**: `Repo` rozwiązuje teraz **wspólny katalog** (plik `commondir`) i
+  z niego bierze ścieżkę konfiguracji oraz klucza; `filter` czyta konfigurację
+  gita stamtąd samo.
+- **Test**: `tests/filter_edge_cases.rs::init_in_a_linked_worktree_registers_where_git_actually_reads`
+  (+ pomocnik `TestRepo::add_worktree`).
+- **Decyzja**: NAPRAWIONE mimo że leży poza planem S-02 — reguła „nigdy nie
+  przepuszczaj treści po cichu" waży więcej niż dyscyplina zakresu, a naprawa
+  jest lokalna. **Do świadomej akceptacji przez człowieka.**
+
+### Obserwacje z drugiego przebiegu
+
+- **Brak `fsync` katalogu po `rename`** — obietnica z `atomic.rs` trzymała tylko
+  wtedy, gdy cel już istniał; przy tworzeniu `.gitattributes` awaria zaraz po
+  `init` zostawiała repozytorium z kluczem, rejestracją i **bez** linii
+  catch-all. Dodany `sync_all` na katalogu (best effort). NAPRAWIONE.
+- **Plik tymczasowy zostaje po `SIGKILL`** i jest niesegregowany w drzewie
+  roboczym, więc `git add -A` mógłby go zacommitować. Treść to tekst atrybutów,
+  nigdy sekret. Udokumentowane w `atomic.rs`; ZAAKCEPTOWANE.
+- **Dowiązanie symboliczne jako `.gitattributes`** jest zastępowane zwykłym
+  plikiem (`fs::write` szło za linkiem). Udokumentowane; ZAAKCEPTOWANE.
+- **`core.ignorecase` vs `Case::Sensitive` w filtrze** — na macOS i Windows git
+  dopasowuje wzorce bez rozróżniania wielkości liter, a filtr rozróżnia. Zmierzone:
+  przy wzorcu `secrets/` ścieżka `Secrets/db.env` **nie jest szyfrowana**, choć
+  `git check-ignore` ją dopasowuje. To semantyka selekcji z S-01 i realny problem,
+  ale zmiana na `Case::Fold` czytałaby konfigurację na ścieżce clean, czyli
+  uzależniłaby zbiór szyfrowanych plików od maszyny. **ZAAKCEPTOWANE jako
+  znalezisko dla S-06 / dokumentacji — wymaga decyzji człowieka.**
+
+### Potwierdzone jako poprawne w drugim przebiegu
+
+- Arytmetyka `upsert` po przejściu na markery liniowe — prześledzona dla braku
+  końcowego znaku nowej linii, CRLF, END jako ostatniej linii, END przed BEGIN i
+  wielu BEGIN. Wszystkie offsety pochodzą z granic linii, więc żadne cięcie
+  napisu nie może trafić w środek znaku wielobajtowego.
+- Idempotencja przy CRLF — sprawdzona na prawdziwym repozytorium.
+- Cytowanie w `spell` — round-trip przez `unquote_c_style` dla spacji, tabulacji,
+  `\r`, odwrotnego ukośnika i bajtów spoza ASCII.
+- Reguły twarde: brak nowych zapisów na `stdout`, zero `unsafe`, brak
+  `unwrap`/`expect` na danych wejściowych poza testami; `required = true` nadal
+  ląduje, odmowa `init` w klonie bez klucza nadal działa.
 
 ## Rozjazdy planu wobec stanu kodu
 

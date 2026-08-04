@@ -149,6 +149,41 @@ fn a_second_init_never_replaces_the_key() {
 }
 
 #[test]
+fn init_in_a_linked_worktree_registers_where_git_actually_reads() {
+    // A linked worktree's git dir is `.git/worktrees/<name>`, and git ignores
+    // the `config` file there unless `extensions.worktreeConfig` says otherwise.
+    // Registering the driver in it left git with no filter at all: measured on
+    // git 2.55, `git add` on a secret exited 0 and stored the plaintext while
+    // `init` reported success.
+    let repo = TestRepo::init();
+    repo.write_file("readme.txt", b"first commit\n");
+    repo.commit_all("something to branch from");
+
+    let worktree = repo.add_worktree("side");
+    worktree.xcrypt_ok(["init"]);
+
+    let registered = worktree.git_ok(["config", "--get", "filter.git-xcrypt.process"]);
+    assert!(
+        !registered.stdout.is_empty(),
+        "git cannot see the filter registration, so nothing will be encrypted here"
+    );
+
+    worktree.write_xcrypt_config("*.env\n");
+    worktree.write_file("secrets.env", SECRET);
+    worktree.commit_all("add a secret from a linked worktree");
+
+    assert_ne!(
+        worktree.blob_bytes("secrets.env"),
+        SECRET,
+        "the secret was stored in the clear"
+    );
+    assert!(
+        !worktree.object_exists_for(SECRET),
+        "the plaintext reached the object database"
+    );
+}
+
+#[test]
 fn init_refuses_in_a_clone_that_has_no_key() {
     let repo = repo_with_secret();
     let clone = repo.clone_without_filter();

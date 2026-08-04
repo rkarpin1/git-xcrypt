@@ -148,6 +148,61 @@ fn a_negated_path_gets_gits_defaults_back() {
 }
 
 #[test]
+fn a_negation_a_later_pattern_overrules_keeps_the_attributes_of_an_encrypted_file() {
+    // Selection is last match in `.git-xcrypt` and in `.gitattributes` alike, so
+    // a negation written *above* the pattern that re-selects the path must not
+    // be the line git ends on. Rendering all negations at the bottom left this
+    // encrypted file without `-text`.
+    let repo = synced("!secrets/README.md\nsecrets/\n");
+
+    assert_eq!(
+        repo.check_attr("text", "secrets/README.md"),
+        "unset",
+        "this path is encrypted, so git must see -text on it"
+    );
+    assert_eq!(repo.check_attr("diff", "secrets/README.md"), "git-xcrypt");
+}
+
+#[test]
+fn a_broad_pattern_leaves_the_bootstrap_files_to_git() {
+    // `.gitattributes` at any depth, `.git-xcrypt` and the envelope directory
+    // are stored in the clear whatever the patterns say, so `-text` on them
+    // would stop git managing their line endings for no reason at all.
+    let repo = synced("*\n");
+
+    for path in [
+        ".gitattributes",
+        "app/.gitattributes",
+        ".git-xcrypt",
+        ".git-xcrypt-keys/robert.age",
+    ] {
+        assert_eq!(
+            repo.check_attr("text", path),
+            "unspecified",
+            "{path} is never encrypted, so it must keep git's defaults"
+        );
+        assert_eq!(repo.check_attr("diff", path), "unspecified");
+    }
+    assert_eq!(
+        repo.check_attr("text", "anything-else.txt"),
+        "unset",
+        "the exclusions must not reach past the bootstrap files"
+    );
+}
+
+#[test]
+fn a_character_class_pattern_stays_a_pattern() {
+    // `[attr]x` opens the line the way a macro definition does, and git checks
+    // for that before it unquotes, so the spelling — not the quoting — is what
+    // keeps the line a pattern.
+    let repo = synced("[attr]x\n");
+
+    assert_eq!(repo.check_attr("text", "ax"), "unset");
+    assert_eq!(repo.check_attr("text", "sub/tx"), "unset");
+    assert_eq!(repo.check_attr("text", "bx"), "unspecified");
+}
+
+#[test]
 fn a_pattern_with_a_space_survives_the_trip_through_git() {
     // `.gitattributes` ends a pattern at the first blank unless the whole
     // pattern is C-quoted; the `\ ` escape `.git-xcrypt` inherits from

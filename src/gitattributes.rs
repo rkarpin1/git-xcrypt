@@ -24,7 +24,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::config::Config;
-use crate::repo::DRIVER;
+use crate::repo::{ATTRIBUTES_FILE, CONFIG_FILE, DRIVER, KEY_ENVELOPE_DIR};
 use crate::{Error, Result};
 
 /// Opens the section this tool owns.
@@ -41,65 +41,93 @@ const CATCH_ALL: &str = "* filter=git-xcrypt";
 
 /// Renders the per-pattern lines for `config`.
 ///
-/// An encrypted path gets `-text` plus `diff=git-xcrypt`, or `-text -diff` when
-/// its pattern was declared `binary` — git's own `binary` macro means
-/// `-text -diff`, and we reproduce it. A path a negation took back out gets
-/// `!text !diff`, which restores git's defaults for it; leaving it alone would
-/// keep `-text` on a file that is stored in the clear, so git would stop
-/// managing its line endings.
+/// An encrypted path gets `-text diff=git-xcrypt`; a path a negation took back
+/// out gets `!text !diff`, which restores git's defaults for it. Leaving the
+/// negation unrendered would keep `-text` on a file that is stored in the clear,
+/// so git would stop managing its line endings.
 ///
-/// Output order is three groups, each in the order of `.git-xcrypt`: patterns
-/// that keep the diff driver, then patterns that drop it, then negations. The
-/// grouping is what reconciles the two resolution rules — git takes the last
-/// matching line, [`Config::decide`] merges every matching line — so anything
-/// that takes an attribute away has to sit below everything that grants it.
-/// Within that, the order is the input's, so the section is a pure function of
-/// the configuration and two runs produce the same file.
+/// Two resolution rules have to be reconciled, and each one dictates part of the
+/// layout:
+///
+/// * **Selection is last match, in both.** git takes the last matching line and
+///   so does [`Config::decide`], so the two kinds of line are emitted strictly
+///   in the order of `.git-xcrypt`. Grouping them by kind — negations last, as
+///   an earlier version did — silently inverted `!secrets/README.md` written
+///   *above* `secrets/`, leaving an encrypted file without `-text`.
+/// * **`binary` is sticky in [`Config::decide`] and positional in git.** A
+///   declaration anywhere suppresses the diff driver for the path, so those
+///   patterns get a trailing `-diff` line: last, and naming only `diff`, so the
+///   `-text` established above it survives.
+///
+/// Finally, the files needed to bootstrap — see [`crate::config::is_never_encrypted`] —
+/// get their defaults back if any pattern reached them, because they are stored
+/// in the clear whatever the patterns say.
+///
+/// Within each group the order is the input's, so the section is a pure function
+/// of the configuration and two runs produce the same file.
 #[must_use]
 pub fn render_lines(config: &Config) -> Vec<String> {
-    // A pattern may be spelled by several lines; `binary` on any of them
-    // suppresses the diff driver for the path, so the spellings merge here
-    // rather than fighting each other in the file.
-    let mut encrypted: Vec<(String, bool)> = Vec::new();
-    for (source, decision) in config.selecting_patterns() {
-        for spelling in translate(source) {
-            match encrypted
-                .iter_mut()
-                .find(|(existing, _)| *existing == spelling)
-            {
-                Some((_, suppress_diff)) => *suppress_diff |= decision.suppress_diff,
-                None => encrypted.push((spelling, decision.suppress_diff)),
+    let mut lines: Vec<String> = Vec::new();
+    let mut suppressed: Vec<String> = Vec::new();
+
+    for pattern in config.patterns() {
+        for spelling in translate(pattern.source) {
+            if pattern.negated {
+                lines.push(format!("{spelling} !text !diff"));
+            } else {
+                lines.push(format!("{spelling} -text diff={DRIVER}"));
+                if pattern.suppress_diff && !suppressed.contains(&spelling) {
+                    suppressed.push(spelling);
+                }
             }
         }
     }
 
-    let mut excluded: Vec<String> = Vec::new();
-    for source in config.negated_patterns() {
-        for spelling in translate(source) {
-            if !excluded.contains(&spelling) {
-                excluded.push(spelling);
-            }
+    // A repeated line is noise, but only the *last* copy may be kept: an earlier
+    // one could otherwise outlive a line between them that says the opposite.
+    let mut seen: Vec<&String> = Vec::new();
+    let mut deduplicated: Vec<String> = Vec::new();
+    for line in lines.iter().rev() {
+        if !seen.contains(&line) {
+            seen.push(line);
+            deduplicated.push(line.clone());
         }
     }
+    deduplicated.reverse();
 
-    let mut lines = Vec::with_capacity(encrypted.len() + excluded.len());
-    lines.extend(
-        encrypted
-            .iter()
-            .filter(|(_, suppress_diff)| !suppress_diff)
-            .map(|(pattern, _)| format!("{pattern} -text diff={DRIVER}")),
+    deduplicated.extend(
+        suppressed
+            .into_iter()
+            .map(|pattern| format!("{pattern} -diff")),
     );
-    lines.extend(
-        encrypted
-            .iter()
-            .filter(|(_, suppress_diff)| *suppress_diff)
-            .map(|(pattern, _)| format!("{pattern} -text -diff")),
-    );
-    lines.extend(
-        excluded
-            .iter()
-            .map(|pattern| format!("{pattern} !text !diff")),
-    );
+    deduplicated.extend(bootstrap_exclusions(config));
+    deduplicated
+}
+
+/// Lines putting git's defaults back on the files that bootstrap the tool.
+///
+/// `.gitattributes`, `.git-xcrypt` and the envelope directory are never
+/// encrypted, whatever the patterns say — git needs the first to know to call us
+/// at all. A pattern broad enough to name them would otherwise leave `-text` on
+/// a file that is stored in the clear, and point a decrypting diff driver at it
+/// once S-05 registers one. The lines are emitted only when a pattern actually
+/// reaches them, so an ordinary configuration never carries them.
+fn bootstrap_exclusions(config: &Config) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    // `.gitattributes` is excluded by basename at any depth, the other two only
+    // where they are read from.
+    let reached = |path: &str| config.decide_ignoring_exclusions(path.as_bytes()).encrypt;
+
+    if reached(ATTRIBUTES_FILE) || reached(&format!("sub/{ATTRIBUTES_FILE}")) {
+        lines.push(format!("**/{ATTRIBUTES_FILE} !text !diff"));
+    }
+    if reached(CONFIG_FILE) {
+        lines.push(format!("/{CONFIG_FILE} !text !diff"));
+    }
+    if reached(&format!("{KEY_ENVELOPE_DIR}/recipient")) {
+        lines.push(format!("/{KEY_ENVELOPE_DIR}/** !text !diff"));
+    }
     lines
 }
 
@@ -126,9 +154,13 @@ pub fn render_lines(config: &Config) -> Vec<String> {
 ///   not encrypted.
 ///
 /// Whitespace ends a pattern in `.gitattributes` unless the whole pattern is
-/// C-quoted; the `\ ` escape `.gitignore` uses is not understood there. A
-/// pattern opening with `[attr]` is quoted for a different reason: git reads
-/// that prefix as a macro definition before it looks at quoting at all.
+/// C-quoted; the `\ ` escape `.gitignore` uses is not understood there.
+///
+/// A line opening with `[attr]` is a macro definition to git, never a pattern.
+/// Quoting does not help — measured on git 2.55, the macro check runs before the
+/// unquoting — so such a pattern is given a leading `**/` or `/` instead, both
+/// of which mean exactly what the unprefixed spelling meant in a root
+/// `.gitattributes`.
 fn translate(pattern: &str) -> Vec<String> {
     let directory_only = pattern.ends_with('/');
     let core = pattern.strip_suffix('/').unwrap_or(pattern);
@@ -142,14 +174,36 @@ fn translate(pattern: &str) -> Vec<String> {
 
     let mut spellings = Vec::with_capacity(2);
     if !directory_only {
-        spellings.push(spell(core));
+        spellings.push(spell(&guard(core.to_string(), anchored)));
     }
-    spellings.push(if anchored {
-        spell(&format!("{core}/**"))
-    } else {
-        spell(&format!("**/{core}/**"))
-    });
+    spellings.push(spell(&guard(
+        if anchored {
+            format!("{core}/**")
+        } else {
+            format!("**/{core}/**")
+        },
+        anchored,
+    )));
     spellings
+}
+
+/// What git reads as the start of a macro definition rather than a pattern.
+const MACRO_PREFIX: &str = "[attr]";
+
+/// Keeps a spelling out of git's macro branch without changing what it matches.
+///
+/// An anchored pattern already carries a slash, so a leading one only makes
+/// explicit what a root `.gitattributes` does anyway; a floating one gets the
+/// `**/` that git documents as equivalent to no prefix at all.
+fn guard(spelling: String, anchored: bool) -> String {
+    if !spelling.starts_with(MACRO_PREFIX) {
+        return spelling;
+    }
+    if anchored {
+        format!("/{spelling}")
+    } else {
+        format!("**/{spelling}")
+    }
 }
 
 /// One pattern, escaped and quoted the way git's attribute parser reads it.
@@ -173,13 +227,10 @@ fn spell(pattern: &str) -> String {
         }
     }
 
-    // A leading quote would send git into its C-quoting parser mid-pattern, and
-    // a leading `[attr]` would make the line a macro definition instead of a
-    // pattern. Quoting settles both.
-    if !plain.contains(char::is_whitespace)
-        && !plain.starts_with('"')
-        && !plain.starts_with("[attr]")
-    {
+    // A leading quote would send git into its C-quoting parser mid-pattern. A
+    // leading `[attr]` is handled by `guard`, not here: git checks for a macro
+    // definition before it unquotes, so quoting would not have helped.
+    if !plain.contains(char::is_whitespace) && !plain.starts_with('"') {
         return plain;
     }
 
@@ -450,8 +501,10 @@ mod tests {
         assert_eq!(
             lines("secrets/key.p12 binary\n"),
             [
-                "secrets/key.p12 -text -diff",
-                "secrets/key.p12/** -text -diff"
+                "secrets/key.p12 -text diff=git-xcrypt",
+                "secrets/key.p12/** -text diff=git-xcrypt",
+                "secrets/key.p12 -diff",
+                "secrets/key.p12/** -diff",
             ]
         );
         assert_eq!(
@@ -466,15 +519,18 @@ mod tests {
 
     #[test]
     fn a_line_that_takes_something_away_is_rendered_below_every_line_that_grants_it() {
-        // git takes the last matching line, `Config::decide` merges them all, so
-        // a `binary` pattern written above a broader one would otherwise have
-        // its `-diff` overruled by the broader line's `diff=git-xcrypt`.
+        // git takes the last matching line, `Config::decide` treats `binary` as
+        // sticky, so a `binary` pattern written above a broader one would
+        // otherwise have its `-diff` overruled by the broader line. The trailing
+        // line names only `diff`, so the `-text` above it survives.
         assert_eq!(
             lines("secrets/key.p12 binary\nsecrets/\n"),
             [
+                "secrets/key.p12 -text diff=git-xcrypt",
+                "secrets/key.p12/** -text diff=git-xcrypt",
                 "**/secrets/** -text diff=git-xcrypt",
-                "secrets/key.p12 -text -diff",
-                "secrets/key.p12/** -text -diff",
+                "secrets/key.p12 -diff",
+                "secrets/key.p12/** -diff",
             ]
         );
     }
@@ -482,8 +538,7 @@ mod tests {
     #[test]
     fn a_negation_restores_gits_defaults_for_the_path() {
         // Dropping the negated pattern would leave `-text` on a file that is
-        // stored in the clear, so git would stop managing its line endings. The
-        // line has to come last, because git takes the last match.
+        // stored in the clear, so git would stop managing its line endings.
         assert_eq!(
             lines("secrets/\n!secrets/README.md\n"),
             [
@@ -491,6 +546,44 @@ mod tests {
                 "secrets/README.md !text !diff",
                 "secrets/README.md/** !text !diff",
             ]
+        );
+    }
+
+    #[test]
+    fn a_negation_a_later_pattern_overrules_does_not_reach_the_bottom_of_the_section() {
+        // Selection is last match in both files, so the lines have to keep the
+        // order they were written in. Grouping the negations at the end instead
+        // left this encrypted file without `-text` — the protection the whole
+        // section exists for.
+        assert_eq!(
+            lines("!secrets/README.md\nsecrets/\n"),
+            [
+                "secrets/README.md !text !diff",
+                "secrets/README.md/** !text !diff",
+                "**/secrets/** -text diff=git-xcrypt",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_broad_pattern_gives_the_bootstrap_files_their_defaults_back() {
+        // They are stored in the clear whatever the patterns say, so `-text` on
+        // them would stop git managing their line endings — and git needs to be
+        // able to read `.gitattributes` at every depth.
+        let rendered = lines("*\n");
+        assert_eq!(
+            &rendered[rendered.len() - 3..],
+            [
+                "**/.gitattributes !text !diff",
+                "/.git-xcrypt !text !diff",
+                "/.git-xcrypt-keys/** !text !diff",
+            ]
+        );
+        assert!(
+            !lines("secrets/\n")
+                .iter()
+                .any(|line| line.contains(".gitattributes")),
+            "an ordinary configuration must not carry the exclusion lines"
         );
     }
 
@@ -522,17 +615,24 @@ mod tests {
     }
 
     #[test]
-    fn a_pattern_opening_with_attr_is_quoted_so_git_reads_it_as_a_pattern() {
+    fn a_pattern_opening_with_attr_is_kept_out_of_gits_macro_branch() {
         // Measured on git 2.55: `[attr]foo …` defines a macro named `foo` and
-        // applies to nothing at all. The macro check runs before the quoting
-        // one, so quoting is what keeps it a pattern.
+        // applies to nothing at all. Quoting does not help — the macro check
+        // runs *before* the unquoting, so `"[attr]x"` is still a macro. A
+        // leading `**/` means the same as no prefix and moves the line off that
+        // branch; an anchored pattern gets a leading `/` for the same reason.
         assert_eq!(
             lines("[attr]x\n"),
             [
-                "\"[attr]x\" -text diff=git-xcrypt",
-                // The subtree spelling opens with `**/`, so git never reaches
-                // its macro branch and the quotes would be noise.
+                "**/[attr]x -text diff=git-xcrypt",
                 "**/[attr]x/** -text diff=git-xcrypt"
+            ]
+        );
+        assert_eq!(
+            lines("[attr]x/y\n"),
+            [
+                "/[attr]x/y -text diff=git-xcrypt",
+                "/[attr]x/y/** -text diff=git-xcrypt"
             ]
         );
     }
@@ -553,14 +653,24 @@ mod tests {
 
     #[test]
     fn a_repeated_pattern_collapses_into_one_line() {
-        // git resolves attributes by last match, we resolve them by merging, so
-        // two lines for one pattern would disagree with the filter's own answer.
+        // Only identical lines collapse, and only onto the last copy: an earlier
+        // one could otherwise outlive a line between them saying the opposite.
         assert_eq!(
             lines("secrets/key.p12 binary\nsecrets/key.p12 eol=lf\n"),
             [
-                "secrets/key.p12 -text -diff",
-                "secrets/key.p12/** -text -diff"
+                "secrets/key.p12 -text diff=git-xcrypt",
+                "secrets/key.p12/** -text diff=git-xcrypt",
+                "secrets/key.p12 -diff",
+                "secrets/key.p12/** -diff",
             ]
+        );
+        assert_eq!(
+            lines("secrets/\n!secrets/\nsecrets/\n"),
+            [
+                "**/secrets/** !text !diff",
+                "**/secrets/** -text diff=git-xcrypt",
+            ],
+            "the surviving copy has to be the last one, or the order flips"
         );
     }
 

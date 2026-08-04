@@ -26,6 +26,12 @@ use crate::{Error, Result};
 /// The temporary file lives beside the target, because `rename` across
 /// filesystems is not a rename at all and would fall back to a copy.
 ///
+/// Two limits worth knowing rather than discovering. A target that is a symlink
+/// is replaced by a regular file, where `fs::write` would have followed the link
+/// — `.gitattributes` under a dotfile manager is the case where that shows. And
+/// the temporary file is only cleaned up on a returned error, so a process
+/// killed outright can leave one behind; it is attribute text, never a secret.
+///
 /// # Errors
 ///
 /// [`Error::Io`] when the temporary file cannot be created, written, flushed or
@@ -35,12 +41,20 @@ pub fn write(path: &Path, contents: &[u8]) -> Result<()> {
 
     let result = (|| -> std::io::Result<()> {
         let mut file = fs::File::create(&temporary)?;
+        // A fresh file gets 0666 minus the umask, so without this a deliberately
+        // narrowed `.git/config` — the one that holds credential helpers and
+        // remote URLs — would come back world readable.
+        if let Ok(existing) = fs::metadata(path) {
+            file.set_permissions(existing.permissions())?;
+        }
         file.write_all(contents)?;
         // Without this the rename can land before the content does, which on a
         // crash leaves an empty file where a complete one is expected.
         file.sync_all()?;
         drop(file);
-        fs::rename(&temporary, path)
+        fs::rename(&temporary, path)?;
+        sync_directory(path);
+        Ok(())
     })();
 
     if result.is_err() {
@@ -48,6 +62,21 @@ pub fn write(path: &Path, contents: &[u8]) -> Result<()> {
         let _ = fs::remove_file(&temporary);
     }
     result.map_err(Error::Io)
+}
+
+/// Flushes the directory entry the rename just created.
+///
+/// Without it the promise above holds only where the target already existed: a
+/// crash right after `init` could otherwise leave a repository with a key, a
+/// filter registration and no `.gitattributes` at all — which is the state where
+/// git stores plaintext and reports success. Best effort, and a no-op on
+/// platforms that do not allow opening a directory.
+fn sync_directory(path: &Path) {
+    if let Some(parent) = path.parent()
+        && let Ok(directory) = fs::File::open(parent)
+    {
+        let _ = directory.sync_all();
+    }
 }
 
 /// A path next to `path` that no concurrent run of this tool will pick.
@@ -97,6 +126,24 @@ mod tests {
             .filter(|name| name != ".gitattributes")
             .collect();
         assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_narrowed_target_keeps_its_permissions() {
+        // `.git/config` carries credential helpers and remote URLs, so a user
+        // who chmods it to 0600 must not have it widened by a `sync`.
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = TempDir::new().expect("temporary directory");
+        let path = dir.path().join("config");
+        fs::write(&path, b"[core]\n").expect("writing must succeed");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod");
+
+        write(&path, b"[core]\n\tbare = false\n").expect("writing must succeed");
+
+        let mode = fs::metadata(&path).expect("metadata").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "the file was widened by the rewrite");
     }
 
     #[test]
