@@ -1,0 +1,112 @@
+# The quality gate `context/foundation/zalozenia.md` §Jakość i testy describes.
+#
+# Three platforms is not thoroughness for its own sake. Whole branches of this
+# codebase have never been executed on this project's development machine:
+# `EolMode::Native`'s CRLF arm is `cfg!(windows)`, every key-permission test is
+# `#[cfg(unix)]`, and APFS refuses the non-UTF-8 path names `decide` and the
+# index are written to handle. Until this file existed, "identical behaviour on
+# three platforms" was a claim with one measurement behind it.
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # A filter that writes a backtrace to stdout would corrupt the file git is
+  # storing. It goes to stderr, but the tests read both, so keep it quiet.
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+
+      # The integration tests drive a real git and compare raw objects, so the
+      # git that runs them is part of the system under test. Printed rather than
+      # pinned: a behaviour change in git is something this suite should catch,
+      # not something it should be insulated from.
+      - name: Report the git under test
+        run: git --version
+
+      # Every assertion about line endings is an assertion about what git does
+      # with a working tree. A checkout that had already rewritten the fixtures
+      # would be testing the runner, not the product.
+      - name: Refuse to let the checkout rewrite line endings
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --all-targets --locked
+
+      # `--all-targets` skips doctests; the crate has none today, and this is
+      # what notices when it gains one.
+      - name: Doctests
+        run: cargo test --doc --locked
+
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+  msrv:
+    name: builds on the declared MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: |
+          version=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      # The whole suite, not just a build: the declared floor is a promise that
+      # the product *works* there.
+      - run: cargo test --all-targets --locked
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # Licences above all: the crate is published as `MIT OR Apache-2.0`, and a
+      # copyleft dependency arriving through a transitive edge would invalidate
+      # that choice silently. `advisories` and `sources` ride along.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses advisories sources bans

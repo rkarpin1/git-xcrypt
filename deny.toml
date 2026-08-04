@@ -1,0 +1,69 @@
+# Licence policy for `cargo deny check`.
+#
+# This file exists for one reason, stated in `context/foundation/zalozenia.md`
+# §Jakość i testy: the crate is published as `MIT OR Apache-2.0`, and a copyleft
+# dependency arriving through a transitive edge would invalidate that choice
+# without anybody noticing. The allow-list is therefore a decision, not an
+# inventory — every entry below is a licence somebody chose to accept.
+
+# Every platform this product ships on. Restricting the target list would hide
+# exactly the dependencies that only appear on Windows or on musl, which is the
+# opposite of what this check is for, so it is deliberately left unset.
+all-features = true
+
+[licenses]
+version = 2
+# Permissive only. Nothing here is copyleft, and nothing here obliges a user of
+# the published crate beyond attribution.
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    # `subtle` — constant-time primitives underneath RustCrypto. BSD-3-Clause is
+    # permissive; its extra clause forbids using the authors' names to endorse,
+    # which costs this project nothing.
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unlicense",
+    "CC0-1.0",
+    # `zlib-rs`, reached through `gix-zlib`: git object decompression. Recorded in
+    # the S-06 report as the one licence outside the MIT/Apache pair that had to
+    # be accepted deliberately rather than by default.
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[[licenses.clarify]]
+name = "unicode-ident"
+expression = "(MIT OR Apache-2.0) AND Unicode-3.0"
+license-files = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# The hard rule is "crypto from RustCrypto crates only, never hand-rolled".
+# `cargo deny` cannot check provenance, but it can make sure the obvious
+# alternatives never arrive quietly.
+deny = [
+    { name = "openssl" },
+    { name = "openssl-sys" },
+    { name = "ring" },
+    { name = "aws-lc-rs" },
+    { name = "aws-lc-sys" },
+    { name = "boring" },
+]
+
+[advisories]
+version = 2
+# No exceptions today. An advisory that has to be accepted belongs here with a
+# comment naming who accepted it and why — never silently, and never by widening
+# the check.
+ignore = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

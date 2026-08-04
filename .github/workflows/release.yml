@@ -1,0 +1,161 @@
+# FR-011: a ready-made binary per platform, with nothing to compile and no
+# libraries to install.
+#
+# Tag-driven rather than merge-driven, as `context/foundation/tech-stack.md`
+# decided: publishing a release on every push to the default branch would be
+# wrong for a distributed binary. The tag is the decision.
+#
+# Linux targets musl so the binary is statically linked and depends on no system
+# libc — the self-containment requirement in `zalozenia.md` §Założenia
+# techniczne. macOS is built for both architectures; Windows for x86_64.
+#
+# Checksums are produced here. Signing is **not** yet set up: the PRD records the
+# counter-argument that an unsigned binary of a cryptographic tool is a new trust
+# vector, and that has to be answered with a real signing identity rather than a
+# workflow step that pretends to.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (for a dry run)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # A tag that disagrees with `Cargo.toml` produces artefacts nobody can trace
+  # back to a source tree. `zalozenia.md` §Dystrybucja asks for consistent
+  # versioning; this is what makes it true rather than intended.
+  verify-version:
+    name: tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v5
+      - run: |
+          manifest=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$manifest" != "$tag" ]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $manifest" >&2
+            exit 1
+          fi
+
+  build:
+    name: ${{ matrix.target }}
+    needs: [verify-version]
+    if: always() && (needs.verify-version.result == 'success' || needs.verify-version.result == 'skipped')
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            cross: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            cross: false
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            cross: false
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --locked
+
+      - name: Build
+        shell: bash
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --locked --target ${{ matrix.target }}
+          else
+            cargo build --release --locked --target ${{ matrix.target }}
+          fi
+
+      # A binary that cannot answer `--version` is not a release artefact. Only
+      # where the runner can execute it — the cross-compiled musl builds cannot
+      # be smoke-tested here, and pretending otherwise would be worse than not.
+      - name: Smoke test
+        if: "!matrix.cross"
+        shell: bash
+        run: |
+          binary="target/${{ matrix.target }}/release/git-xcrypt"
+          [ "${{ runner.os }}" = "Windows" ] && binary="$binary.exe"
+          "$binary" --version
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME:-dev}"
+          name="git-xcrypt-${version}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/git-xcrypt.exe" "dist/$name/"
+          else
+            cp "target/${{ matrix.target }}/release/git-xcrypt" "dist/$name/"
+          fi
+          cp README.md LICENSE-MIT LICENSE-APACHE "dist/$name/"
+          cd dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "${name}.zip" "$name" > /dev/null
+            archive="${name}.zip"
+          else
+            tar czf "${name}.tar.gz" "$name"
+            archive="${name}.tar.gz"
+          fi
+          # SHA-256 sums, as `zalozenia.md` §Dystrybucja requires. The sum file
+          # sits beside the archive so it can be checked without this workflow.
+          if command -v sha256sum > /dev/null; then
+            sha256sum "$archive" > "${archive}.sha256"
+          else
+            shasum -a 256 "$archive" > "${archive}.sha256"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    name: publish the release
+    needs: [build]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          fail_on_unmatched_files: true
+          generate_release_notes: true
