@@ -7,8 +7,6 @@
 //! `stdout` as the file content itself, so a stray `println!` silently corrupts
 //! a user's file. Diagnostics go to `stderr`.
 
-use std::io::{Read, Write};
-
 use thiserror::Error;
 
 pub mod commands;
@@ -17,11 +15,13 @@ pub mod crypto;
 pub mod decide;
 pub mod eol;
 pub mod exit;
+pub mod filter;
 pub mod format;
 pub mod gitattributes;
 pub mod gitconfig;
 pub mod key;
 pub mod keyfile;
+pub mod pktline;
 pub mod repo;
 
 /// Errors returned by library operations.
@@ -102,47 +102,9 @@ pub fn format_key_id(key_id: &[u8; format::KEY_ID_LEN]) -> String {
     hex(key_id)
 }
 
-/// Placeholder transform standing in for the real cipher until S-01 phase 4.
-///
-/// Reversing the byte order is deterministic and its own inverse, so one
-/// implementation serves both the clean and the smudge side of the filter.
-/// Phase 4 removes it together with the hidden `__test-filter` command.
-#[must_use]
-pub fn transform(input: &[u8]) -> Vec<u8> {
-    input.iter().rev().copied().collect()
-}
-
-/// Reads all of `input`, applies [`transform`] and writes the result to `output`.
-///
-/// # Errors
-///
-/// [`Error::Io`] when reading or writing fails.
-pub fn run_filter(input: &mut impl Read, output: &mut impl Write) -> Result<()> {
-    let mut buffer = Vec::new();
-    input.read_to_end(&mut buffer)?;
-    output.write_all(&transform(&buffer))?;
-    output.flush()?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn transform_is_its_own_inverse() {
-        let all_bytes: Vec<u8> = (0u8..=255).collect();
-        for input in [b"".as_slice(), b"a".as_slice(), all_bytes.as_slice()] {
-            assert_eq!(transform(&transform(input)), input);
-        }
-    }
-
-    #[test]
-    fn empty_input_yields_empty_output() {
-        let mut output = Vec::new();
-        run_filter(&mut b"".as_slice(), &mut output).expect("empty input must succeed");
-        assert!(output.is_empty());
-    }
 
     #[test]
     fn key_ids_render_as_lowercase_hex() {

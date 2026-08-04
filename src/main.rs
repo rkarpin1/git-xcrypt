@@ -3,13 +3,12 @@
 //! Nothing but file content may reach `stdout` on the filter path: git treats
 //! the filter's `stdout` as the file itself, so a stray `println!` corrupts it.
 
-use std::io;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
 use git_xcrypt::repo::Repo;
-use git_xcrypt::{Result, commands, exit};
+use git_xcrypt::{Result, commands};
 
 /// Transparent encryption of selected files in a git repository.
 #[derive(Debug, Parser)]
@@ -24,13 +23,10 @@ enum Command {
     /// Generate a key and register the filter in this repository.
     Init,
 
-    /// Hidden placeholder standing in for the real filter until S-01 phase 4.
-    #[command(name = "__test-filter", hide = true)]
-    TestFilter {
-        /// Fail without writing anything, so tests can prove git aborts.
-        #[arg(long)]
-        fail: bool,
-    },
+    /// Serve git's long-running filter protocol. Registered by `init`.
+    ///
+    /// Not meant to be run by hand: everything it writes to stdout is protocol.
+    Process,
 }
 
 fn main() -> ExitCode {
@@ -38,7 +34,7 @@ fn main() -> ExitCode {
 
     match cli.command {
         Command::Init => report(run_init()),
-        Command::TestFilter { fail } => run_test_filter(fail),
+        Command::Process => report(commands::process::run()),
     }
 }
 
@@ -82,24 +78,4 @@ fn run_init() -> Result<()> {
         eprintln!("git-xcrypt: already set up; nothing to do");
     }
     Ok(())
-}
-
-/// Hidden command standing in for the real `clean`/`smudge` filter until S-01
-/// phase 4 replaces it with the long-running protocol.
-fn run_test_filter(fail: bool) -> ExitCode {
-    if fail {
-        eprintln!("git-xcrypt: __test-filter was asked to fail");
-        return ExitCode::from(exit::USAGE);
-    }
-
-    let mut input = io::stdin().lock();
-    let mut output = io::stdout().lock();
-
-    match git_xcrypt::run_filter(&mut input, &mut output) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            eprintln!("git-xcrypt: {err}");
-            ExitCode::from(err.exit_code())
-        }
-    }
 }

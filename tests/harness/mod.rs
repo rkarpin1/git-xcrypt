@@ -50,25 +50,59 @@ impl TestRepo {
         &self.path
     }
 
-    /// Registers the hidden test filter under `name`.
+    /// Runs `git-xcrypt` in this repository and returns the full output.
+    pub fn xcrypt<I, S>(&self, args: I) -> Output
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        Command::new(BIN)
+            .current_dir(&self.path)
+            .args(args)
+            .output()
+            .expect("could not run git-xcrypt")
+    }
+
+    /// Runs `git-xcrypt` and panics unless it succeeded.
+    pub fn xcrypt_ok<I, S>(&self, args: I) -> Output
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let output = self.xcrypt(args);
+        assert!(
+            output.status.success(),
+            "git-xcrypt failed with {:?}\nstderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    /// Sets the repository up exactly as a user would: one command.
+    pub fn init_xcrypt(&self) {
+        self.xcrypt_ok(["init"]);
+    }
+
+    /// Writes the versioned list of what to encrypt.
+    pub fn write_xcrypt_config(&self, contents: &str) {
+        self.write_file(".git-xcrypt", contents.as_bytes());
+    }
+
+    /// Points the filter at a binary that does not exist.
     ///
-    /// `required = true` is not optional. Without it git treats a failing clean
-    /// filter as harmless and commits the unfiltered content with exit code 0 —
-    /// which for the real product means a secret landing in the repository in
-    /// the clear.
-    pub fn register_filter(&self, name: &str) {
-        self.register_filter_command(name, &filter_command(None));
-    }
-
-    /// Registers a filter that always fails, for proving git aborts.
-    pub fn register_failing_filter(&self, name: &str) {
-        self.register_filter_command(name, &filter_command(Some("--fail")));
-    }
-
-    fn register_filter_command(&self, name: &str, command: &str) {
-        self.git_ok(["config", &format!("filter.{name}.clean"), command]);
-        self.git_ok(["config", &format!("filter.{name}.smudge"), command]);
-        self.git_ok(["config", &format!("filter.{name}.required"), "true"]);
+    /// Git cannot start it, so the filter fails — which is what proves that
+    /// `required = true` aborts the operation instead of letting the content
+    /// through. The product no longer ships a way to fail on purpose, and it
+    /// should not.
+    pub fn break_filter(&self) {
+        let missing = self.path.join("no-such-binary");
+        self.git_ok([
+            "config",
+            "filter.git-xcrypt.process",
+            &format!("'{}' process", missing.display()),
+        ]);
+        self.git_ok(["config", "filter.git-xcrypt.required", "true"]);
     }
 
     /// Writes `contents` to `relative_path`, creating parent directories.
@@ -78,14 +112,6 @@ impl TestRepo {
             fs::create_dir_all(parent).expect("could not create parent directories");
         }
         fs::write(&target, contents).expect("could not write the file");
-    }
-
-    /// Writes `.gitattributes` at the repository root.
-    ///
-    /// `-text` keeps `core.autocrlf` from rewriting content that must survive
-    /// byte for byte.
-    pub fn write_attributes(&self, contents: &str) {
-        self.write_file(".gitattributes", contents.as_bytes());
     }
 
     /// Stages everything and commits.
@@ -278,22 +304,6 @@ fn assert_bytes_eq(actual: &[u8], expected: &[u8], label: &str) {
         actual.len(),
         expected.len()
     );
-}
-
-/// The command git runs as the filter.
-///
-/// Git hands the value to a shell, so the path is single-quoted: inside single
-/// quotes a POSIX shell expands nothing, while double quotes would still let a
-/// `$` or a backtick in a project path through. A literal quote is closed,
-/// escaped and reopened. Backslashes become forward slashes first, because git
-/// accepts those on Windows and treats a backslash in a config value as an
-/// escape — doing it in this order keeps the escape we introduce intact.
-fn filter_command(extra_argument: Option<&str>) -> String {
-    let binary = BIN.replace('\\', "/").replace('\'', r"'\''");
-    match extra_argument {
-        Some(argument) => format!("'{binary}' __test-filter {argument}"),
-        None => format!("'{binary}' __test-filter"),
-    }
 }
 
 /// Fails loudly when git is missing.

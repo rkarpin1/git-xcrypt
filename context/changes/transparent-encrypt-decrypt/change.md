@@ -2,7 +2,7 @@
 id: transparent-encrypt-decrypt
 title: Przezroczyste szyfrowanie w jednym repozytorium
 roadmap_id: S-01
-status: planned
+status: implemented
 created: 2026-08-04
 updated: 2026-08-04
 ---

@@ -551,17 +551,17 @@ Brak. Nic nie jest wydane, żadne istniejące repozytorium nie używa tego forma
 
 #### Automatyczne
 
-- [ ] 4.1 Blob zaczyna się od `\x00GITXCRYPT\x00`
-- [ ] 4.2 Plik po checkoucie jest bajt w bajt równy oryginałowi
-- [ ] 4.3 `git status` po checkoucie jest czysty
-- [ ] 4.4 Klon bez filtra pokazuje ciphertext
-- [ ] 4.5 Pusty plik i plik binarny przechodzą round-trip
-- [ ] 4.6 Filtr zwracający błąd przerywa `git add` i nie zostawia plaintextu
-- [ ] 4.7 Jeden proces obsługuje wszystkie pliki jednej operacji
-- [ ] 4.8 W drzewie nie ma `__test-filter`, `transform` ani `run_filter`
-- [ ] 4.9 `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`
+- [x] 4.1 Blob zaczyna się od `\x00GITXCRYPT\x00`
+- [x] 4.2 Plik po checkoucie jest bajt w bajt równy oryginałowi
+- [x] 4.3 `git status` po checkoucie jest czysty
+- [x] 4.4 Klon bez filtra pokazuje ciphertext
+- [x] 4.5 Pusty plik i plik binarny przechodzą round-trip
+- [x] 4.6 Filtr zwracający błąd przerywa `git add` i nie zostawia plaintextu
+- [x] 4.7 Jeden proces obsługuje wszystkie pliki jednej operacji
+- [x] 4.8 W drzewie nie ma `__test-filter`, `transform` ani `run_filter`
+- [x] 4.9 `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`
 
 #### Ręczne
 
-- [ ] 4.10 `git add` na kilkuset plikach nie jest odczuwalnie wolniejszy
-- [ ] 4.11 Komunikaty `stderr` czytelne w oknie Git w IDE
+- [x] 4.10 `git add` na kilkuset plikach nie jest odczuwalnie wolniejszy
+- [x] 4.11 Komunikaty `stderr` czytelne w oknie Git w IDE

@@ -5,3 +5,4 @@
 //! whole purpose is to produce output.
 
 pub mod init;
+pub mod process;
