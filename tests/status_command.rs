@@ -1020,6 +1020,172 @@ fn a_line_that_turns_the_filter_off_is_named() {
 }
 
 #[test]
+fn a_declared_path_git_would_not_filter_is_a_setup_gap_not_a_note() {
+    // The last route to a green report on a repository that stores plaintext.
+    // Measured on git 2.55: `git check-attr filter -- secrets/db.env` answers
+    // `unset`, the next `git add` stores `hunter2` in the clear with exit code
+    // 0, and every other check in this command passes. Naming the file was not
+    // enough — a note does not fail a CI gate.
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.write_file("secrets/db.env", b"hunter2\n");
+    repo.commit_all("secret");
+    repo.write_file("secrets/.gitattributes", b"* -filter\n");
+    repo.commit_all("the override");
+
+    assert_eq!(
+        repo.check_attr("filter", "secrets/db.env"),
+        "unset",
+        "the fixture must really take the filter off the declared path"
+    );
+
+    let output = repo.xcrypt(["status"]);
+    let text = report(&output);
+
+    assert_eq!(
+        output.status.code(),
+        Some(EXPOSED),
+        "a repository git does not filter must fail the gate:\n{text}"
+    );
+    assert!(
+        text.contains("setup: git is NOT filtering"),
+        "the finding belongs in the setup section:\n{text}"
+    );
+    assert!(
+        text.contains("secrets/db.env"),
+        "the report has to name the path git leaves unfiltered:\n{text}"
+    );
+    assert!(
+        text.contains("`unset`"),
+        "the report has to quote what git resolves instead:\n{text}"
+    );
+}
+
+#[test]
+fn an_info_attributes_file_that_turns_the_filter_off_fails_the_gate() {
+    // `$GIT_DIR/info/attributes` is not versioned and outranks every
+    // `.gitattributes`, so it is the source an audit is least likely to look at
+    // — and the one a reviewer of a pull request cannot see at all.
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.write_file("secrets/db.env", b"hunter2\n");
+    repo.commit_all("secret");
+    std::fs::create_dir_all(repo.path().join(".git").join("info")).expect("directories");
+    std::fs::write(
+        repo.path().join(".git").join("info").join("attributes"),
+        b"secrets/** -filter\n",
+    )
+    .expect("writing");
+
+    assert_eq!(repo.check_attr("filter", "secrets/db.env"), "unset");
+
+    let output = repo.xcrypt(["status"]);
+    let text = report(&output);
+
+    assert_eq!(output.status.code(), Some(EXPOSED), "{text}");
+    assert!(text.contains("secrets/db.env"), "{text}");
+}
+
+#[test]
+fn a_macro_that_takes_the_filter_off_is_followed_through() {
+    // `[attr]` indirection is the shape a reader is least likely to follow by
+    // hand, and the reason resolving beats pattern-spotting: nothing on the
+    // line that reaches `secrets/` mentions `filter` at all.
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.write_file("secrets/db.env", b"hunter2\n");
+    repo.commit_all("secret");
+
+    let attributes = std::fs::read_to_string(repo.path().join(".gitattributes"))
+        .expect("reading .gitattributes");
+    repo.write_file(
+        ".gitattributes",
+        format!("[attr]plain -filter\n{attributes}secrets/** plain\n").as_bytes(),
+    );
+    repo.commit_all("a macro");
+
+    assert_eq!(
+        repo.check_attr("filter", "secrets/db.env"),
+        "unset",
+        "the fixture must really take the filter off through the macro"
+    );
+
+    let output = repo.xcrypt(["status"]);
+    let text = report(&output);
+
+    assert_eq!(output.status.code(), Some(EXPOSED), "{text}");
+    assert!(
+        text.contains("setup: git is NOT filtering"),
+        "the macro has to be followed, not merely spotted:\n{text}"
+    );
+    assert!(text.contains("secrets/db.env"), "{text}");
+}
+
+#[test]
+fn a_foreign_filter_on_paths_no_pattern_reaches_does_not_fail_the_gate() {
+    // `*.psd filter=lfs` below the managed section is entirely ordinary. A
+    // build that alarmed on the presence of a foreign `filter` line would fail
+    // the gate in every repository using LFS, which is the fastest way to teach
+    // a user to ignore this command.
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.write_file("secrets/db.env", b"hunter2\n");
+    let attributes = std::fs::read_to_string(repo.path().join(".gitattributes"))
+        .expect("reading .gitattributes");
+    repo.write_file(
+        ".gitattributes",
+        format!("{attributes}*.psd filter=lfs\n").as_bytes(),
+    );
+    repo.commit_all("with lfs");
+
+    assert_eq!(
+        repo.check_attr("filter", "secrets/db.env"),
+        "git-xcrypt",
+        "git still runs our filter for the declared path"
+    );
+
+    let output = repo.xcrypt(["status"]);
+    let text = report(&output);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "an unrelated LFS line must not fail the gate:\n{text}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        text.contains("*.psd filter=lfs"),
+        "the line is still worth naming, as a note:\n{text}"
+    );
+    assert!(
+        text.contains("nothing tracked is unprotected"),
+        "the note has to say the resolution came out clean:\n{text}"
+    );
+}
+
+#[test]
+fn a_repository_with_no_foreign_filter_lines_says_nothing_about_them() {
+    // The note used to fire on the mere presence of a line. This is the other
+    // half of that fix: silence when there is nothing to say.
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.write_file("secrets/db.env", b"hunter2\n");
+    repo.commit_all("secret");
+
+    let text = report(&repo.xcrypt(["status"]));
+
+    assert!(
+        !text.contains("set or unset `filter`"),
+        "a healthy repository must not carry the note:\n{text}"
+    );
+}
+
+#[test]
 fn an_intent_to_add_entry_is_not_claimed_as_fixed() {
     // `git add -N` records the empty blob at mode 100644, so it reads as
     // content in the clear — and repointing it announced a repair the next

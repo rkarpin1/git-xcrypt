@@ -476,6 +476,7 @@ dependencies = [
  "bstr",
  "clap",
  "getrandom 0.4.3",
+ "gix-attributes",
  "gix-config",
  "gix-discover",
  "gix-glob",
@@ -500,6 +501,23 @@ dependencies = [
  "bstr",
  "gix-date",
  "gix-error",
+]
+
+[[package]]
+name = "gix-attributes"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c31c593692ebdc1e38858d9a2b56f6a594c501e24a38971fe6685571f5a07be0"
+dependencies = [
+ "bstr",
+ "gix-features",
+ "gix-glob",
+ "gix-path",
+ "gix-quote",
+ "gix-trace",
+ "smallvec",
+ "thiserror",
+ "unicode-bom",
 ]
 
 [[package]]

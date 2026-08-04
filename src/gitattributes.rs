@@ -441,12 +441,11 @@ pub fn catch_all_present(path: &Path) -> Result<bool> {
 /// and `status` — which only looked for the catch-all line — called the
 /// repository healthy.
 ///
-/// Reported rather than resolved. Answering "which paths does this actually
-/// reach" means running git's attribute stack over every declared path, nested
-/// `.gitattributes` files included, which is a dependency and a subsystem this
-/// element did not take on. Naming the lines is what a user needs in order to
-/// look, and `filter=lfs` on unrelated paths is perfectly legitimate — so this
-/// is a note, never a gate failure.
+/// Reading only. The question "does any of this actually reach a declared path"
+/// is answered by [`FilterResolver`], which runs git's own attribute stack; what
+/// this function contributes is the text of the offending lines, so a report can
+/// show a reader what to delete instead of only telling them a path is
+/// unfiltered.
 ///
 /// # Errors
 ///
@@ -488,62 +487,12 @@ pub fn foreign_filter_lines(path: &Path) -> Result<Vec<String>> {
     Ok(found)
 }
 
-/// Every attributes file git would consult here, and the `filter` lines in it.
-///
-/// **The root `.gitattributes` is not the only one git reads**, and looking only
-/// there made `status` claim a repository was filtered while git said otherwise.
-/// Measured on git 2.55, both of these:
-///
-/// ```text
-/// secrets/.gitattributes  →  `* -filter`
-/// .git/info/attributes    →  `secrets/** -filter`
-/// ```
-///
-/// In each case `git check-attr filter -- secrets/db.env` answered `unset`, the
-/// next `git add` stored the plaintext, and `status` reported
-/// `VERDICT: no findings` with `setup: git is configured to run the filter in
-/// this repository`. Git resolves attributes from every directory on a path,
-/// then `$GIT_DIR/info/attributes`, then `core.attributesFile`, with the last
-/// match winning.
-///
-/// Named rather than resolved, exactly as the single-file version was: deciding
-/// which of these lines actually reaches a declared path means reimplementing
-/// git's attribute matching, and a report that names the file and the line is
-/// something the user can check with `git check-attr`.
-///
-/// Sources that cannot be read are skipped. This answer only ever *adds* a
-/// warning, so a miss costs a message, never a false clean bill of health — the
-/// positive claim rests on the configuration check, not on this.
-#[must_use]
-pub fn foreign_filter_sources(
-    work_tree: &Path,
-    git_dir: &Path,
-    global: Option<&Path>,
-) -> Vec<(PathBuf, Vec<String>)> {
-    let mut sources: Vec<PathBuf> = Vec::new();
-    collect_attribute_files(work_tree, &mut sources);
-    sources.sort();
-    sources.push(git_dir.join("info").join("attributes"));
-    if let Some(global) = global {
-        sources.push(global.to_path_buf());
-    }
-
-    sources
-        .into_iter()
-        .filter_map(|path| match foreign_filter_lines(&path) {
-            Ok(lines) if lines.is_empty() => None,
-            Ok(lines) => Some((path, lines)),
-            Err(_) => None,
-        })
-        .collect()
-}
-
 /// Every `.gitattributes` under `root`, `.git` excluded.
 ///
 /// Iterative rather than recursive, for the same reason the history walk is: a
 /// working tree may be arbitrarily deep and a diagnostic command must not be the
-/// thing that crashes on it. Directories that will not open are skipped; see the
-/// note on misses in [`foreign_filter_sources`].
+/// thing that crashes on it. Directories that will not open are skipped, exactly
+/// as git skips a file it cannot read — see [`FilterResolver`].
 fn collect_attribute_files(root: &Path, out: &mut Vec<PathBuf>) {
     let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {
@@ -568,6 +517,185 @@ fn collect_attribute_files(root: &Path, out: &mut Vec<PathBuf>) {
                 out.push(entry.path());
             }
         }
+    }
+}
+
+/// What git resolves the `filter` attribute to for one path.
+///
+/// The spelling of each variant is `git check-attr filter`'s own, so a report can
+/// quote the answer a user would get from git and the two cannot drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FilterAttribute {
+    /// `filter=git-xcrypt` — git runs this tool for the path.
+    Ours,
+    /// `filter=<something else>`, `filter=lfs` being the ordinary case.
+    Foreign(String),
+    /// `filter` with no value. Git has no driver to run.
+    Set,
+    /// `-filter`. Explicitly off.
+    Unset,
+    /// No line reaches this path at all.
+    Unspecified,
+}
+
+impl FilterAttribute {
+    /// Whether git would run *this* tool for the path.
+    #[must_use]
+    pub fn is_ours(&self) -> bool {
+        matches!(self, Self::Ours)
+    }
+
+    /// The answer as `git check-attr filter` prints it.
+    #[must_use]
+    pub fn as_check_attr(&self) -> &str {
+        match self {
+            Self::Ours => DRIVER,
+            Self::Foreign(value) => value,
+            Self::Set => "set",
+            Self::Unset => "unset",
+            Self::Unspecified => "unspecified",
+        }
+    }
+}
+
+impl std::fmt::Display for FilterAttribute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_check_attr())
+    }
+}
+
+/// Answers "would git run our filter for this path", the way git answers it.
+///
+/// **Resolving rather than naming, since 2026-08-04.** The previous build listed
+/// every attribute source carrying a `filter` line and left the reader to run
+/// `git check-attr`. That was the last route to a green report on a repository
+/// that stores plaintext: a line below the managed section, or a
+/// `.gitattributes` in a subdirectory, silently outranks the catch-all, and a
+/// note does not fail a CI gate. Naming also cannot tell an ordinary
+/// `*.psd filter=lfs` from a line that reaches a secret, so it either cried wolf
+/// or said nothing useful.
+///
+/// The stack reproduced here is git's, in git's precedence order — lowest first,
+/// because [`gix_attributes::Search`] matches its lists in reverse:
+///
+/// 1. the built-in `[attr]binary` macro;
+/// 2. `core.attributesFile`, the global file;
+/// 3. the working tree's `.gitattributes`, root first and each directory after
+///    it, so the file closest to the path wins;
+/// 4. `$GIT_DIR/info/attributes`, which outranks everything.
+///
+/// Macros (`[attr]name …`) are honoured only where git honours them: the root
+/// file, the global file and `info/attributes`. A `[attr]` line in a
+/// subdirectory is not a macro definition to git and is not one here.
+///
+/// A source that cannot be read is skipped, exactly as git skips it.
+pub struct FilterResolver {
+    search: gix_attributes::Search,
+    outcome: gix_attributes::search::Outcome,
+    case: gix_glob::pattern::Case,
+    sources: Vec<PathBuf>,
+}
+
+impl FilterResolver {
+    /// Loads every attribute source git would consult under `work_tree`.
+    ///
+    /// `global` is `core.attributesFile`; `ignore_case` is `core.ignorecase`,
+    /// which git applies to attribute matching as well as to path lookup.
+    #[must_use]
+    pub fn new(work_tree: &Path, git_dir: &Path, global: Option<&Path>, ignore_case: bool) -> Self {
+        let mut collection = gix_attributes::search::MetadataCollection::default();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut search = gix_attributes::Search::new_globals(
+            global
+                .map(Path::to_path_buf)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            &mut buf,
+            &mut collection,
+        )
+        .unwrap_or_default();
+
+        let mut sources: Vec<PathBuf> = Vec::new();
+        collect_attribute_files(work_tree, &mut sources);
+        // Shallowest first: git gives the file closest to the path the higher
+        // precedence, and `Search` matches its lists last-added-first. Depth
+        // before name, because a plain string sort does not order `a/x/.g`
+        // against `a/.g` by depth in every alphabet.
+        sources.sort_by_key(|path| (path.components().count(), path.clone()));
+
+        for source in &sources {
+            // Macros only where git takes them: the root file. Anywhere deeper a
+            // `[attr]` line is an ordinary pattern to git.
+            let is_root = source.parent() == Some(work_tree);
+            let _ = search.add_patterns_file(
+                source.clone(),
+                true,
+                Some(work_tree),
+                &mut buf,
+                &mut collection,
+                is_root,
+            );
+        }
+
+        // Last, so it outranks every file in the working tree — which is exactly
+        // what makes it the source an audit is least likely to look at.
+        let info = git_dir.join("info").join("attributes");
+        let _ = search.add_patterns_file(info.clone(), true, None, &mut buf, &mut collection, true);
+        sources.push(info);
+        // Reported alongside the rest even though it was loaded first: a global
+        // file that silently unsets `filter` is a source a reader has to be told
+        // about, whatever its precedence.
+        sources.extend(global.map(Path::to_path_buf));
+
+        let mut outcome = gix_attributes::search::Outcome::default();
+        outcome.initialize_with_selection(&collection, ["filter"]);
+
+        Self {
+            search,
+            outcome,
+            case: if ignore_case {
+                gix_glob::pattern::Case::Fold
+            } else {
+                gix_glob::pattern::Case::Sensitive
+            },
+            sources,
+        }
+    }
+
+    /// What git resolves `filter` to for a repository-relative path.
+    pub fn resolve(&mut self, relative_path: &[u8]) -> FilterAttribute {
+        use gix_attributes::StateRef;
+
+        self.outcome.reset();
+        self.search.pattern_matching_relative_path(
+            bstr::BStr::new(relative_path),
+            self.case,
+            Some(false),
+            &mut self.outcome,
+        );
+
+        let Some(found) = self.outcome.iter_selected().next() else {
+            return FilterAttribute::Unspecified;
+        };
+        match found.assignment.state {
+            StateRef::Value(value) => {
+                let value = value.as_bstr().to_string();
+                if value == DRIVER {
+                    FilterAttribute::Ours
+                } else {
+                    FilterAttribute::Foreign(value)
+                }
+            }
+            StateRef::Set => FilterAttribute::Set,
+            StateRef::Unset => FilterAttribute::Unset,
+            StateRef::Unspecified => FilterAttribute::Unspecified,
+        }
+    }
+
+    /// Every attributes file this resolver read, in the order it read them.
+    #[must_use]
+    pub fn sources(&self) -> &[PathBuf] {
+        &self.sources
     }
 }
 
@@ -937,6 +1065,218 @@ mod tests {
         let broken = format!("{BEGIN}\n{CATCH_ALL}\n");
         let error = upsert(&broken, &render_section(&[])).expect_err("must refuse");
         assert_eq!(error.exit_code(), crate::exit::CONFIG);
+    }
+
+    /// One attributes source: where it lives, relative to the repository root.
+    struct Source<'a> {
+        path: &'static str,
+        body: &'a str,
+    }
+
+    /// Sets up a repository from `sources`, then asserts our answer for `path`
+    /// is character for character what `git check-attr filter` says.
+    ///
+    /// Comparative rather than expectation-based on purpose: git is the only
+    /// authority on its own attribute stack, and every earlier review of this
+    /// area found a place where our reading of the documentation and git's
+    /// behaviour parted company.
+    fn agrees_with_git(sources: &[Source<'_>], path: &str, global: Option<&str>) {
+        use std::process::Command;
+
+        let dir = tempfile::TempDir::new().expect("temporary directory");
+        let root = dir.path();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(root)
+                .status()
+                .expect("git must be on PATH")
+                .success(),
+            "git init failed"
+        );
+
+        for source in sources {
+            let target = root.join(source.path);
+            fs::create_dir_all(target.parent().expect("a parent")).expect("directories");
+            fs::write(&target, source.body).expect("writing an attributes file");
+        }
+
+        let global_path = global.map(|body| {
+            let path = root.join("global-attributes");
+            fs::write(&path, body).expect("writing the global attributes file");
+            assert!(
+                Command::new("git")
+                    .args(["config", "core.attributesFile"])
+                    .arg(&path)
+                    .current_dir(root)
+                    .status()
+                    .expect("git")
+                    .success()
+            );
+            path
+        });
+
+        // The file has to exist for git to consult its directory's rules, and
+        // `check-attr` without `--cached` reads the working tree.
+        let target = root.join(path);
+        fs::create_dir_all(target.parent().expect("a parent")).expect("directories");
+        fs::write(&target, b"content\n").expect("writing the subject file");
+
+        let output = Command::new("git")
+            .args(["check-attr", "filter", "--", path])
+            .current_dir(root)
+            .output()
+            .expect("git check-attr");
+        let printed = String::from_utf8(output.stdout).expect("check-attr prints text");
+        let expected = printed
+            .rsplit(": ")
+            .next()
+            .expect("check-attr always prints a value")
+            .trim()
+            .to_string();
+
+        let mut resolver =
+            FilterResolver::new(root, &root.join(".git"), global_path.as_deref(), false);
+        let ours = resolver.resolve(path.as_bytes());
+
+        assert_eq!(
+            ours.as_check_attr(),
+            expected,
+            "git and git-xcrypt disagree about `filter` for {path}"
+        );
+    }
+
+    #[test]
+    fn the_filter_attribute_is_resolved_exactly_as_git_resolves_it() {
+        // Ten shapes, every one of them a way a repository can end up not being
+        // filtered while the catch-all line sits there looking correct.
+        let catch_all = "# >>> git-xcrypt >>>\n* filter=git-xcrypt\n# <<< git-xcrypt <<<\n";
+
+        // The healthy case, so a disagreement here would be caught too.
+        agrees_with_git(
+            &[Source {
+                path: ".gitattributes",
+                body: catch_all,
+            }],
+            "secrets/db.env",
+            None,
+        );
+
+        // A line below the managed section. Git takes the last match.
+        agrees_with_git(
+            &[Source {
+                path: ".gitattributes",
+                body: &format!("{catch_all}secrets/** -filter\n"),
+            }],
+            "secrets/db.env",
+            None,
+        );
+
+        // A `.gitattributes` in the directory of the path outranks the root.
+        agrees_with_git(
+            &[
+                Source {
+                    path: ".gitattributes",
+                    body: catch_all,
+                },
+                Source {
+                    path: "secrets/.gitattributes",
+                    body: "* -filter\n",
+                },
+            ],
+            "secrets/db.env",
+            None,
+        );
+
+        // `$GIT_DIR/info/attributes` outranks everything in the working tree.
+        agrees_with_git(
+            &[
+                Source {
+                    path: ".gitattributes",
+                    body: catch_all,
+                },
+                Source {
+                    path: ".git/info/attributes",
+                    body: "secrets/** -filter\n",
+                },
+            ],
+            "secrets/db.env",
+            None,
+        );
+
+        // …and it can also put the filter back, which is the direction a build
+        // that merely looked for foreign lines would have got wrong.
+        agrees_with_git(
+            &[
+                Source {
+                    path: ".gitattributes",
+                    body: catch_all,
+                },
+                Source {
+                    path: "secrets/.gitattributes",
+                    body: "* -filter\n",
+                },
+                Source {
+                    path: ".git/info/attributes",
+                    body: "secrets/** filter=git-xcrypt\n",
+                },
+            ],
+            "secrets/db.env",
+            None,
+        );
+
+        // An ordinary LFS line on paths no pattern of ours reaches.
+        agrees_with_git(
+            &[Source {
+                path: ".gitattributes",
+                body: &format!("{catch_all}*.psd filter=lfs\n"),
+            }],
+            "secrets/db.env",
+            None,
+        );
+
+        // …and the same line where it *does* reach.
+        agrees_with_git(
+            &[Source {
+                path: ".gitattributes",
+                body: &format!("{catch_all}*.env filter=lfs\n"),
+            }],
+            "secrets/db.env",
+            None,
+        );
+
+        // A macro, which is the indirection a reader is least likely to follow.
+        agrees_with_git(
+            &[Source {
+                path: ".gitattributes",
+                body: &format!("[attr]plain -filter\n{catch_all}secrets/** plain\n"),
+            }],
+            "secrets/db.env",
+            None,
+        );
+
+        // `!filter` — unspecified rather than unset, and git tells them apart.
+        agrees_with_git(
+            &[Source {
+                path: ".gitattributes",
+                body: &format!("{catch_all}secrets/** !filter\n"),
+            }],
+            "secrets/db.env",
+            None,
+        );
+
+        // The global file is the *lowest* precedence, so the repository wins.
+        agrees_with_git(
+            &[Source {
+                path: ".gitattributes",
+                body: catch_all,
+            }],
+            "secrets/db.env",
+            Some("* -filter\n"),
+        );
+
+        // …and it decides when nothing in the repository speaks.
+        agrees_with_git(&[], "secrets/db.env", Some("* filter=git-xcrypt\n"));
     }
 
     #[test]

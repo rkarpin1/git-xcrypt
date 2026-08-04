@@ -89,7 +89,7 @@ What the exit code means to the job:
 | Code | Meaning | What to do |
 | --- | --- | --- |
 | `0` | Everything was checked and nothing was found. | Nothing. |
-| `5` | Something was found: a setup gap, a declared file staged in the clear, or a plaintext version in history. | Read the report. If a secret leaked, **rotate it first**. |
+| `5` | Something was found: a setup gap, a declared file staged in the clear, a plaintext version in history, or a declared path git does not resolve `filter=git-xcrypt` for. | Read the report. If a secret leaked, **rotate it first**. |
 | `6` | The run could not answer. A shallow or partial clone, an index that will not parse, a reference store that will not enumerate, a missing `.git-xcrypt`. | Fix the checkout and run it again. Nothing was found, and nothing is ruled out. |
 | `1`–`4` | The tool itself failed — bad arguments, not a repository, no key, bad format. | Fix the invocation or the environment. |
 
@@ -127,6 +127,24 @@ CI logs and every clone that exists.
 
 `status` answers "are my declarations enforced", not "does this repository hold
 secrets". A file no pattern ever matched is invisible to it.
+
+### Attributes that turn the filter off
+
+The `* filter=git-xcrypt` line is one attribute line among many, and git takes
+the **last** match. A line below the managed section, a `.gitattributes` in a
+subdirectory, or `.git/info/attributes` — which is not versioned, so nobody
+reviewing a pull request can see it — can set `-filter` on a declared path.
+`git add` then stores the plain text with exit code 0.
+
+`git-xcrypt status` resolves the `filter` attribute for every declared path the
+index holds, using git's own precedence rules, macros included, and fails with
+exit `5` when git would not run this tool. It resolves rather than guesses, so
+an ordinary `*.psd filter=lfs` line does not trigger it. `git check-attr filter
+-- <path>` gives the same answer by hand.
+
+The boundary: only paths the index already tracks are resolved. A line that
+would disable the filter for a file nobody has committed yet is reported as a
+note, not a finding.
 
 ## Known limitations
 

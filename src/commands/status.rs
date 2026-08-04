@@ -62,6 +62,28 @@ pub enum SetupGap {
     },
     /// `.gitattributes` carries no `* filter=git-xcrypt` line.
     CatchAllMissing,
+    /// Git resolves `filter` to something other than this tool for declared paths.
+    ///
+    /// The catch-all is one line among many and git takes the **last** match, so
+    /// an attribute line below the managed section, a `.gitattributes` in a
+    /// subdirectory, or `$GIT_DIR/info/attributes` — which is not versioned and
+    /// outranks everything — turns this tool off for paths it believes it
+    /// protects. Measured on git 2.55: `git check-attr filter` then answers
+    /// `unset`, the next `git add` stores the plaintext, and every other check in
+    /// this command passes.
+    ///
+    /// Until 2026-08-04 this was a **note**: the report named the files and the
+    /// lines and left the reader to run `git check-attr`. That was the last route
+    /// to a green report on a repository that does not encrypt, because a note
+    /// does not fail a CI gate.
+    FilterUnresolved {
+        /// The declared paths git would not filter, capped for the message.
+        paths: Vec<String>,
+        /// How many there are altogether.
+        total: usize,
+        /// What git resolves instead, spelled as `git check-attr` spells it.
+        resolved: String,
+    },
     /// A file the whole mechanism bootstraps from is not tracked.
     ///
     /// `.gitattributes` is what makes git call the filter and `.git-xcrypt` is
@@ -90,6 +112,27 @@ impl fmt::Display for SetupGap {
                 crate::repo::ATTRIBUTES_FILE,
                 gitattributes::CATCH_ALL
             ),
+            Self::FilterUnresolved {
+                paths,
+                total,
+                resolved,
+            } => {
+                write!(
+                    f,
+                    "git resolves `filter` to `{resolved}` for {total} declared path(s), \
+                     not `{DRIVER}` — so committing them stores the plain text, whatever \
+                     the `{catch_all}` line says. Some attribute line outranks it; \
+                     `git check-attr filter -- <path>` shows which, and the notes below \
+                     name every file carrying a `filter` line. Deleting or narrowing that \
+                     line is the fix — `git-xcrypt init` will not remove it. Reached: {}",
+                    paths.join(", "),
+                    catch_all = gitattributes::CATCH_ALL
+                )?;
+                if *total > paths.len() {
+                    write!(f, ", … and {} more", total - paths.len())?;
+                }
+                Ok(())
+            }
             Self::Untracked(path) => write!(
                 f,
                 "{path} is not committed, so no clone of this repository gets it \
@@ -629,34 +672,6 @@ pub fn run(repo: &Repo, fix: bool) -> Result<Report> {
     }
 
     report.notes.extend(diff_driver_note(repo, &config));
-    // Git takes the last matching attribute line, so one below the managed
-    // section can turn the filter off for paths this tool believes it protects.
-    // Named, not resolved — see `gitattributes::foreign_filter_lines`.
-    // Every source git reads, not just the root file: a `.gitattributes` in a
-    // subdirectory and `.git/info/attributes` both outrank it, and looking only
-    // at the root let a `secrets/.gitattributes` holding `* -filter` pass
-    // unmentioned while `git add` stored the plaintext.
-    for (source, foreign) in gitattributes::foreign_filter_sources(
-        repo.work_tree(),
-        repo.git_dir(),
-        gitconfig::get(&config, "core.attributesFile")
-            .as_deref()
-            .map(std::path::Path::new),
-    ) {
-        report.notes.push(format!(
-            "{} carries {} line(s) of its own that set or unset `filter`, and git \
-             takes the LAST match — so any declared path they reach is not \
-             filtered by git-xcrypt, whatever this report says about it. Check \
-             with `git check-attr filter -- <path>`:\n    {}",
-            repo.relative(&source)
-                .unwrap_or(&source)
-                .display()
-                .to_string()
-                .replace('\\', "/"),
-            foreign.len(),
-            foreign.join("\n    ")
-        ));
-    }
     if !report.has_key {
         // Otherwise a locked repository and a healthy one render identically,
         // and "no findings" reads as "everything is fine here" to someone who
@@ -688,7 +703,36 @@ pub fn run(repo: &Repo, fix: bool) -> Result<Report> {
     let hash = gitindex::object_hash(gitconfig::get(&config, "extensions.objectformat").as_deref());
     let objects = history::objects(repo.common_dir(), hash)?;
 
-    inspect_index(repo, &declarations, &objects, hash, &mut report)?;
+    // Git's own attribute stack, not a search for suspicious lines: the question
+    // is what `git check-attr filter` answers for each declared path, and only a
+    // resolution answers it. Built once for the whole run — it reads every
+    // `.gitattributes` in the working tree, and doing that per path would turn a
+    // diagnostic into a walk of the tree squared.
+    let mut filters = gitattributes::FilterResolver::new(
+        repo.work_tree(),
+        repo.git_dir(),
+        gitconfig::get(&config, "core.attributesFile")
+            .as_deref()
+            .map(std::path::Path::new),
+        gitconfig::get(&config, "core.ignorecase").is_some_and(|value| gitconfig::is_true(&value)),
+    );
+
+    inspect_index(
+        repo,
+        &declarations,
+        &objects,
+        hash,
+        &mut filters,
+        &mut report,
+    )?;
+    report.notes.extend(foreign_source_note(
+        repo,
+        &filters,
+        report
+            .setup
+            .iter()
+            .any(|gap| matches!(gap, SetupGap::FilterUnresolved { .. })),
+    ));
     if fix {
         restage(repo, &declarations, hash, &mut report)?;
     }
@@ -798,6 +842,7 @@ fn inspect_index(
     declarations: &Config,
     objects: &gix_odb::Handle,
     hash: gix_hash::Kind,
+    filters: &mut gitattributes::FilterResolver,
     report: &mut Report,
 ) -> Result<()> {
     let index_path = repo.git_dir().join("index");
@@ -856,6 +901,12 @@ fn inspect_index(
         }
     }
 
+    // Declared paths git resolves to something other than our driver, with what
+    // it resolves instead. Collected rather than reported one by one: a
+    // subdirectory `.gitattributes` reaches every file under it, and three
+    // hundred identical gaps would bury every other finding.
+    let mut unfiltered: Vec<(String, String)> = Vec::new();
+
     for entry in entries {
         // A symbolic link and a submodule gitlink are not file content, so git
         // never filters them and no declaration could have applied. Measured on
@@ -880,6 +931,15 @@ fn inspect_index(
             continue;
         }
 
+        // What git would actually do with this path, asked of git's own rules.
+        // A declared path git does not resolve to our driver is stored in the
+        // clear on the next `git add`, with exit code 0 and no warning — and
+        // every other check in this command passes while it happens.
+        let resolved = filters.resolve(&name);
+        if !resolved.is_ours() {
+            unfiltered.push((show(&name), resolved.to_string()));
+        }
+
         let Ok(id) = gix_hash::oid::try_from_bytes(&id) else {
             report.undetermined.push(format!(
                 "{}: the index records an object id this build cannot read",
@@ -901,7 +961,73 @@ fn inspect_index(
     report.encrypted.sort();
     report.in_the_clear.sort();
     report.by_choice.sort();
+
+    if !unfiltered.is_empty() {
+        unfiltered.sort();
+        let resolved = unfiltered
+            .first()
+            .map(|(_, resolved)| resolved.clone())
+            .unwrap_or_default();
+        report.setup.push(SetupGap::FilterUnresolved {
+            paths: unfiltered
+                .iter()
+                .take(MAX_LISTED)
+                .map(|(path, _)| path.clone())
+                .collect(),
+            total: unfiltered.len(),
+            resolved,
+        });
+    }
     Ok(())
+}
+
+/// Names the attribute files carrying `filter` lines, once resolution has run.
+///
+/// Kept as a **note** and emitted only when there is something to attach it to,
+/// which is the change 2026-08-04 brought. Before it, the mere presence of a
+/// foreign `filter` line produced this note on every run — and `*.psd
+/// filter=lfs` in a subdirectory is entirely ordinary, so the note fired in
+/// repositories where nothing was wrong and taught a reader to skip it.
+///
+/// It still says what the resolution cannot: these lines exist, and a path they
+/// reach which the index does not yet hold would not be filtered either. That is
+/// the honest boundary of a check that resolves only the paths git is tracking.
+fn foreign_source_note(
+    repo: &Repo,
+    filters: &gitattributes::FilterResolver,
+    reached_a_declared_path: bool,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    for source in filters.sources() {
+        let Ok(lines) = gitattributes::foreign_filter_lines(source) else {
+            continue;
+        };
+        if lines.is_empty() {
+            continue;
+        }
+        let shown = repo
+            .relative(source)
+            .unwrap_or(source)
+            .display()
+            .to_string()
+            .replace('\\', "/");
+        let verdict = if reached_a_declared_path {
+            "and git takes the LAST match. Some of them reach a declared path — \
+             see the setup gap above, which is the finding."
+        } else {
+            "and git takes the LAST match. Checked against every declared path the \
+             index holds: git still resolves `filter=git-xcrypt` for all of them, \
+             so nothing tracked is unprotected by these. A path they reach which \
+             the index does not yet hold would be."
+        };
+        notes.push(format!(
+            "{shown} carries {} line(s) of its own that set or unset `filter`, \
+             {verdict} Check with `git check-attr filter -- <path>`:\n    {}",
+            lines.len(),
+            lines.join("\n    ")
+        ));
+    }
+    notes
 }
 
 /// Re-stages every declared path the index holds in the clear.
