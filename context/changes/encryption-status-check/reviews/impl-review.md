@@ -4,8 +4,9 @@
 - **Plan**: `context/changes/encryption-status-check/plan.md`
 - **Zakres**: Fazy 1–3 z 3 (wszystkie ukończone)
 - **Data**: 2026-08-04
-- **Werdykt**: ODRZUCONY po pierwszym przebiegu → ZAAKCEPTOWANY po naprawach
-- **Ustalenia**: przebieg 1 — 3 krytyczne, 4 ostrzeżenia, 6 obserwacji
+- **Werdykt**: ODRZUCONY po pierwszym przebiegu → ODRZUCONY po drugim → ZAAKCEPTOWANY
+- **Ustalenia**: przebieg 1 — 3 krytyczne, 4 ostrzeżenia, 6 obserwacji;
+  przebieg 2 — 2 krytyczne, 6 ostrzeżeń, 9 obserwacji
 - **Metoda**: dwóch recenzentów równolegle (zgodność z planem; bezpieczeństwo,
   jakość i wzorce), plus własne sondy na prawdziwych repozytoriach git 2.55 —
   SHA-256, podzielony indeks, obiekty w paczkach, podłączony worktree,
@@ -23,9 +24,9 @@
 | Spójność wzorców | PASS | PASS |
 | Kryteria sukcesu | PASS | PASS |
 
-Bramka jakości po naprawach: `cargo fmt --check`,
+Bramka jakości po obu przebiegach: `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings` i `cargo test` (262 testy jednostkowe
-+ 118 integracyjnych, w tym 32 nowe w `tests/status_command.rs`) przechodzą.
++ 130 integracyjnych, w tym 40 nowych w `tests/status_command.rs`) przechodzą.
 Zestaw integracyjny uruchomiony ośmiokrotnie z rzędu bez ani jednej awarii.
 
 ## Ustalenia krytyczne
@@ -324,7 +325,8 @@ Udokumentowane w nagłówku `src/commands/status.rs`, pokryte testem
 `a_declaration_added_later_does_not_reach_an_untouched_file_and_status_says_so`.
 
 **Do decyzji człowieka:** czy dopisać to ograniczenie do `zalozenia.md`
-§Integracja z git obok pozostałych zmierzonych zachowań gita.
+§Integracja z git obok pozostałych zmierzonych zachowań gita. Wpisane już do
+`AGENTS.md` jako twarda reguła, bo następny agent musi je znać.
 
 ## Rozjazdy planu wobec stanu kodu
 
@@ -360,6 +362,203 @@ Odnotowane, nie naprawiane w planie:
   `MIT OR Apache-2.0` poza `zlib-rs`, które ma licencję **Zlib** — permisywną,
   zatwierdzoną przez OSI, bez copyleft, więc `MIT OR Apache-2.0` projektu
   zostaje w mocy. Do wpisania w przyszłą konfigurację `cargo deny`.
+
+## Drugi przebieg — czego pierwszy nie dotknął
+
+Metoda: dwóch recenzentów równolegle na zbudowanej binarce — jeden polował na
+regresje po naprawach z przebiegu pierwszego, drugi na treść raportu jako
+zabezpieczenie, na zgodność z pozostałymi komendami i na kontrakt kodów wyjścia.
+Wszystkie osiem napraw z przebiegu 1 **potwierdzono jako poprawne**, w tym
+bajtowe łatanie indeksu na wersjach 2/3/4, SHA-256, `index.skipHash` oraz — po
+raz pierwszy — na indeksie z 3001 wpisami, gdzie rozszerzenia `EOIE` i `IEOT`
+faktycznie występują; git przyjął przebudowany plik, `TREE` i `EOIE` zniknęły,
+`IEOT` został.
+
+### G1 — `--fix` wyrzucał cały raport przez jeden plik, którego nie umiał wyczyścić
+
+- **Ważność**: ❌ KRYTYCZNE · **Lokalizacja**: `src/commands/status.rs` (`restage`)
+- **Szczegóły**: `decide::clean(...)?` propagował błąd, więc plik zaszyfrowany
+  obcym kluczem przerywał całą komendę. Zmierzone: `status` bez `--fix` dawał
+  kod `5` i dwie ścieżki w historii; `status --fix` na tym samym repozytorium
+  dawał **kod `4`, zero bajtów na `stdout`** i ani jednego znaleziska. Bramka
+  czytała „narzędzie się zepsuło". Dwie awarie po obu stronach tej linii —
+  nieczytalny plik i nieudany zapis obiektu — były obsłużone poprawnie od
+  początku; ta jedna była wyjątkiem.
+- **Naprawa**: ostrzeżenie, ścieżka zostaje w `in_the_clear`, przebieg trwa dalej.
+- **Decyzja**: NAPRAWIONE
+
+### G2 — zielony raport na repozytorium, którego git nie filtruje
+
+- **Ważność**: ❌ KRYTYCZNE · **Lokalizacja**: `src/gitattributes.rs`,
+  `src/commands/status.rs`
+- **Szczegóły**: dwa niezależne warianty tej samej luki.
+  **(a)** `catch_all_present` szuka dosłownej linii, a git bierze **ostatnie**
+  dopasowanie — linia `secrets/** -filter` poniżej sekcji zarządzanej wyłącza
+  filtr dla zadeklarowanych ścieżek. Zmierzone: `git check-attr filter` mówi
+  `unset`, `git add` zapisuje plaintext, a `status` mówił, że wszystko gra.
+  **(b)** `.gitattributes` i `.git-xcrypt` czytane są z katalogu roboczego i
+  nikt nie pytał, czy są **śledzone**. `init` je tworzy i nie commituje, więc
+  repozytorium wypchnięte bez nich wygląda od środka na skonfigurowane, a każdy
+  jego klon nie filtruje niczego.
+- **Naprawa**: (b) to nowa luka konfiguracji `SetupGap::Untracked`, zapalająca
+  bramkę — ale dopiero gdy cokolwiek innego jest już śledzone, żeby nie czepiać
+  się repozytorium sprzed pierwszego `git add`. (a) to **nota**, nie luka:
+  odpowiedź „które ścieżki to naprawdę obejmuje" wymaga przejścia stosu
+  atrybutów gita (`gix-attributes` plus zagnieżdżone pliki), a `filter=lfs` na
+  niezwiązanych ścieżkach jest zupełnie legalne i nie może palić bramki. Nota
+  nazywa linie i odsyła do `git check-attr`.
+- **Testy**: `bootstrap_files_that_were_never_committed_are_a_setup_gap`,
+  `a_line_that_turns_the_filter_off_is_named`.
+- **Decyzja**: NAPRAWIONE częściowo — pełne rozstrzyganie atrybutów **wymaga
+  decyzji człowieka**, patrz „Do decyzji człowieka" niżej.
+
+### G3 — raport chował to, po co się go czyta
+
+- **Ważność**: ⚠️ OSTRZEŻENIE · **Lokalizacja**: `src/commands/status.rs` (`Display`)
+- **Szczegóły**: sekcja „encrypted" wypisywała **każdą** zadeklarowaną ścieżkę i
+  szła **przed** sekcjami o ekspozycji. Zmierzone przy 301 ścieżkach i jednym
+  wycieku: 319 linii, `leaked in history` w linii 306, `ROTATE THE SECRET` w 312.
+  Na czterdziestoliniowym terminalu użytkownik widzi ścianę dobrych wiadomości i
+  nic więcej. Polecenie `git filter-repo` z 301 argumentami `--path` było jedną
+  nieprzeklejalną linią.
+- **Naprawa**: linia `VERDICT:` na samej górze, lista „encrypted" ucięta do
+  dziesięciu pozycji, szczegóły blobów ucięte do trzech na ścieżkę, a polecenie
+  rewrite'u powyżej dziesięciu ścieżek przechodzi na `--paths-from-file`.
+- **Testy**: `the_verdict_comes_before_the_wall_of_good_news`,
+  `a_clean_repository_says_so_on_its_first_line`.
+- **Decyzja**: NAPRAWIONE
+
+### G4 — raport przeczył sam sobie po nieudanym `--fix`
+
+- **Ważność**: ⚠️ OSTRZEŻENIE · **Lokalizacja**: `src/commands/status.rs` (`Display`)
+- **Szczegóły**: trzy warianty. `stdout` po `--fix`, który jednej ścieżki nie
+  ruszył, radził uruchomić `--fix` — czyli komendę, której wynik czytelnik trzyma
+  w ręku — a powód leżał wyłącznie na `stderr`. Checklista historii kazała zrobić
+  `--fix` również wtedy, gdy `--fix` właśnie odmówił. Linia zamykająca mówiła
+  „scanned 0 commit(s)" w repozytorium z pięciuset commitami, gdy przebieg wrócił
+  przed skanem.
+- **Naprawa**: `Report::fix_requested` i `Report::scan_ran`; rady są warunkowe,
+  a brak skanu jest nazwany zamiast wyliczony na zero.
+- **Decyzja**: NAPRAWIONE
+
+### G5 — `--fix` zastawiał niezastagowane zmiany i twierdził inaczej
+
+- **Ważność**: ⚠️ OSTRZEŻENIE · **Lokalizacja**: `src/commands/status.rs`
+- **Szczegóły**: `restage` czyta **katalog roboczy**, więc `--fix` zastawia też
+  edycje, których użytkownik świadomie nie zastagował — dokładnie tak jak
+  `git add`, i to jest właściwe zachowanie. Raport mówił jednak „This changed the
+  index and nothing else … The working tree is untouched … commit when ready",
+  co zaprasza do zacommitowania czegoś, o czym nie wspomniano.
+- **Naprawa**: raport mówi wprost, że zastawiona jest treść z katalogu roboczego,
+  edycje niezastagowane włącznie, i odsyła do `git diff --cached`.
+- **Decyzja**: NAPRAWIONE
+
+### G6 — plik pod `refs/`, który nie jest referencją, palił bramkę
+
+- **Ważność**: ⚠️ OSTRZEŻENIE (regresja naprawy F2) · **Lokalizacja**: `src/history.rs` (`tips`)
+- **Szczegóły**: naprawa F2 liczyła jako nierozwiązaną referencję również błąd
+  **iteracji**, który obejmuje pusty plik po awarii albo przypadkowy `notes.txt`
+  w `refs/heads/`. Git wypisuje `warning: ignoring broken ref` i idzie dalej,
+  bo taki plik nie prowadzi do żadnej historii. Zmierzone: `git status` kod 0,
+  `git-xcrypt status` kod 5.
+- **Naprawa**: błąd iteracji to nota (tolerancja gita), błąd **rozwinięcia** —
+  czyli referencja, która nią jest i nie prowadzi nigdzie — nadal pali bramkę,
+  bo tam git też umiera. Dodatkowo nazwy referencji trafiają na `stdout`;
+  wcześniej `stdout` mówił „1 reference(s)", a nazwa była tylko na `stderr`.
+- **Testy**: `a_file_under_refs_that_is_not_a_reference_does_not_fail_the_gate`,
+  `a_reference_that_will_not_resolve_is_named_not_merely_counted`.
+- **Decyzja**: NAPRAWIONE
+
+### G7 — klon częściowy raportowany jako uszkodzony
+
+- **Ważność**: ⚠️ OSTRZEŻENIE · **Lokalizacja**: `src/commands/status.rs`
+- **Szczegóły**: bliźniak naprawionego wcześniej klonu płytkiego. Obiekt
+  promisor jest nieobecny z założenia, a raport mówił „N object(s) could not be
+  read … `git fsck` says what is missing" — przy czym `git fsck` w klonie
+  częściowym kończy się zerem i nie zgłasza nic.
+- **Naprawa**: wykrycie po `remote.<nazwa>.promisor` / `extensions.partialclone`
+  i własny wpis `undetermined` z poleceniem, które faktycznie pomaga.
+- **Decyzja**: NAPRAWIONE
+
+### G8 — `git add -N` raportowany jako naprawiony
+
+- **Ważność**: ⚠️ OSTRZEŻENIE · **Lokalizacja**: `src/gitindex.rs`, `src/commands/status.rs`
+- **Szczegóły**: wpis intent-to-add ma tryb `100644` i pusty blob, więc czytał
+  się jako treść jawna; `--fix` przestawiał go i ogłaszał naprawę, której
+  następny `git commit` nie robi — git nadal traktuje ścieżkę jako niezastagowaną.
+- **Naprawa**: `Tracked::intent_to_add` z rozszerzonego słowa flag (bit `0x2000`,
+  czyli `CE_INTENT_TO_ADD`), pomijany razem z dowiązaniami i gitlinkami.
+- **Test**: `an_intent_to_add_entry_is_not_claimed_as_fixed`.
+- **Decyzja**: NAPRAWIONE
+
+### Obserwacje z drugiego przebiegu, naprawione
+
+- **Nieczytelny `HEAD` twierdził, że nic nie przeskanowano** — flaga
+  `refs_unavailable` była ustawiana z trzech różnych awarii, a czytana jako
+  jedna; raport przeczył liczbie commitów trzy linie niżej. Teraz to jedna
+  nierozwiązana referencja.
+- **`--fix` gubił ostrzeżenie z `decide::clean`** — druga implementacja ścieżki
+  check-in nie może być tą, która połyka komunikat.
+- **`--fix` wyrzucał raport przy każdym błędzie klucza poza `NoKey`** — nieczytelny
+  plik klucza tracił diagnozę tak samo jak brakujący.
+- **Budżet ostrzeżeń o referencjach** — obiekty dostały swój przy F11, referencje
+  nie miały żadnego; tysiąc zepsutych referencji zalewało `stderr`.
+- **Referencja wskazująca na drzewo lub blob znikała bez śladu** — teraz nota.
+- **Kody wyjścia**: błąd użycia kończył się kodem `2`, tym samym co „konflikt
+  stanu" — bramka nie odróżniłaby literówki od zepsutego repozytorium; teraz `1`,
+  a `--help` i `--version` kończą się zerem. Nieczytelny `.gitattributes` kończył
+  się kodem `1` wbrew własnemu kontraktowi funkcji; teraz `2`.
+- **Nieaktualna sekcja `.gitattributes`** — `sync --check` kończył się jedynką,
+  a `status` zerem i milczeniem na tym samym repozytorium. Teraz nota, nie luka:
+  linie kosmetyczne to zadanie `sync` i ich rozjazd nigdy nie zapisuje sekretu
+  jawnie, ale klon takiego repozytorium po `unlock` ma brudny `git status`,
+  wbrew kryterium akceptacji 6.
+- **Repozytorium zamknięte czytało się identycznie jak zdrowe** — teraz nota
+  mówiąca, że klucza tu nie ma.
+
+### Potwierdzone jako poprawne w drugim przebiegu
+
+- **Wszystkie osiem napraw z przebiegu 1**, prześledzone osobno i w większości
+  empirycznie: `at_opts` (jedyna różnica wobec `at` to `object_hash`), offset
+  trybu 24..28 niezależny od wersji indeksu i długości skrótu, `Restaged::Done`
+  na obu gałęziach awarii, cache `HeadLookup` nadal wypisujący ostrzeżenie,
+  pomijanie tagów na nie-commitach bez gubienia niczego legalnego (sprawdzone na
+  szesnastu kształtach repozytorium), `working_tree_path`, `shell_quoted`.
+- **Brak paniki, zawieszenia, uszkodzenia indeksu i fałszywego „czysto"** na:
+  SHA-256, wersjach indeksu 2/3/4, podzielonym indeksie, indeksie z 3001 wpisami
+  z `EOIE`/`IEOT`, obciętym i uszkodzonym indeksie, zajętym `index.lock`,
+  dowiązaniu, gitlinku, konflikcie scalania, `git add -N`, podłączonym worktree,
+  bisekcji, stashu, notes, `refs/replace`, alternatywach, klonie płytkim i
+  częściowym, uszkodzonym `packed-refs`, nieczytelnym `refs/heads`, nieurodzonej
+  gałęzi, `--orphan`, wzorcu `*` jako całej deklaracji i podwójnym `--fix`.
+- **Zgodność z pozostałymi komendami**: `status` daje `0` po `init`+commicie, po
+  `sync`, po `lock` i po `unlock`; `status --fix` nie psuje późniejszego `lock`;
+  samo `status` nie zmienia ani jednego bajtu na dysku (sprawdzone sumami).
+- **Higiena**: brak `unwrap`/`expect`/`panic!` poza testami, zero `unsafe`, ani
+  jedno okno ośmiu bajtów pliku klucza ani żaden plaintext nie pojawia się w
+  wyjściu (sprawdzone wprost).
+
+## Do decyzji człowieka
+
+1. **Pełne rozstrzyganie atrybutów.** `status` nazywa dziś linie `filter` spoza
+   sekcji zarządzanej, ale nie odpowiada, których ścieżek naprawdę dotyczą.
+   Odpowiedź wymaga `gix-attributes` (sprawdzone: **zero** nowych zależności
+   przechodnich, wszystko już jest w drzewie) plus stosu plików `.gitattributes`
+   per katalog. To jedyna znana droga do zielonego raportu na repozytorium,
+   którego git nie filtruje.
+2. **Klon płytki pali bramkę, a `actions/checkout` domyślnie robi klon płytki.**
+   Uczciwe: historii, której nie pobrano, nie da się zaświadczyć. Praktyczne:
+   każdy domyślny przebieg CI będzie czerwony, co jest najszybszą drogą do
+   nauczenia ludzi ignorowania tej komendy. Do rozstrzygnięcia razem z
+   dokumentacją (`fetch-depth: 0`).
+3. **Kod `5` obejmuje dziś także „nie dało się ustalić".** Zamrożona tabela
+   rezerwuje `5` dla ekspozycji. Fail-closed jest właściwy, ale bramka nie
+   odróżni „sekret jest w historii" od „nie przeczytałem indeksu". Albo
+   poszerzyć opis `5` w `zalozenia.md`, albo rozdzielić na `2`.
+4. **Repozytorium bare jest odmawiane**, choć skan historii nie potrzebuje
+   katalogu roboczego, a lustro bare to naturalne miejsce na bramkę serwerową.
+5. **Ograniczenie cache'u `stat`** (patrz niżej) — czy dopisać je do
+   `zalozenia.md` §Integracja z git obok pozostałych zmierzonych zachowań gita.
 
 ## Luki w weryfikacji, które zostają
 
