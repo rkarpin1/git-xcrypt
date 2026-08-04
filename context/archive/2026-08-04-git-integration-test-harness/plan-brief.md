@@ -1,6 +1,6 @@
 # Git integration test harness — Plan Brief
 
-> Pełny plan: `context/changes/git-integration-test-harness/plan.md`
+> Pełny plan: `context/archive/2026-08-04-git-integration-test-harness/plan.md`
 
 ## What and why
 

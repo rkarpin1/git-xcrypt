@@ -1,7 +1,7 @@
 <!-- IMPL-REVIEW-REPORT -->
 # Implementation Review: Git integration test harness
 
-- **Plan**: `context/changes/git-integration-test-harness/plan.md`
+- **Plan**: `context/archive/2026-08-04-git-integration-test-harness/plan.md`
 - **Scope**: Phases 1–3 of 3
 - **Date**: 2026-08-04
 - **Verdict**: NEEDS ATTENTION (all findings resolved during triage)
