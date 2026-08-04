@@ -37,12 +37,14 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use bstr::ByteSlice as _;
+
 use crate::config::EolMode;
 use crate::decide::{self, Outcome};
 use crate::format::looks_encrypted;
 use crate::key::MasterKey;
 use crate::repo::Repo;
-use crate::{Error, Result};
+use crate::{Error, Result, keyfile};
 
 /// Reads `path` and returns the text git should diff.
 ///
@@ -136,6 +138,18 @@ fn named_io(path: &Path, err: &std::io::Error) -> Error {
 ///
 /// As [`run`], minus the I/O.
 pub fn convert(key: Option<&MasterKey>, name: &[u8], content: &[u8]) -> Result<Outcome> {
+    // Decided on the content, so it holds wherever the file is and whatever the
+    // current directory is — the location check in `run` cannot say that, and it
+    // has nothing to say at all about a copy `export-key` wrote into the working
+    // tree. The rule has no exception: a key leaves through `export-key`.
+    if keyfile::holds_a_key(content) {
+        return Err(Error::Config(format!(
+            "{}: this is a git-xcrypt key file, and a key is never printed. \
+             To carry it to another machine, use `git-xcrypt export-key`.",
+            name.as_bstr()
+        )));
+    }
+
     if !looks_encrypted(content) {
         return Ok(Outcome {
             content: content.to_vec(),
@@ -232,6 +246,21 @@ mod tests {
         let blob = crypto::encrypt(&key(), 0, &content).expect("encryption");
         let outcome = convert(Some(&key()), b"a.p12", &blob).expect("decryption");
         assert_eq!(outcome.content, content);
+    }
+
+    #[test]
+    fn a_key_file_is_refused_although_it_carries_no_data_magic() {
+        // Both shapes. Neither starts with the data magic, so without this the
+        // pass-through branch would print the repository's master key.
+        let exported = crate::keyfile::encode_portable(&key());
+        for content in [exported.as_bytes(), b"\0GITXCRYPTKEY\0\x01somekeymaterial"] {
+            let error = convert(Some(&key()), b"notes.txt", content).expect_err("must refuse");
+            assert_eq!(error.exit_code(), crate::exit::CONFIG);
+            assert!(
+                error.to_string().contains("export-key"),
+                "the refusal must say where a key is allowed to go: {error}"
+            );
+        }
     }
 
     #[test]

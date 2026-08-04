@@ -174,9 +174,11 @@ fn tampered_ciphertext_is_refused_with_the_format_code() {
 }
 
 #[test]
-fn init_registers_the_diff_driver_and_leaves_the_cache_off() {
+fn init_registers_the_diff_driver_and_switches_the_cache_off() {
     // A cache would keep every decrypted file in a notes ref inside `.git/`,
-    // where it would outlive `lock`.
+    // where it would outlive `lock`. `git config --get` is asked here rather
+    // than the local file, because the value that matters is the one git
+    // resolves: an inherited `true` is what a local `false` has to beat.
     let repo = prepared();
 
     let registered = text(
@@ -188,12 +190,15 @@ fn init_registers_the_diff_driver_and_leaves_the_cache_off() {
         registered.trim_end().ends_with(" diff"),
         "registered `{registered}`"
     );
-    assert!(
-        !repo
-            .git(["config", "--get", "diff.git-xcrypt.cachetextconv"])
-            .status
-            .success(),
-        "the textconv cache was switched on"
+    assert_eq!(
+        text(
+            &repo
+                .git_ok(["config", "--bool", "diff.git-xcrypt.cachetextconv"])
+                .stdout
+        )
+        .trim_end(),
+        "false",
+        "the textconv cache was left for an inherited value to switch on"
     );
 }
 
@@ -327,6 +332,79 @@ fn the_driver_refuses_to_print_anything_out_of_the_git_directory() {
         output.stdout.is_empty(),
         "the repository key reached stdout"
     );
+}
+
+#[test]
+fn a_key_file_is_never_printed_whatever_the_current_directory_is() {
+    // The location check can only speak about the repository it is standing in,
+    // and it has nothing at all to say about a copy `export-key` wrote. Deciding
+    // on the content is what makes the refusal hold in both cases.
+    let repo = prepared();
+    let elsewhere = tempfile::TempDir::new().expect("temporary directory");
+    let exported = elsewhere.path().join("repo.key");
+    repo.xcrypt_ok(["export-key", &exported.to_string_lossy()]);
+
+    // The same export, renamed and dropped in the working tree — where no path
+    // rule could recognise it.
+    repo.write_file(
+        "notes.txt",
+        &fs::read(&exported).expect("the export must exist"),
+    );
+
+    let targets = [
+        Repo::discover(repo.path()).expect("discovery").key_path(),
+        exported,
+        repo.path().join("notes.txt"),
+    ];
+    for target in targets {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_git-xcrypt"))
+            // Deliberately outside every repository: the first version of this
+            // guard was a path check, and it fell silent from here.
+            .current_dir(elsewhere.path())
+            .arg("diff")
+            .arg(&target)
+            .output()
+            .expect("could not run git-xcrypt");
+
+        assert_eq!(
+            output.status.code(),
+            Some(i32::from(git_xcrypt::exit::CONFIG)),
+            "{}: stderr {}",
+            target.display(),
+            text(&output.stderr)
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "a key reached stdout from {}",
+            target.display()
+        );
+    }
+}
+
+#[test]
+fn a_linked_worktree_diffs_on_the_plaintext_too() {
+    // The one configuration where the git directory and the directory holding
+    // the key are not the same place, which is what the guard walks over.
+    let repo = prepared();
+    repo.write_file("a.env", b"api_key = one\n");
+    repo.commit_all("first");
+
+    let linked = repo.add_worktree("side");
+    linked.write_file("a.env", b"api_key = two\n");
+
+    let diff = text(&linked.git_ok(["--no-pager", "diff", "--", "a.env"]).stdout);
+    assert!(diff.contains("-api_key = one"), "{diff}");
+    assert!(diff.contains("+api_key = two"), "{diff}");
+
+    let key_path = Repo::discover(linked.path()).expect("discovery").key_path();
+    let output = linked.xcrypt(["diff", &key_path.to_string_lossy()]);
+    assert_eq!(
+        output.status.code(),
+        Some(i32::from(git_xcrypt::exit::CONFIG)),
+        "stderr: {}",
+        text(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
 }
 
 #[cfg(unix)]

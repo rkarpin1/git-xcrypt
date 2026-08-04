@@ -90,6 +90,7 @@ pub fn run(repo: &Repo) -> Result<Report> {
     let config = Config::load(&repo.xcrypt_config_path())?;
     let lines = gitattributes::render_lines(&config);
     report.warnings = config.pointless_eol;
+    report.warnings.extend(textconv_cache_warning(repo));
     report.attributes_written = gitattributes::write_section(&repo.attributes_path(), &lines)?;
 
     Ok(report)
@@ -153,11 +154,16 @@ fn refuse_if_previously_configured(repo: &Repo) -> Result<()> {
 ///
 /// The `diff` driver is registered alongside it, so the cosmetic
 /// `diff=git-xcrypt` lines S-02 renders have something behind them and `git
-/// diff` compares plaintext. `cachetextconv` is not merely left unset but
-/// actively removed: it makes git keep every decrypted file in a notes ref
-/// inside `.git/`, which would survive `lock` and put the plaintext this product
-/// exists to hide back on disk. The key is namespaced under our own driver name,
-/// so nothing a user configured elsewhere is touched.
+/// diff` compares plaintext.
+///
+/// `cachetextconv` is written as an explicit `false` rather than merely left
+/// out. It makes git keep every *decrypted* file as a blob under
+/// `refs/notes/textconv/git-xcrypt`, inside `.git/`, where it survives `lock` —
+/// the plaintext this product exists to hide, back on disk after the key is
+/// gone. Merely unsetting the local key was measured to be no defence at all: a
+/// `[diff "git-xcrypt"] cachetextconv = true` in `~/.gitconfig` is inherited,
+/// and only a local `false` overrides it. The key is namespaced under our own
+/// driver name, so nothing a user configured for anything else is touched.
 ///
 /// Shared with `import-key` and `unlock` rather than copied: a clone has the
 /// catch-all line in `.gitattributes` and no driver behind it, and every command
@@ -178,19 +184,13 @@ pub(crate) fn register_driver(repo: &Repo) -> Result<bool> {
         ),
         (format!("filter.{DRIVER}.required"), "true".to_string()),
         (format!("diff.{DRIVER}.textconv"), format!("{binary} diff")),
+        (format!("diff.{DRIVER}.cachetextconv"), "false".to_string()),
     ];
 
     let mut changed = false;
     for (key, value) in wanted {
         if gitconfig::get(&config, &key).as_deref() != Some(value.as_str()) {
             gitconfig::set(&mut config, &key, &value)?;
-            changed = true;
-        }
-    }
-
-    for unwanted in [format!("diff.{DRIVER}.cachetextconv")] {
-        if gitconfig::get(&config, &unwanted).is_some() {
-            gitconfig::unset(&mut config, &unwanted)?;
             changed = true;
         }
     }
@@ -241,15 +241,16 @@ pub(crate) fn register_driver_for_lock(repo: &Repo) -> Result<LockRegistration> 
     // registration" every single time — noise in the one output a user scans
     // for signs of trouble before the key disappears, and a repair that no
     // longer proves anything if the real one stops working.
+    //
+    // Only `textconv` goes. The `cachetextconv = false` line stays, because with
+    // no driver there is nothing to cache and because removing it would let a
+    // `true` in `~/.gitconfig` back through if the repository is ever unlocked
+    // by a build that does not write it.
     let mut diff_driver_removed = false;
-    for unwanted in [
-        format!("diff.{DRIVER}.textconv"),
-        format!("diff.{DRIVER}.cachetextconv"),
-    ] {
-        if gitconfig::get(&config, &unwanted).is_some() {
-            gitconfig::unset(&mut config, &unwanted)?;
-            diff_driver_removed = true;
-        }
+    let textconv = format!("diff.{DRIVER}.textconv");
+    if gitconfig::get(&config, &textconv).is_some() {
+        gitconfig::unset(&mut config, &textconv)?;
+        diff_driver_removed = true;
     }
 
     let mut changed = false;
@@ -275,6 +276,36 @@ pub(crate) fn register_driver_for_lock(repo: &Repo) -> Result<LockRegistration> 
     Ok(LockRegistration {
         repaired: changed,
         diff_driver_removed,
+    })
+}
+
+/// Warns when a textconv cache is already sitting in this repository.
+///
+/// `cachetextconv` makes git store every *decrypted* file as a blob under
+/// `refs/notes/textconv/git-xcrypt`. [`register_driver`] now writes an explicit
+/// `false`, so no new cache can appear — but one made by an earlier build, or by
+/// hand, is still there, and it outlives `lock`.
+///
+/// Reported rather than deleted, deliberately. Removing the ref would leave the
+/// objects it points at in the database, so a message saying "cleaned up" would
+/// be false; the same reason `status` reports plaintext in history and prints
+/// the procedure instead of rewriting it.
+pub(crate) fn textconv_cache_warning(repo: &Repo) -> Option<String> {
+    let reference = format!("refs/notes/textconv/{DRIVER}");
+
+    let present = repo.common_dir().join(&reference).is_file()
+        || fs::read_to_string(repo.common_dir().join("packed-refs"))
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line.split_whitespace().nth(1) == Some(reference.as_str()));
+
+    present.then(|| {
+        format!(
+            "{reference} exists: git's textconv cache holds decrypted copies of files \
+             from this repository in its object database, and they outlive `lock`. \
+             Remove them with `git update-ref -d {reference}` followed by \
+             `git gc --prune=now`."
+        )
     })
 }
 
@@ -399,15 +430,23 @@ mod tests {
     }
 
     #[test]
-    fn a_textconv_cache_is_removed_rather_than_left_holding_plaintext() {
-        // With `cachetextconv` set, git keeps every decrypted file in a notes
-        // ref inside `.git/` — plaintext that outlives `lock`.
+    fn the_textconv_cache_is_switched_off_rather_than_merely_left_out() {
+        // With `cachetextconv` on, git keeps every decrypted file in a notes ref
+        // inside `.git/` — plaintext that outlives `lock`. Measured: unsetting
+        // the local key is no defence, because a `true` in `~/.gitconfig` is
+        // inherited. Only a local `false` overrides it.
         let dir = init_repo();
         let repo = Repo::discover(dir.path()).expect("discovery");
         run(&repo).expect("first init");
 
         let path = repo.config_path();
         let key = format!("diff.{DRIVER}.cachetextconv");
+        assert_eq!(
+            gitconfig::get(&gitconfig::open_local(&path).expect("config"), &key).as_deref(),
+            Some("false"),
+            "an inherited `true` would go unopposed"
+        );
+
         let mut config = gitconfig::open_local(&path).expect("config");
         gitconfig::set(&mut config, &key, "true").expect("setting");
         gitconfig::save_local(&path, &config).expect("saving");
@@ -415,9 +454,40 @@ mod tests {
         let report = run(&repo).expect("init must repair");
 
         assert!(report.config_written, "the repair went unreported");
-        assert!(
-            gitconfig::get(&gitconfig::open_local(&path).expect("config"), &key).is_none(),
+        assert_eq!(
+            gitconfig::get(&gitconfig::open_local(&path).expect("config"), &key).as_deref(),
+            Some("false"),
             "the textconv cache survived init"
+        );
+    }
+
+    #[test]
+    fn a_cache_that_already_exists_is_reported_rather_than_passed_over() {
+        // Deleting the ref would leave its objects in the database, so the
+        // honest answer is to name it and say how to expire it.
+        let dir = init_repo();
+        let repo = Repo::discover(dir.path()).expect("discovery");
+        run(&repo).expect("first init");
+        assert!(textconv_cache_warning(&repo).is_none());
+
+        let reference = repo
+            .common_dir()
+            .join("refs")
+            .join("notes")
+            .join("textconv")
+            .join(DRIVER);
+        fs::create_dir_all(reference.parent().expect("a parent")).expect("directories");
+        fs::write(&reference, "0".repeat(40) + "\n").expect("writing the ref");
+
+        let warning = textconv_cache_warning(&repo).expect("the cache must be reported");
+        assert!(warning.contains("gc"), "no way out was offered: {warning}");
+        assert!(
+            run(&repo)
+                .expect("init must succeed")
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("textconv")),
+            "init said nothing about the cache"
         );
     }
 

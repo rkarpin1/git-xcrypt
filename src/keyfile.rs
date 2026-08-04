@@ -34,6 +34,19 @@ const KEY_FILE_VERSION: u8 = 1;
 /// Total length of a key file: magic, version byte, master key.
 const KEY_FILE_LEN: usize = KEY_FILE_MAGIC.len() + 1 + MASTER_KEY_LEN;
 
+/// Whether `content` is one of this tool's key files, in either shape.
+///
+/// For the diff driver, which git hands arbitrary paths and which prints what it
+/// reads. A key file carries neither the data magic nor anything else that would
+/// stop it going straight to `stdout`, and `git-xcrypt diff <key> > k` would put
+/// it in the working tree, one `git add -A` from a commit. Deciding on the
+/// content rather than on the location is what makes the refusal hold for an
+/// exported copy, for a hard link and whatever the current directory is.
+#[must_use]
+pub fn holds_a_key(content: &[u8]) -> bool {
+    content.starts_with(KEY_FILE_MAGIC) || content.starts_with(EXPORT_PREFIX.as_bytes())
+}
+
 /// Serialises a key into the bytes stored on disk.
 ///
 /// The buffer holds the master key, so it is wrapped in [`Zeroizing`]: without

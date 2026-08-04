@@ -368,6 +368,13 @@ pub fn run(repo: &Repo, confirm: &mut dyn Confirm) -> Result<Outcome> {
     let registration = super::init::register_driver_for_lock(repo)?;
     report.config_written = registration.repaired;
     report.diff_driver_removed = registration.diff_driver_removed;
+
+    // A textconv cache holds decrypted copies inside `.git/`, and this is the
+    // command after which nobody can decrypt anything — so it is the last moment
+    // the plaintext left behind is worth naming.
+    report
+        .warnings
+        .extend(super::init::textconv_cache_warning(repo));
     report.attributes_written = write_catch_all_if_missing(repo, &config)?;
 
     // Before the encryption pass, so nothing we are about to write is mistaken
