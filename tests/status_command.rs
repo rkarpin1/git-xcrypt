@@ -11,6 +11,14 @@ use harness::TestRepo;
 /// The exit code the frozen table gives to "an exposure was found".
 const EXPOSED: i32 = 5;
 
+/// The exit code for "this run could not answer the question".
+///
+/// Added 2026-08-04. Before it, both answers came out as `5`, so a perfectly
+/// healthy `git clone --depth 1` — what `actions/checkout` produces by default —
+/// failed the gate with the same code as a repository holding a plaintext
+/// secret. The two ask different things of whoever reads them.
+const UNDETERMINED: i32 = 6;
+
 /// Everything `status` printed to `stdout`, which is where the report belongs.
 fn report(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
@@ -298,7 +306,7 @@ fn a_missing_declaration_is_reported_as_undetermined_rather_than_clean() {
     let output = repo.xcrypt(["status"]);
     let text = report(&output);
 
-    assert_eq!(output.status.code(), Some(EXPOSED), "{text}");
+    assert_eq!(output.status.code(), Some(UNDETERMINED), "{text}");
     assert!(text.contains("undetermined"), "{text}");
 }
 
@@ -586,7 +594,7 @@ fn a_split_index_is_reported_as_undetermined_rather_than_silently_skipped() {
     let output = repo.xcrypt(["status"]);
     let text = report(&output);
 
-    assert_eq!(output.status.code(), Some(EXPOSED), "{text}");
+    assert_eq!(output.status.code(), Some(UNDETERMINED), "{text}");
     assert!(text.contains("undetermined"), "{text}");
     assert!(text.contains("split index"), "{text}");
 }
@@ -723,7 +731,13 @@ fn references_that_cannot_be_read_fail_the_gate_instead_of_reading_as_clean() {
     repo.write_xcrypt_config("# nothing declared yet\n");
     repo.write_file("secrets/db.env", b"hunter2\n");
     repo.commit_all("leak");
+    // Declared and re-committed, so the index holds ciphertext and the only
+    // thing left to find is in history — which is exactly what the unreadable
+    // reference store hides. Without this the index carried a finding of its
+    // own and the test could not tell the two verdicts apart.
     repo.write_xcrypt_config("secrets/\n");
+    repo.xcrypt_ok(["sync"]);
+    repo.commit_all("declare");
     repo.git_ok(["pack-refs", "--all"]);
 
     // Unreadable rather than absent: absent is an ordinary, honest state.
@@ -741,7 +755,7 @@ fn references_that_cannot_be_read_fail_the_gate_instead_of_reading_as_clean() {
     let text = report(&output);
     assert_eq!(
         output.status.code(),
-        Some(EXPOSED),
+        Some(UNDETERMINED),
         "an unscannable repository reported clean:\n{text}"
     );
     assert!(text.contains("undetermined"), "{text}");
@@ -796,6 +810,136 @@ fn a_shallow_clone_is_named_as_such_rather_than_reported_as_corruption() {
         !text.contains("git fsck"),
         "a graft point was reported as a missing object:\n{text}"
     );
+}
+
+/// A source repository and a key file that opens it, for the clone tests below.
+fn source_and_key() -> (TestRepo, tempfile::TempDir, std::path::PathBuf) {
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.xcrypt_ok(["sync"]);
+    repo.write_file("secrets/db.env", b"hunter2\n");
+    repo.commit_all("one");
+    repo.write_file("README.md", b"two\n");
+    repo.commit_all("two");
+
+    let elsewhere = tempfile::TempDir::new().expect("a directory outside the repository");
+    let key = elsewhere.path().join("repo.key");
+    repo.xcrypt_ok(["export-key", &key.to_string_lossy()]);
+    (repo, elsewhere, key)
+}
+
+#[test]
+fn a_healthy_shallow_clone_is_undetermined_rather_than_exposed() {
+    // The measurement that forced the new code: `actions/checkout` clones with
+    // `--depth 1` unless told otherwise, so the default CI setup could not pass
+    // this gate. Nothing here is wrong with the repository — a history that was
+    // never fetched simply cannot be vouched for — and "I could not check" has
+    // to be distinguishable from "I found a secret" by the exit code alone,
+    // because that is all a CI gate reads.
+    let (repo, _elsewhere, key) = source_and_key();
+
+    let clone = repo.clone_shallow();
+    clone.xcrypt_ok(["unlock", &key.to_string_lossy()]);
+    let output = clone.xcrypt(["status"]);
+    let text = report(&output);
+
+    assert_eq!(
+        output.status.code(),
+        Some(UNDETERMINED),
+        "a healthy shallow clone must not report an exposure:\n{text}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(text.contains("shallow clone"), "{text}");
+    assert!(
+        text.contains("could not be checked"),
+        "the verdict has to say it could not check, not that it found something:\n{text}"
+    );
+    assert!(
+        !text.contains("leaked in history"),
+        "nothing was found, so nothing may be reported as found:\n{text}"
+    );
+}
+
+#[test]
+fn a_partial_clone_is_undetermined_rather_than_exposed() {
+    // `extensions.partialclone` is what a `--filter=blob:none` clone carries,
+    // and it means an absent object is a design decision rather than damage.
+    // Same verdict as the shallow case and for the same reason: unjudged, not
+    // guilty.
+    let (repo, _elsewhere, key) = source_and_key();
+
+    let clone = repo.clone_without_filter();
+    clone.xcrypt_ok(["unlock", &key.to_string_lossy()]);
+    clone.git_ok(["config", "extensions.partialclone", "origin"]);
+    let output = clone.xcrypt(["status"]);
+    let text = report(&output);
+
+    assert_eq!(
+        output.status.code(),
+        Some(UNDETERMINED),
+        "a partial clone must not report an exposure:\n{text}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(text.contains("partial clone"), "{text}");
+    assert!(text.contains("could not be checked"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_index_that_cannot_be_read_is_undetermined_when_nothing_else_was_found() {
+    // The twin of `an_index_that_cannot_be_read_still_leaves_a_report_and_a_verdict`,
+    // which has a real finding beside it and therefore still exits 5. With no
+    // finding, all this run established is that it could not look.
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.xcrypt_ok(["sync"]);
+    repo.write_file("secrets/db.env", b"hunter2\n");
+    repo.commit_all("secret");
+
+    let index = repo.path().join(".git").join("index");
+    let restore = std::fs::metadata(&index).expect("index").permissions();
+    std::fs::set_permissions(&index, std::fs::Permissions::from_mode(0o000)).expect("closing");
+
+    let output = repo.xcrypt(["status"]);
+    std::fs::set_permissions(&index, restore).expect("reopening");
+
+    let text = report(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(UNDETERMINED),
+        "an unreadable index is not an exposure:\n{text}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(text.contains("undetermined"), "{text}");
+}
+
+#[test]
+fn a_real_finding_outranks_anything_that_could_not_be_checked() {
+    // Precedence, stated as a test because the whole value of the new code is
+    // that `5` never gets weaker. A run that both found a leak and could not
+    // read the index has found a leak.
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("# nothing declared yet\n");
+    repo.write_file("secrets/db.env", b"hunter2\n");
+    repo.commit_all("the leak");
+    repo.write_xcrypt_config("secrets/\n");
+    repo.git_ok(["update-index", "--split-index"]);
+
+    let output = repo.xcrypt(["status"]);
+    let text = report(&output);
+
+    assert_eq!(
+        output.status.code(),
+        Some(EXPOSED),
+        "an exposure beside an unanswerable question is still an exposure:\n{text}"
+    );
+    assert!(text.contains("leaked in history"), "{text}");
+    assert!(text.contains("undetermined"), "{text}");
 }
 
 #[test]
@@ -932,7 +1076,9 @@ fn a_reference_that_will_not_resolve_is_named_not_merely_counted() {
     let output = repo.xcrypt(["status"]);
     let text = report(&output);
 
-    assert_eq!(output.status.code(), Some(EXPOSED), "{text}");
+    // Undetermined rather than exposed: a branch whose history was never walked
+    // is a question left unanswered, not a secret found.
+    assert_eq!(output.status.code(), Some(UNDETERMINED), "{text}");
     assert!(text.contains("refs/heads/dangling"), "{text}");
 }
 

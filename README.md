@@ -64,7 +64,7 @@ deterministic cipher: unchanged files never look modified.
 | --- | --- |
 | `init` | Generate the repository key, register the filter and the diff driver, create `.git-xcrypt`, write the managed `.gitattributes` section. |
 | `sync` | Regenerate the per-pattern `.gitattributes` lines. `--check` reports staleness through exit code 1 instead of writing. |
-| `status` | Report whether your declarations are actually enforced, scanning the whole reachable history. `--fix` re-stages declared files the index holds in the clear. Exits `5` on a finding. |
+| `status` | Report whether your declarations are actually enforced, scanning the whole reachable history. `--fix` re-stages declared files the index holds in the clear. Exits `5` on a finding, `6` when it could not tell. |
 | `export-key` | Write the repository key to a file outside the working tree. |
 | `import-key` | Put a key carried from another machine into this repository. |
 | `unlock` | Decrypt the working tree and register the filter, importing a key file first if one is given. |
@@ -72,7 +72,34 @@ deterministic cipher: unchanged files never look modified.
 | `diff`, `process` | Registered by `init` for git to call. Not meant to be run by hand. |
 
 Exit codes: `0` success, `1` usage or unclassified failure, `2` configuration or
-state conflict, `3` no key, `4` bad format, `5` `status` found an exposure.
+state conflict, `3` no key, `4` bad format, `5` `status` found an exposure, `6`
+`status` could not tell.
+
+### Using `status` as a CI gate
+
+```yaml
+- uses: actions/checkout@v5
+  with:
+    fetch-depth: 0        # required: see below
+- run: git-xcrypt status
+```
+
+What the exit code means to the job:
+
+| Code | Meaning | What to do |
+| --- | --- | --- |
+| `0` | Everything was checked and nothing was found. | Nothing. |
+| `5` | Something was found: a setup gap, a declared file staged in the clear, or a plaintext version in history. | Read the report. If a secret leaked, **rotate it first**. |
+| `6` | The run could not answer. A shallow or partial clone, an index that will not parse, a reference store that will not enumerate, a missing `.git-xcrypt`. | Fix the checkout and run it again. Nothing was found, and nothing is ruled out. |
+| `1`–`4` | The tool itself failed — bad arguments, not a repository, no key, bad format. | Fix the invocation or the environment. |
+
+**`fetch-depth: 0` is not optional for a full answer.** `actions/checkout` clones
+with `--depth 1` by default, and history that was never fetched cannot be
+scanned — so the default setup exits `6`, honestly, rather than passing on a
+history it never saw. The same applies to `--filter=blob:none` partial clones.
+
+A finding always outranks an unanswered question: a run that both hit an
+unreadable index and found a leak exits `5`.
 
 ## What it does and does not protect
 
@@ -93,7 +120,8 @@ the clear on disk.
 A secret committed **before** its pattern reached `.git-xcrypt` stays in history
 in the clear, forever, and pushing sends it to the host. `git-xcrypt status`
 scans the whole reachable history for exactly this and exits `5` when it finds
-something. If it does: **rotate the secret first.** Rewriting history cleans the
+something — and `6` when it could not look at all, which is not the same answer.
+If it exits `5`: **rotate the secret first.** Rewriting history cleans the
 repository but does not undo the leak — the secret is already in forks, caches,
 CI logs and every clone that exists.
 
@@ -114,7 +142,9 @@ secrets". A file no pattern ever matched is invisible to it.
 - **A clone that has not been unlocked is not safe to write to.** `.git/config`
   is not versioned, so a fresh clone carries the catch-all `.gitattributes` line
   with no driver behind it, and git treats an undefined filter as no filter.
-  `git-xcrypt status` detects this and exits `5`.
+  `git-xcrypt status` detects this and exits `5`. A shallow clone of the same
+  repository exits `6` instead once it is unlocked: nothing is wrong with it,
+  but the history it never fetched cannot be vouched for.
 - **Real git only.** The filter is registered under the long-running protocol
   (`filter.<driver>.process`). Clients that reimplement git rather than calling
   it — JGit, and tools built on libgit2 — may not speak it and may treat the

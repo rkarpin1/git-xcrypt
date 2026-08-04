@@ -32,9 +32,13 @@
 //! which is the whole reason the fix operates on the index rather than merely
 //! printing advice.
 //!
-//! The exit code is part of the contract: `5` on any finding, so the command
-//! works as a CI gate and so "the repository has a problem" is distinguishable
-//! from "the tool broke".
+//! The exit code is part of the contract: `5` on a finding, so the command works
+//! as a CI gate and so "the repository has a problem" is distinguishable from
+//! "the tool broke". Since 2026-08-04 there is a third answer, `6`, for the runs
+//! that could not tell — a shallow or partial clone, an index that will not
+//! parse, a missing declaration. Collapsing that into `5` failed the gate on a
+//! healthy `git clone --depth 1`, which is what `actions/checkout` produces
+//! unless it is given `fetch-depth: 0`. See [`Verdict`].
 
 use std::fmt;
 
@@ -160,14 +164,44 @@ pub struct Scanned {
     pub blobs: usize,
 }
 
+/// What a run concluded, as the exit code reports it.
+///
+/// Three values rather than two, and the third one is the whole point. "I found
+/// a secret in the clear" and "I could not look" are different answers that ask
+/// different things of whoever reads them, and until 2026-08-04 both came out
+/// as `5` — so a healthy `git clone --depth 1` failed the gate exactly as a
+/// leaking repository did. See [`crate::exit::UNDETERMINED`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// Everything was checked and nothing was found.
+    Clean,
+    /// Nothing was found, but part of the question could not be answered.
+    Undetermined,
+    /// Something was found.
+    Exposed,
+}
+
 impl Report {
-    /// Whether anything was found that should fail a CI gate.
+    /// What this run concluded.
+    ///
+    /// A finding outranks an unanswered question, always: a run that both hit an
+    /// unreadable index and found a leak has found a leak, and the weaker code
+    /// must never mask the stronger one.
+    #[must_use]
+    pub fn verdict(&self) -> Verdict {
+        if !self.setup.is_empty() || !self.in_the_clear.is_empty() || !self.leaked.is_empty() {
+            Verdict::Exposed
+        } else if self.undetermined.is_empty() {
+            Verdict::Clean
+        } else {
+            Verdict::Undetermined
+        }
+    }
+
+    /// Whether this run found an exposure.
     #[must_use]
     pub fn exposed(&self) -> bool {
-        !self.setup.is_empty()
-            || !self.in_the_clear.is_empty()
-            || !self.leaked.is_empty()
-            || !self.undetermined.is_empty()
+        self.verdict() == Verdict::Exposed
     }
 }
 
@@ -273,8 +307,20 @@ impl Report {
     /// solid wall of good news. The founding document is explicit that the
     /// wording here *is* the safeguard; a safeguard nobody scrolls to is not one.
     fn write_verdict(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if !self.exposed() {
-            return writeln!(f, "VERDICT: no findings.\n");
+        match self.verdict() {
+            Verdict::Clean => return writeln!(f, "VERDICT: no findings.\n"),
+            // Deliberately not phrased as a finding. An operator reading this in
+            // a CI log has to act on the checkout, not on the repository, and
+            // the sentence has to be readable as such without the exit code.
+            Verdict::Undetermined => {
+                return writeln!(
+                    f,
+                    "VERDICT: undetermined — {} thing(s) could not be checked. \
+                     NOTHING WAS FOUND, and nothing is ruled out either.\n",
+                    self.undetermined.len()
+                );
+            }
+            Verdict::Exposed => {}
         }
 
         let mut parts: Vec<String> = Vec::new();
@@ -308,6 +354,18 @@ impl Report {
         )?;
         for reason in &self.undetermined {
             writeln!(f, "  - {reason}")?;
+        }
+        // Said only when it is the whole story. Beside a real finding the
+        // sentence would soften the finding, which is the opposite of what this
+        // section is for.
+        if self.verdict() == Verdict::Undetermined {
+            writeln!(
+                f,
+                "\n  This is exit code {undetermined}, not {exposed}: settle the reasons above \
+                 and ask again. Nothing here was found — it was not looked at.",
+                undetermined = crate::exit::UNDETERMINED,
+                exposed = crate::exit::EXPOSED
+            )?;
         }
         Ok(())
     }
@@ -1206,8 +1264,40 @@ mod tests {
         let report = run(&repo, false).expect("status must succeed");
 
         assert!(report.setup.is_empty(), "{:?}", report.setup);
-        assert!(!report.exposed());
+        assert_eq!(report.verdict(), Verdict::Clean);
         assert!(report.has_key);
+    }
+
+    #[test]
+    fn a_question_left_unanswered_is_its_own_verdict_and_never_masks_a_finding() {
+        // The two codes are the whole point of the split: `6` says fix the
+        // checkout, `5` says rotate a secret. A run that hit both has found a
+        // secret, so the stronger answer has to win — measured here rather than
+        // trusted, because the direction of that precedence is the one thing
+        // that would quietly weaken the gate.
+        let clean = Report::default();
+        assert_eq!(clean.verdict(), Verdict::Clean);
+
+        let undetermined = Report {
+            undetermined: vec!["a shallow clone".into()],
+            ..Report::default()
+        };
+        assert_eq!(undetermined.verdict(), Verdict::Undetermined);
+        assert!(
+            undetermined.to_string().contains("NOTHING WAS FOUND"),
+            "the verdict line must not read as a finding: {undetermined}"
+        );
+
+        let both = Report {
+            undetermined: vec!["a shallow clone".into()],
+            in_the_clear: vec![b"secrets/db.env".to_vec()],
+            ..Report::default()
+        };
+        assert_eq!(both.verdict(), Verdict::Exposed);
+        assert!(
+            !both.to_string().contains("NOTHING WAS FOUND"),
+            "an exposure must not be softened by what could not be checked: {both}"
+        );
     }
 
     #[test]

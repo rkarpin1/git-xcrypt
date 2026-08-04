@@ -6,6 +6,32 @@
 # `#[cfg(unix)]`, and APFS refuses the non-UTF-8 path names `decide` and the
 # index are written to handle. Until this file existed, "identical behaviour on
 # three platforms" was a claim with one measurement behind it.
+#
+# A note for anyone copying a `git-xcrypt status` gate out of here into their
+# own project: this workflow tests the tool and does not gate on it — this
+# repository is not itself encrypted. A gate looks like
+#
+#   - uses: actions/checkout@v5
+#     with:
+#       fetch-depth: 0            # NOT optional, see below
+#   - run: git-xcrypt status
+#
+# and the exit code is the whole interface:
+#
+#   0  everything was checked, nothing found
+#   5  a finding — a setup gap, a declared file staged in the clear, or a
+#      plaintext version still in history. Rotate the secret before anything
+#      else; rewriting history does not undo a leak.
+#   6  the run could not answer: a shallow or partial clone, an unreadable
+#      index, a reference store that will not enumerate, a missing
+#      `.git-xcrypt`. Nothing was found and nothing is ruled out.
+#   1-4 the tool itself failed.
+#
+# `fetch-depth: 0` is what separates 0 from 6. `actions/checkout` clones with
+# `--depth 1` by default, and history that was never fetched cannot be scanned,
+# so the default setup exits 6 rather than passing on a history it never saw.
+# Until 2026-08-04 that case shared code 5 with a real leak, which made the
+# default CI configuration fail the gate for no reason.
 name: CI
 
 on:

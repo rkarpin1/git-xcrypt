@@ -8,6 +8,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+use git_xcrypt::commands::status::Verdict;
 use git_xcrypt::commands::sync::Outcome;
 use git_xcrypt::repo::Repo;
 use git_xcrypt::{Result, commands, exit};
@@ -422,8 +423,9 @@ fn lock_and_describe(assume_yes: bool) -> Result<ExitCode> {
 /// Runs `status`, whose findings are an answer rather than a failure.
 ///
 /// Its own exit path rather than [`report`], because a repository with a problem
-/// is not a broken tool: the frozen table gives that its own code, `5`, so a CI
-/// gate can tell the two apart without reading the message.
+/// is not a broken tool: the table gives that its own code, `5`, so a CI gate
+/// can tell the two apart without reading the message. A third code, `6`, says
+/// the run could not answer — see [`git_xcrypt::exit::UNDETERMINED`].
 ///
 /// The report goes to `stdout` — this is not the filter path, where git reads
 /// `stdout` as file content, and a gate that has to be scraped off `stderr` is a
@@ -453,10 +455,13 @@ fn status_and_describe(fix: bool) -> Result<ExitCode> {
     write!(out, "{report}")?;
     out.flush()?;
 
-    Ok(if report.exposed() {
-        ExitCode::from(exit::EXPOSED)
-    } else {
-        ExitCode::SUCCESS
+    Ok(match report.verdict() {
+        Verdict::Clean => ExitCode::SUCCESS,
+        // Its own code since 2026-08-04. A CI gate reads nothing but this
+        // number, and "I could not check" asks the operator to fix the checkout
+        // while "I found something" asks them to rotate a secret.
+        Verdict::Undetermined => ExitCode::from(exit::UNDETERMINED),
+        Verdict::Exposed => ExitCode::from(exit::EXPOSED),
     })
 }
 

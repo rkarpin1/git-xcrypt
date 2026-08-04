@@ -25,5 +25,23 @@ pub const FORMAT: u8 = 4;
 /// `status` found an exposure — plaintext where ciphertext was expected.
 ///
 /// Distinct from the error codes so a CI gate can tell "the tool broke" from
-/// "the repository has a problem".
+/// "the repository has a problem". Since 2026-08-04 it means **only** that:
+/// see [`UNDETERMINED`].
 pub const EXPOSED: u8 = 5;
+
+/// `status` could not answer the question it was asked.
+///
+/// A shallow or partial clone, an index that will not parse, a reference store
+/// that will not enumerate, a missing `.git-xcrypt`. Nothing was found and
+/// nothing is ruled out.
+///
+/// **Added 2026-08-04, and it widens a table this project had frozen.** The
+/// reason is measured: `5` used to carry both answers, so a perfectly healthy
+/// `git clone --depth 1` — what `actions/checkout` produces unless it is given
+/// `fetch-depth: 0` — failed the gate with the same code as a repository
+/// holding a plaintext secret. A gate that cries wolf on its default setup is a
+/// gate that gets switched off, and the two answers ask different things of
+/// whoever reads them: `5` says fix the repository, `6` says fix the checkout
+/// and ask again. Widening the table costs nothing before the first release —
+/// no consumer exists yet — and after it would cost a breaking change.
+pub const UNDETERMINED: u8 = 6;
