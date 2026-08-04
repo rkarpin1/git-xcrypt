@@ -82,6 +82,16 @@ enum Command {
     ///
     /// Not meant to be run by hand: everything it writes to stdout is protocol.
     Process,
+
+    /// Print a file's decrypted content, for `git diff` to compare.
+    ///
+    /// Registered by `init` as `diff.git-xcrypt.textconv`. Content that is not
+    /// ours is printed unchanged, so `git log -p` still works over history from
+    /// before the repository was configured.
+    Diff {
+        /// The file git wants read. Usually one it wrote to a temporary path.
+        path: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -95,7 +105,31 @@ fn main() -> ExitCode {
         Command::Unlock { key } => report(run_unlock(key.as_deref())),
         Command::Lock { yes } => run_lock(yes),
         Command::Process => report(commands::process::run()),
+        Command::Diff { path } => report(run_diff(&path)),
     }
+}
+
+/// Runs the `textconv` driver, whose output belongs on `stdout`.
+///
+/// The only command in this binary that writes there. It is not the exception it
+/// looks like: the rule protects the *filter* path, where git reads `stdout` as
+/// the file it is about to store. Here git reads it as one side of a diff, so
+/// printing the content is the entire point — and nothing else may join it,
+/// which is why the warning below goes to `stderr` like every other message.
+fn run_diff(path: &std::path::Path) -> Result<()> {
+    use std::io::Write as _;
+
+    let outcome = commands::diff::run(path)?;
+    if let Some(warning) = outcome.warning {
+        eprintln!("git-xcrypt: {warning}");
+    }
+
+    let mut out = std::io::stdout().lock();
+    out.write_all(&outcome.content)?;
+    // Explicit: a `BufWriter`-free lock still buffers, and git reads this pipe
+    // to end-of-file, so an unflushed tail would silently truncate the diff.
+    out.flush()?;
+    Ok(())
 }
 
 /// Turns a command's result into an exit code, reporting failures on `stderr`.

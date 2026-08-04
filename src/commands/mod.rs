@@ -4,6 +4,7 @@
 //! matching exit code. Nothing here writes to `stdout` unless the command's
 //! whole purpose is to produce output.
 
+pub mod diff;
 pub mod export_key;
 pub mod import_key;
 pub mod init;

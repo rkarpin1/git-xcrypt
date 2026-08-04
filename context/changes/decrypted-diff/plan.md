@@ -102,14 +102,14 @@ naprawy stanu, którą `init` wykonuje przy istniejącym kluczu.
 
 #### Automatyczne
 
-- [ ] 1.1 `git diff` pokazuje linie plaintextu
-- [ ] 1.2 `git log -p` na historii sprzed konfiguracji nie kończy się błędem
-- [ ] 1.3 Plik bez magic jest przepuszczany bez zmian
-- [ ] 1.4 Brak klucza → kod `3`
-- [ ] 1.5 Uszkodzony ciphertext → kod `4`
-- [ ] 1.6 `init` rejestruje `textconv` i nie ustawia `cachetextconv`
-- [ ] 1.7 `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`
+- [x] 1.1 `git diff` pokazuje linie plaintextu
+- [x] 1.2 `git log -p` na historii sprzed konfiguracji nie kończy się błędem
+- [x] 1.3 Plik bez magic jest przepuszczany bez zmian
+- [x] 1.4 Brak klucza → kod `3`
+- [x] 1.5 Uszkodzony ciphertext → kod `4`
+- [x] 1.6 `init` rejestruje `textconv` i nie ustawia `cachetextconv`
+- [x] 1.7 `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`
 
 #### Ręczne
 
-- [ ] 1.8 `git show` i `git difftool` pokazują treść jawną
+- [x] 1.8 `git show` i `git difftool` pokazują treść jawną

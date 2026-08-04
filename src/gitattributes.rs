@@ -402,8 +402,9 @@ pub fn write_section(path: &Path, extra_lines: &[String]) -> Result<bool> {
 /// A clone that never ran `init` or `unlock` carries the catch-all attribute
 /// through history but not `.git/config`, and git treats an undefined filter as
 /// no filter at all — content passes through in the clear. `diff.git-xcrypt.*`
-/// is absent on purpose: it arrives with S-05, and listing it here would make
-/// every repository report itself incomplete until then.
+/// is absent on purpose even now that it exists: a missing diff driver costs a
+/// readable `git diff` and nothing more, and `lock` removes it deliberately, so
+/// listing it here would make every locked repository report itself broken.
 #[must_use]
 pub fn driver_keys() -> [String; 2] {
     [

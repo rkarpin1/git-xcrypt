@@ -151,10 +151,13 @@ fn refuse_if_previously_configured(repo: &Repo) -> Result<()> {
 /// per file was measured 22× slower, which the catch-all construction cannot
 /// afford.
 ///
-/// The `diff` driver is deliberately **not** registered here. It belongs to
-/// S-05, and pointing `diff.git-xcrypt.textconv` at a subcommand this build does
-/// not have would break `git diff` the moment S-02 emits the cosmetic
-/// `diff=git-xcrypt` lines.
+/// The `diff` driver is registered alongside it, so the cosmetic
+/// `diff=git-xcrypt` lines S-02 renders have something behind them and `git
+/// diff` compares plaintext. `cachetextconv` is not merely left unset but
+/// actively removed: it makes git keep every decrypted file in a notes ref
+/// inside `.git/`, which would survive `lock` and put the plaintext this product
+/// exists to hide back on disk. The key is namespaced under our own driver name,
+/// so nothing a user configured elsewhere is touched.
 ///
 /// Shared with `import-key` and `unlock` rather than copied: a clone has the
 /// catch-all line in `.gitattributes` and no driver behind it, and every command
@@ -174,6 +177,7 @@ pub(crate) fn register_driver(repo: &Repo) -> Result<bool> {
             format!("{binary} process"),
         ),
         (format!("filter.{DRIVER}.required"), "true".to_string()),
+        (format!("diff.{DRIVER}.textconv"), format!("{binary} diff")),
     ];
 
     let mut changed = false;
@@ -184,13 +188,9 @@ pub(crate) fn register_driver(repo: &Repo) -> Result<bool> {
         }
     }
 
-    // "Repair the rest" has to include undoing what an earlier build wrote.
-    // Versions before the diff driver was deferred to S-05 registered
-    // `diff.git-xcrypt.textconv` pointing at a subcommand that does not exist;
-    // leaving it behind means those repositories keep the breakage.
-    for stale in [format!("diff.{DRIVER}.textconv")] {
-        if gitconfig::get(&config, &stale).is_some() {
-            gitconfig::unset(&mut config, &stale)?;
+    for unwanted in [format!("diff.{DRIVER}.cachetextconv")] {
+        if gitconfig::get(&config, &unwanted).is_some() {
+            gitconfig::unset(&mut config, &unwanted)?;
             changed = true;
         }
     }
@@ -201,7 +201,20 @@ pub(crate) fn register_driver(repo: &Repo) -> Result<bool> {
     Ok(changed)
 }
 
-/// Registers only what is missing, and never repoints a working driver.
+/// Settles the registration for a repository that is about to lose its key.
+///
+/// Registers only what is missing, never repoints a working driver, and takes
+/// the diff driver back out.
+///
+/// **The diff driver has to go.** Measured on git 2.55: `diff.<driver>.textconv`
+/// makes git materialise each side of a diff through
+/// `convert_to_working_tree` — the smudge filter — before handing it over. In a
+/// locked repository that filter has no key, `required = true` turns its refusal
+/// into `fatal: smudge filter git-xcrypt failed`, and `git log -p` over any
+/// declared path stops working entirely. Without the driver git falls back to
+/// `Binary files differ`, which is the honest answer for a repository nobody can
+/// read. `unlock` and `import-key` put it back, through
+/// [`register_driver`].
 ///
 /// For `lock`, which is the one command after which the user has no key left to
 /// run `unlock` again — and `init` deliberately refuses in a repository that
@@ -219,11 +232,21 @@ pub(crate) fn register_driver(repo: &Repo) -> Result<bool> {
 /// # Errors
 ///
 /// [`Error::Config`] when `.git/config` cannot be read or written.
-pub(crate) fn register_driver_if_absent(repo: &Repo) -> Result<bool> {
+pub(crate) fn register_driver_for_lock(repo: &Repo) -> Result<bool> {
     let path = repo.config_path();
     let mut config = gitconfig::open_local(&path)?;
 
     let mut changed = false;
+    for unwanted in [
+        format!("diff.{DRIVER}.textconv"),
+        format!("diff.{DRIVER}.cachetextconv"),
+    ] {
+        if gitconfig::get(&config, &unwanted).is_some() {
+            gitconfig::unset(&mut config, &unwanted)?;
+            changed = true;
+        }
+    }
+
     let process = format!("filter.{DRIVER}.process");
     if gitconfig::get(&config, &process).is_none_or(|value| value.trim().is_empty()) {
         gitconfig::set(
@@ -328,27 +351,55 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_diff_driver_from_an_older_build_is_removed() {
-        // Older builds registered `diff.git-xcrypt.textconv` pointing at a
-        // subcommand that does not exist. "Repair the rest" has to undo that,
-        // or those repositories keep the breakage forever.
+    fn the_diff_driver_is_registered_and_repointed_when_it_is_wrong() {
+        // Older builds registered a `textconv` naming a subcommand that did not
+        // exist, and then a run of builds registered none at all. Both leave
+        // `git diff` broken on the cosmetic `diff=git-xcrypt` lines unless
+        // "repair the rest" reaches this key too.
         let dir = init_repo();
         let repo = Repo::discover(dir.path()).expect("discovery");
         run(&repo).expect("first init");
 
         let path = repo.config_path();
+        let key = format!("diff.{DRIVER}.textconv");
+        let registered = gitconfig::get(&gitconfig::open_local(&path).expect("config"), &key)
+            .expect("init must register a diff driver");
+        assert!(registered.ends_with(" diff"), "registered `{registered}`");
+
         let mut config = gitconfig::open_local(&path).expect("config");
-        gitconfig::set(&mut config, &format!("diff.{DRIVER}.textconv"), "old diff")
-            .expect("setting");
+        gitconfig::set(&mut config, &key, "old diff").expect("setting");
         gitconfig::save_local(&path, &config).expect("saving");
 
         let report = run(&repo).expect("init must repair");
 
         assert!(report.config_written, "the repair went unreported");
-        let config = gitconfig::open_local(&path).expect("config");
+        assert_eq!(
+            gitconfig::get(&gitconfig::open_local(&path).expect("config"), &key),
+            Some(registered),
+            "a diff driver naming another binary survived init"
+        );
+    }
+
+    #[test]
+    fn a_textconv_cache_is_removed_rather_than_left_holding_plaintext() {
+        // With `cachetextconv` set, git keeps every decrypted file in a notes
+        // ref inside `.git/` — plaintext that outlives `lock`.
+        let dir = init_repo();
+        let repo = Repo::discover(dir.path()).expect("discovery");
+        run(&repo).expect("first init");
+
+        let path = repo.config_path();
+        let key = format!("diff.{DRIVER}.cachetextconv");
+        let mut config = gitconfig::open_local(&path).expect("config");
+        gitconfig::set(&mut config, &key, "true").expect("setting");
+        gitconfig::save_local(&path, &config).expect("saving");
+
+        let report = run(&repo).expect("init must repair");
+
+        assert!(report.config_written, "the repair went unreported");
         assert!(
-            gitconfig::get(&config, &format!("diff.{DRIVER}.textconv")).is_none(),
-            "a diff driver pointing at a missing subcommand survived init"
+            gitconfig::get(&gitconfig::open_local(&path).expect("config"), &key).is_none(),
+            "the textconv cache survived init"
         );
     }
 

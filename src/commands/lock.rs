@@ -355,7 +355,11 @@ pub fn run(repo: &Repo, confirm: &mut dyn Confirm) -> Result<Outcome> {
     // regenerates them — so rewriting the section here would leave `git status`
     // dirty after a successful lock, disclosed to nobody and after the key was
     // already gone.
-    report.config_written = super::init::register_driver_if_absent(repo)?;
+    //
+    // The same call takes the diff driver back *out*: with no key, textconv
+    // drags the smudge filter into every `git log -p` and aborts it. See
+    // `init::register_driver_for_lock`.
+    report.config_written = super::init::register_driver_for_lock(repo)?;
     report.attributes_written = write_catch_all_if_missing(repo, &config)?;
 
     // Before the encryption pass, so nothing we are about to write is mistaken
