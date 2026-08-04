@@ -40,6 +40,7 @@ Produkt rozstrzyga na podstawie wzorców ścieżek, które pliki opuszczają mas
 | S-05  | decrypted-diff               | oglądać różnice na treści jawnej                                         | S-01          | FR-006                 | proposed |
 | S-06  | encryption-status-check      | sprawdzić, co jest szyfrowane, a co powinno być                          | S-02          | FR-010                 | proposed |
 | S-07  | cross-platform-binaries      | pobrać gotową binarkę dla swojej platformy                               | S-01          | FR-011                 | proposed |
+| S-08  | binary-detection-parity      | dostać ten sam werdykt tekst/binarny co git, także na pliku z `SUB`     | S-01          | §NFR (trzy platformy)  | proposed |
 
 ## Streams
 
@@ -182,6 +183,33 @@ Fundament poniżej zakłada ten stan i nie tworzy ponownie niczego, co jest zgł
 - **Risk:** publikacja pod kolidującą nazwą albo bez rozstrzygniętej licencji jest trudna do wycofania — obie decyzje musiały zapaść przed pierwszym publicznym wydaniem i zapadły 2026-08-04. Sama technika jest tu najprostsza w całej roadmapie; pozostaje pilnować, by `cargo deny check licenses` w CI nie wpuściło zależności copyleft, która unieważniłaby wybór.
 - **Status:** proposed
 
+### S-08: Zgodność wykrywania plików binarnych z gitem
+
+- **Outcome:** plik, który git uznaje za tekst, git-xcrypt też uznaje za tekst — łącznie z plikiem zakończonym DOS-owym znacznikiem końca `SUB` (`0x1A`), który dziś rozjeżdża się z gitem.
+- **Change ID:** binary-detection-parity
+- **PRD refs:** §Non-Functional Requirements (identyczne zachowanie na trzech platformach), §Guardrails (filtr nie uszkadza pliku użytkownika)
+- **Prerequisites:** S-01
+- **Parallel with:** S-03, S-05, S-06
+- **Blockers:** —
+- **Termin wiążący: przed `S-07`, czyli przed pierwszym publicznym wydaniem binarki.** `looks_binary` jest zamrożony razem z formatem (`src/eol.rs:44`) — dopóki nie istnieje ani jedno repozytorium poza tym projektem, poprawka kosztuje jedną linię; po wydaniu kosztuje nowy `suite`, bo przesuwa granicę tekst/binarny i przepisuje ciphertext istniejących plików.
+- **Znalezisko (2026-08-04, review `looks_binary`):** `gather_stats` w `convert.c` gita v2.55.0 kończy się korektą, której nasz port nie ma:
+  ```c
+  /* If file ends with EOF then don't count this EOF as non-printable. */
+  if (size >= 1 && buf[size-1] == '\032')
+          stats->nonprintable--;
+  ```
+  Zweryfikowane na żywym gicie 2.55, nie tylko z lektury źródeł: repozytorium tymczasowe, `* text=auto`, plik o treści `a\r\n\x1a` → blob `61 0a 1a`, czyli git **znormalizował CRLF**, więc uznał plik za tekst. Nasz `looks_binary` na tej samej treści liczy `printable = 1`, `nonprintable = 1`, `0 < 1` → **binarny**. Granica text/binary leży u nas o jeden bajt bliżej niż u gita.
+- **Zakres:**
+  - korekta w `src/eol.rs::looks_binary` — po pętli zdjąć jeden `nonprintable`, gdy `content.last() == Some(&0x1a)`; `saturating_sub`, bo panic w debug przerywa operację gita, a nie tylko test;
+  - test na dokładnie tę treść, z odsyłaczem do zmierzonego bloba, w stylu pozostałych testów w tym pliku;
+  - test granicy proporcji `(printable >> 7) < nonprintable`, dziś niepokryty: `printable = 128` z `nonprintable = 1` → tekst, z `nonprintable = 2` → binarny;
+  - uzupełnienie `zalozenia.md` §Końce linii → „Zmierzone zachowanie gita", gdzie zapisana reguła jest niepełna wobec kodu: nie wymienia ani reguły lone-`CR` (kod ją ma i słusznie), ani `SUB`.
+- **Sprawdzone przy okazji i zgodne — nie ruszać:** lone `CR` (w tym `CR` na końcu bufora), `CR`/`LF` w żadnym kubełku, `DEL` (`0x7f`) jako non-printable, wybaczone wyłącznie `BS`/`TAB`/`FF`/`ESC`, `≥ 0x80` jako printable, `printable >> 7`, skan całej treści (okno 8000 B należy do `mmfile_is_binary` w `diff.c`, nie tutaj). Port jest wierny — brakuje wyłącznie korekty na `SUB`.
+- **Unknowns:**
+  - Czy przy tej okazji domykamy otwartą decyzję 8 z `zalozenia.md` (odpowiednik `core.safecrlf`)? Powiązanie jest realne: jawny `text` omija ochronę lone-`CR` — zgodnie z gitem, bo `crlf_to_git` konsultuje `convert_is_binary` tylko dla wariantów `CRLF_AUTO*` — więc treść `a\r\r\nb` daje jeden fałszywy „modified" po checkoucie, zanim stan się ustabilizuje. Test `content_that_is_normalised_survives_a_second_pass` pokrywa dziś tylko `Auto`, więc ta dziura nie jest nawet oznaczona testem. — Właściciel: użytkownik. Blokuje: nie.
+- **Risk:** rozjazd dotyczy wąskiej klasy plików (stare pliki tekstowe z DOS-a), więc kusi, żeby go odłożyć — i to jest właśnie pułapka. Koszt nie rośnie liniowo, tylko skacze w momencie pierwszego wydania, bo reguła jest zamrożona z formatem. Sama poprawka jest trywialna; kosztowne jest jej przegapienie przed `S-07`.
+- **Status:** proposed
+
 ## Backlog Handoff
 
 | Roadmap ID | Change ID                    | Sugerowany tytuł zadania                            | Gotowe do `/10x-plan` | Uwagi                                       |
@@ -194,6 +222,7 @@ Fundament poniżej zakłada ten stan i nie tworzy ponownie niczego, co jest zgł
 | S-05       | decrypted-diff               | Różnice na treści odszyfrowanej                     | nie                   | Czeka na S-01                               |
 | S-06       | encryption-status-check      | Widoczność stanu szyfrowania                        | nie                   | Czeka na S-02; głębokość rozstrzygnięta 2026-08-04 |
 | S-07       | cross-platform-binaries      | Binarki dla Windows, macOS i Linuksa                | nie                   | Czeka na S-01; nazwa i licencja rozstrzygnięte |
+| S-08       | binary-detection-parity      | Zgodność wykrywania plików binarnych z gitem        | tak                   | Poprawka w kodzie S-01, znaleziona 2026-08-04. **Musi wejść przed S-07** — reguła jest zamrożona z formatem. Uruchom `/10x-plan binary-detection-parity` |
 
 ## Open Roadmap Questions
 
