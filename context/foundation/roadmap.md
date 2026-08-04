@@ -3,7 +3,7 @@ project: "git-crypt"
 version: 1
 status: draft
 created: 2026-08-03
-updated: 2026-08-03
+updated: 2026-08-04
 prd_version: 1
 main_goal: learn
 top_blocker: decisions
@@ -32,7 +32,7 @@ Produkt rozstrzyga na podstawie wzorców ścieżek, które pliki opuszczają mas
 
 | ID    | Change ID                    | Outcome (użytkownik może …)                                             | Prerequisites | PRD refs               | Status   |
 | ----- | ---------------------------- | ----------------------------------------------------------------------- | ------------- | ---------------------- | -------- |
-| F-01  | git-integration-test-harness | (foundation) weryfikować zachowanie na prawdziwym repozytorium git      | —             | §Guardrails            | ready    |
+| F-01  | git-integration-test-harness | (foundation) weryfikować zachowanie na prawdziwym repozytorium git      | —             | §Guardrails            | done     |
 | S-01  | transparent-encrypt-decrypt  | commitować plik i dostać ciphertext w repo, plaintext w katalogu roboczym | F-01          | FR-001, FR-004, FR-005 | proposed |
 | S-02  | gitignore-style-config       | wskazać pliki do szyfrowania w składni `.gitignore`                      | S-01          | FR-002, FR-003         | blocked  |
 | S-03  | key-export-and-unlock        | odzyskać sekrety po klonie na drugiej maszynie                           | S-01          | US-01, FR-007, FR-008  | proposed |
@@ -80,7 +80,7 @@ Fundament poniżej zakłada ten stan i nie tworzy ponownie niczego, co jest zgł
 - **Blockers:** —
 - **Unknowns:** —
 - **Risk:** bez tego każdy kolejny element weryfikuje się ręcznie, a akurat determinizm i brak uszkodzeń treści to właśnie te własności, które ręczne sprawdzenie przeoczy. Zakres celowo minimalny — pomocnik tworzący repozytorium, rejestrujący filtr i pozwalający czytać surowe obiekty, nie pełny zestaw testów.
-- **Status:** ready
+- **Status:** done
 
 ## Slices
 
@@ -213,4 +213,4 @@ Fundament poniżej zakłada ten stan i nie tworzy ponownie niczego, co jest zgł
 
 ## Done
 
-(Pusta przy pierwszym generowaniu. `/10x-archive` dopisuje tu wpis i zmienia `Status` elementu na `done`, gdy zmiana o pasującym `Change ID` zostanie zarchiwizowana.)
+- **F-01: (foundation) weryfikować zachowanie na prawdziwym repozytorium git** — Zarchiwizowano 2026-08-04 → `context/archive/2026-08-04-git-integration-test-harness/`. Lekcja: —.

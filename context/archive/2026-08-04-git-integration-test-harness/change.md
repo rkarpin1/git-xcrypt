@@ -2,7 +2,8 @@
 change_id: git-integration-test-harness
 title: "Git integration test harness"
 roadmap_ref: F-01
-status: impl_reviewed
+status: archived
+archived_at: 2026-08-04T09:02:05Z
 created: 2026-08-04
 updated: 2026-08-04
 ---
