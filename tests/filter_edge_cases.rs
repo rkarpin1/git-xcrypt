@@ -479,3 +479,100 @@ fn a_dos_end_of_file_marker_is_classified_the_way_git_classifies_it() {
         ours.assert_status_clean();
     }
 }
+
+/// A file name no `String` can hold, driven end to end through a real git.
+///
+/// AGENTS.md makes "a path is bytes, never a `String`" a hard rule, and names
+/// the two bugs that bought it: a `trim_end()` on a name that legally ends in a
+/// space, and a `from_utf8_lossy` on the filter's `pathname=`. Both matched a
+/// file under a name it did not have, and in the pass-through direction that
+/// stores a secret in the clear. Every module now carries a byte-preserving
+/// conversion for this — `filter`, `config::decide`, `gitindex`, `history`,
+/// `lock`, `unlock`, `status` — and until this test **not one of them had ever
+/// seen such a name arrive from a filesystem.** The unit tests pin the
+/// conversions in isolation; the CI note in `.github/workflows/ci.yml` says so
+/// outright.
+///
+/// `#[cfg(target_os = "linux")]` because ext4 is where the case exists: any byte
+/// string without `/` or NUL is a legal name there. APFS rejects it at `open`,
+/// and a Windows name is UTF-16 and cannot express it at all — so this is not a
+/// case those platforms handle differently, it is one they cannot reach.
+///
+/// The whole life cycle, because each stage reaches the bytes by a different
+/// route: `git add` hands them over in the filter protocol, `status` reads them
+/// out of the index and the trees, and `lock`/`unlock` build them from
+/// `read_dir`. A lossy step anywhere shows up as a plaintext blob, a false
+/// finding, or a file left in the clear behind a command that deleted the key.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_file_name_that_is_not_utf8_survives_the_whole_life_cycle() {
+    use std::ffi::{OsStr, OsString};
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+
+    const NAME: &[u8] = b"secrets/pa\xffssword.env";
+
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.xcrypt_ok(["sync"]);
+
+    let path = repo.path().join(OsStr::from_bytes(NAME));
+    std::fs::create_dir_all(path.parent().expect("a parent")).expect("could not create secrets/");
+    std::fs::write(&path, SECRET).expect("ext4 must accept this name");
+
+    repo.commit_all("a secret whose name is not text");
+
+    // The blob, asked for by the same bytes git was given.
+    let mut spec = OsString::from_vec(b"HEAD:".to_vec());
+    spec.push(OsStr::from_bytes(NAME));
+    let blob = repo
+        .git_ok([OsStr::new("cat-file"), OsStr::new("blob"), &spec])
+        .stdout;
+    assert!(
+        blob.starts_with(b"\0GITXCRYPT\0"),
+        "the filter judged the file under a name it does not have, and the \
+         plaintext was committed"
+    );
+    assert_eq!(blob.len(), 38 + SECRET.len());
+    assert_eq!(
+        std::fs::read(&path).expect("reading"),
+        SECRET,
+        "the working tree must still hold the plain text"
+    );
+
+    // `status` reads the same name out of the index, resolves git's attribute
+    // stack for it and walks it through history. Nothing is exposed, so the
+    // gate has to be green — a lossy read here invents a declared path that no
+    // blob answers for.
+    let status = repo.xcrypt(["status"]);
+    assert_eq!(
+        status.status.code(),
+        Some(0),
+        "status did not come back clean:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr)
+    );
+
+    // `lock` and `unlock` reach the same file through `read_dir` instead. `lock`
+    // is the direction where a miss is unrecoverable: it deletes the key, so a
+    // file it failed to select stays plaintext with nothing left to close it.
+    let vault = tempfile::TempDir::new().expect("could not create a temporary directory");
+    let key = vault.path().join("repo.key");
+    repo.xcrypt_ok([OsStr::new("export-key"), key.as_os_str()]);
+
+    repo.xcrypt_ok(["lock", "--yes"]);
+    assert!(
+        std::fs::read(&path)
+            .expect("reading")
+            .starts_with(b"\0GITXCRYPT\0"),
+        "lock left the file in the clear and deleted the key over it"
+    );
+
+    repo.xcrypt_ok([OsStr::new("unlock"), key.as_os_str()]);
+    assert_eq!(
+        std::fs::read(&path).expect("reading"),
+        SECRET,
+        "unlock did not find the file it had just encrypted"
+    );
+    repo.assert_status_clean();
+}
