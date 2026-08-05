@@ -202,11 +202,28 @@ fn is_git_true(value: &str) -> bool {
 /// Applies a resolved line-ending mode to content that was normalised to LF.
 #[must_use]
 pub fn apply(content: &[u8], mode: EolMode) -> Vec<u8> {
+    apply_where(content, mode, cfg!(windows))
+}
+
+/// The platform-independent core, so both arms are testable from either machine.
+///
+/// `native_is_crlf` is `cfg!(windows)` in production and an argument here for the
+/// same reason `repo::with_separator` takes a separator: this arm decides the
+/// bytes that land in a **Windows** working tree, and the development machine is
+/// not Windows, so without the parameter it would be covered by CI alone.
+///
+/// It is the smudge half of the asymmetry this module exists for — clean never
+/// reads the platform, smudge is the one place that may — so the invariant worth
+/// pinning is that the two still meet: whatever this writes out has to normalise
+/// back to exactly what came in, or the same file yields a different blob on
+/// Windows and `git status` reports a file nobody edited.
+#[must_use]
+fn apply_where(content: &[u8], mode: EolMode, native_is_crlf: bool) -> Vec<u8> {
     match mode {
         EolMode::Lf => content.to_vec(),
         EolMode::Crlf => to_crlf(content),
         EolMode::Native => {
-            if cfg!(windows) {
+            if native_is_crlf {
                 to_crlf(content)
             } else {
                 content.to_vec()
@@ -461,6 +478,59 @@ mod tests {
                 EolMode::Lf,
                 "`core.autocrlf = {spelling}` is false to git, so core.eol decides"
             );
+        }
+    }
+
+    #[test]
+    fn the_native_mode_writes_what_each_platform_asks_for_and_still_round_trips() {
+        // `EolMode::Native` is what `resolve_output` returns whenever
+        // `core.autocrlf` is false and `core.eol` is unset or `native` — an
+        // ordinary configuration — and its CRLF arm has never run on the
+        // development machine. Parameterised rather than left to CI, the same
+        // way `repo::with_separator` is. Verified to bite: forcing the arm to
+        // the Unix answer fails the first assertion below.
+        let stored = b"one\ntwo\nthree\n";
+
+        assert_eq!(
+            apply_where(stored, EolMode::Native, true),
+            b"one\r\ntwo\r\nthree\r\n",
+            "a Windows working tree must receive CRLF"
+        );
+        assert_eq!(
+            apply_where(stored, EolMode::Native, false),
+            stored,
+            "a Unix working tree must receive the bytes unchanged"
+        );
+
+        // The other two modes do not consult the platform at all, which is what
+        // makes the measured configuration table portable.
+        for native_is_crlf in [true, false] {
+            assert_eq!(apply_where(stored, EolMode::Lf, native_is_crlf), stored);
+            assert_eq!(
+                apply_where(stored, EolMode::Crlf, native_is_crlf),
+                b"one\r\ntwo\r\nthree\r\n"
+            );
+        }
+
+        // The invariant that spans the asymmetry: smudge may write CRLF, but the
+        // next clean has to normalise back to exactly the plaintext that was
+        // encrypted, or the same file gives a different blob on Windows and
+        // `git status` reports a file nobody edited, for good.
+        for content in [
+            &b"one\ntwo\nthree\n"[..],
+            b"",
+            b"no trailing newline",
+            b"\n",
+            b"blank\n\nlines\n",
+        ] {
+            for native_is_crlf in [true, false] {
+                let written = apply_where(content, EolMode::Native, native_is_crlf);
+                assert_eq!(
+                    normalise_to_lf(&written),
+                    content,
+                    "{content:?} did not survive the Windows round trip"
+                );
+            }
         }
     }
 
