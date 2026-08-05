@@ -512,20 +512,35 @@ fn a_name_with_a_space_is_declared_in_quotes_and_lives_the_whole_cycle() {
     );
 
     // --- Written the way it is written now. ---------------------------------
+    //
+    // `"!weird.env"` rides along because quoting is what made it spellable: the
+    // parser stopped reading a quoted `!` as the negation marker, so the leading
+    // `!` is part of a real file name and the filter encrypts it. The rendered
+    // line is where that goes wrong in silence — git discards a `.gitattributes`
+    // line opening with `!` (`warning: Negative patterns are ignored`), quoting
+    // does not rescue it, and the path is left carrying ciphertext with no
+    // `-text`. Measured on git 2.55: 35 CR bytes eaten out of a 2 MB blob, `git
+    // add` exit 0, and the file unrecoverable at checkout.
     repo.write_xcrypt_config(
         "\"my secrets/\"\n\
          \"my secrets/*.sh\"   text eol=lf\n\
-         !\"my secrets/README.md\"\n",
+         !\"my secrets/README.md\"\n\
+         \"!weird.env\"\n",
     );
     repo.xcrypt_ok(["sync"]);
 
     repo.write_file("my secrets/deploy.sh", CRLF);
     repo.write_file("app/my secrets/nested.env", SPACED);
     repo.write_file("my secrets/README.md", b"nothing secret here\n");
+    repo.write_file("!weird.env", SPACED);
     repo.commit_all("a secret under a name with a space");
     repo.assert_status_clean();
 
-    for path in ["my secrets/db.env", "app/my secrets/nested.env"] {
+    for path in [
+        "my secrets/db.env",
+        "app/my secrets/nested.env",
+        "!weird.env",
+    ] {
         assert!(
             repo.blob_is_encrypted(path),
             "{path}: a declared path was stored in the clear"
@@ -585,6 +600,7 @@ fn a_name_with_a_space_is_declared_in_quotes_and_lives_the_whole_cycle() {
     repo.assert_worktree_eq("my secrets/db.env", SPACED);
     repo.assert_worktree_eq("my secrets/deploy.sh", LF);
     repo.assert_worktree_eq("app/my secrets/nested.env", SPACED);
+    repo.assert_worktree_eq("!weird.env", SPACED);
     repo.assert_status_clean();
 }
 

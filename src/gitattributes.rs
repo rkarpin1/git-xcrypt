@@ -161,11 +161,12 @@ fn bootstrap_exclusions(config: &Config) -> Vec<String> {
 /// 2026-08-05, so the two files now close a space the same way and [`spell`]
 /// only has to put the quotes back around what the parser took them off.
 ///
-/// A line opening with `[attr]` is a macro definition to git, never a pattern.
-/// Quoting does not help — measured on git 2.55, the macro check runs before the
-/// unquoting — so such a pattern is given a leading `**/` or `/` instead, both
-/// of which mean exactly what the unprefixed spelling meant in a root
-/// `.gitattributes`.
+/// Two openings send git somewhere other than its pattern matcher, and quoting
+/// rescues neither: a line opening with `[attr]` is a macro definition, and one
+/// opening with `!` is discarded outright (`warning: Negative patterns are
+/// ignored in git attributes`). Both are given a leading `**/` or `/` by
+/// [`guard`] instead, which means exactly what the unprefixed spelling meant in
+/// a root `.gitattributes`.
 fn translate(pattern: &str) -> Vec<String> {
     let directory_only = pattern.ends_with('/');
     let core = pattern.strip_suffix('/').unwrap_or(pattern);
@@ -195,13 +196,30 @@ fn translate(pattern: &str) -> Vec<String> {
 /// What git reads as the start of a macro definition rather than a pattern.
 const MACRO_PREFIX: &str = "[attr]";
 
-/// Keeps a spelling out of git's macro branch without changing what it matches.
+/// Keeps a spelling out of the branches git takes before it ever matches it.
 ///
 /// An anchored pattern already carries a slash, so a leading one only makes
 /// explicit what a root `.gitattributes` does anyway; a floating one gets the
 /// `**/` that git documents as equivalent to no prefix at all.
+///
+/// Two openings need it, and in both cases the line is lost in silence without
+/// it — the pattern simply never reaches git's matcher, so the `-text` this
+/// renderer exists to place is not there:
+///
+/// * `[attr]`, which git reads as a macro definition rather than a pattern;
+/// * `!`, which git discards with `warning: Negative patterns are ignored in
+///   git attributes`. A name whose leading `!` is part of it became spellable on
+///   2026-08-05, when quoting arrived in `.git-xcrypt` and the parser stopped
+///   reading a quoted `!` as the negation marker — so `"!weird.env"` selects a
+///   real file, and `.gitattributes` has to cover it.
+///
+/// **Quoting rescues neither**, which is why this is a prefix rather than a
+/// stanza in [`spell`]. Measured on git 2.55: the macro check runs before the
+/// unquoting, and `"!weird.env"` draws the negative-pattern warning too, so git
+/// tests for `!` *after* unquoting. `**/!weird.env` and `/!secrets/x.env` were
+/// measured resolving `text: unset` and `diff: xc` for the paths they name.
 fn guard(spelling: String, anchored: bool) -> String {
-    if !spelling.starts_with(MACRO_PREFIX) {
+    if !spelling.starts_with(MACRO_PREFIX) && !spelling.starts_with('!') {
         return spelling;
     }
     if anchored {
@@ -223,8 +241,9 @@ fn spell(pattern: &str) -> String {
     // attributes; a leading quote sends git into its C-quoting parser
     // mid-pattern; a leading `#` makes git read the whole line as a comment, so
     // the `-text` for that path would simply not be there. A leading `[attr]`
-    // is handled by `guard` rather than here, because git checks for a macro
-    // definition before it unquotes and quoting would not have helped.
+    // and a leading `!` are handled by `guard` rather than here, because quoting
+    // does not rescue either — measured on git 2.55, the macro check runs before
+    // the unquoting, and the negative-pattern check runs after it.
     if !pattern.contains(char::is_whitespace)
         && !pattern.starts_with('"')
         && !pattern.starts_with('#')
