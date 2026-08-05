@@ -250,7 +250,20 @@ pub fn run(repo: &Repo, key_source: Option<&Path>) -> Result<Report> {
     match refreshed {
         Ok(crate::gitindex::Outcome::Cleared(_)) => {}
         Ok(crate::gitindex::Outcome::Skipped(why)) => report.warnings.push(why),
-        Err(err) if stopped.is_none() => return Err(err),
+        // A warning, not a return: the decryption already happened, and a bare
+        // `Err` here threw the whole report away — the user was never told that
+        // N files now sit in the clear, and a second run cannot say it either,
+        // because the files are plain by then and the walk no longer selects
+        // them. `Skipped` (a held lock, a split index) already answers the
+        // identical situation with a warning carrying the remedy; a failed read
+        // or write differs only in the errno. The report's own decrypted list
+        // is the load-bearing half — what changed on disk must reach the user
+        // whatever the stat cache did.
+        Err(err) if stopped.is_none() => report.warnings.push(format!(
+            "the index's stat cache could not be refreshed ({err}). The files \
+             are decrypted correctly; if `git status` shows them as modified, \
+             `git add --renormalize .` settles it."
+        )),
         // A second failure on top of the one that stopped the loop. The first is
         // what the user has to act on; this one goes with it rather than
         // replacing it.

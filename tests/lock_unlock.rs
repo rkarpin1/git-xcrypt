@@ -418,6 +418,54 @@ fn lock_refuses_over_every_checkout_and_every_file_it_cannot_account_for() {
     );
 }
 
+/// A stat-cache refresh that fails must not eat the news that files are open.
+///
+/// The refresh runs after the decryption pass, so by the time it can fail the
+/// working tree already holds plaintext. Returning the bare error threw the
+/// whole report away — the user was never told a single file was decrypted, the
+/// exit code said the command failed, and a second run could not say it either,
+/// because the files are plain by then and the walk no longer selects them.
+///
+/// Provoked with a directory where the index belongs rather than a permission
+/// bit, so the branch runs on all three platforms — what is checked is the
+/// branch, not the errno. A held `index.lock` and a split index take the
+/// `Skipped` arm, which already warns; this is the arm for a read that fails.
+#[test]
+fn a_failed_stat_refresh_still_reports_what_unlock_decrypted() {
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.xcrypt_ok(["sync"]);
+    repo.write_file("secrets/db.env", DOTENV);
+    repo.commit_all("a secret");
+
+    let vault = TempDir::new().expect("could not create a temporary directory");
+    let key_file = vault.path().join("repo.key");
+    repo.xcrypt_ok(["export-key", &key_file.to_string_lossy()]);
+    repo.xcrypt_ok(["lock", "--yes"]);
+
+    let index = repo.path().join(".git/index");
+    fs::remove_file(&index).expect("removing the index");
+    fs::create_dir(&index).expect("a directory where the index belongs");
+
+    let output = repo.xcrypt(["unlock", &key_file.to_string_lossy()]);
+    let said = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "unlock decrypted the tree and then reported failure over the stat \
+         cache:\n{said}"
+    );
+    repo.assert_worktree_eq("secrets/db.env", DOTENV);
+    assert!(
+        said.contains("decrypted secrets/db.env"),
+        "the report of what changed on disk was thrown away:\n{said}"
+    );
+    assert!(
+        said.contains("git add --renormalize"),
+        "the warning must carry the remedy for the stale stat cache:\n{said}"
+    );
+}
+
 /// The sweep deletes exactly the residue it can prove is ours, and nothing else.
 ///
 /// Two files share the temporary-name shape; only one may go. The untracked one
