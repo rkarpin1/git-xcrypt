@@ -689,6 +689,12 @@ fn a_declaration_added_later_does_not_reach_an_untouched_file_and_status_says_so
     );
 }
 
+// Unix only, and the coverage it leaves behind is named rather than lost: git on
+// Windows stores a symlink as a plain file unless `core.symlinks` is on and the
+// account may create links, so the shape this guards against cannot be built
+// there. The index-side twin (`Tracked::mode`) is platform-neutral and still runs
+// on all three.
+#[cfg(unix)]
 #[test]
 fn a_tracked_symlink_is_left_alone_by_fix() {
     // Measured on the build that read index entries without their mode: a
@@ -749,16 +755,19 @@ fn references_that_cannot_be_read_fail_the_gate_instead_of_reading_as_clean() {
     repo.git_ok(["pack-refs", "--all"]);
 
     // Unreadable rather than absent: absent is an ordinary, honest state.
+    //
+    // A directory in the file's place, not `chmod 0o000`: this guarantee is the
+    // one that must not be reported as a clean bill of health, so it has to be
+    // checked on every platform, and mode bits are `#[cfg(unix)]`. Opening a
+    // directory as a file fails everywhere — `EISDIR` here, `ERROR_ACCESS_DENIED`
+    // on Windows — and both reach us as an ordinary `io::Error`.
     let packed = repo.path().join(".git/packed-refs");
-    let mut permissions = std::fs::metadata(&packed).expect("metadata").permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o000);
-    std::fs::set_permissions(&packed, permissions).expect("chmod");
+    std::fs::remove_file(&packed).expect("removing packed-refs");
+    std::fs::create_dir(&packed).expect("a directory where the file was");
 
     let output = repo.xcrypt(["status"]);
 
-    let mut restore = std::fs::metadata(&packed).expect("metadata").permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut restore, 0o644);
-    std::fs::set_permissions(&packed, restore).expect("chmod");
+    std::fs::remove_dir(&packed).expect("restoring");
 
     let text = report(&output);
     assert_eq!(

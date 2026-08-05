@@ -1056,6 +1056,11 @@ mod tests {
         assert_eq!(scan.unreadable, 0);
     }
 
+    // Unix only: git on Windows writes a symlink as a plain file unless
+    // `core.symlinks` is on and the account may create links, so mode 120000
+    // cannot be produced there. The walk's gitlink case above is the
+    // platform-neutral half of the same rule and runs everywhere.
+    #[cfg(unix)]
     #[test]
     fn a_symlink_is_not_judged() {
         // Git never filters a symlink, so no declaration could have covered it.
