@@ -577,7 +577,11 @@ fn refuse_if_the_tree_moved(repo: &Repo, config: &Config, before: &[Vec<u8>]) ->
 ///
 /// A declared entry with nothing at its path is not a finding: a staged deletion
 /// leaves the index naming a file that is gone, and there is no plain text in a
-/// file that does not exist. Symlinks and gitlinks are skipped for the reason
+/// file that does not exist. That is the **only** read failure treated as an
+/// answer — measured when it was not: with a declared file at mode `000` and the
+/// spellings already drifted apart, an earlier version of this gate skipped it,
+/// the key went, and the plain text was readable again the moment the mode was
+/// put back. Symlinks and gitlinks are skipped for the reason
 /// `gitindex::Tracked::holds_content` gives — their blob is not file content and
 /// no filter ever ran on them.
 ///
@@ -613,16 +617,30 @@ fn refuse_if_a_declared_file_is_still_open(
         // Only the header is needed, and reading the whole file would be a
         // pointless copy of a secret into this process for the large ones.
         let mut head = [0u8; crate::format::MAGIC.len()];
-        let read = match std::fs::File::open(&path) {
-            Ok(mut file) => {
-                use std::io::Read as _;
-                file.read(&mut head).unwrap_or(0)
+        let read = std::fs::File::open(&path).and_then(|mut file| {
+            use std::io::Read as _;
+            file.read(&mut head)
+        });
+        match read {
+            Ok(read) if head[..read] == crate::format::MAGIC => {}
+            // Nothing at that path: a staged deletion leaves the index naming a
+            // file that is gone, and a file that does not exist holds no plain
+            // text. The **only** failure that is an answer rather than a
+            // question — measured before it was the only one: with a declared
+            // file at mode `000` this arm swallowed the refusal, the key went,
+            // and the plain text was readable again the moment the mode was put
+            // back.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => open.push(bstr::BStr::new(&entry.path).to_string()),
+            Err(err) => {
+                return Err(Error::Config(format!(
+                    "refusing to delete the key: {} is declared and tracked, and \
+                     could not be read ({err}), so lock cannot show it is closed. \
+                     The key has been kept and every file lock did encrypt is \
+                     encrypted; nothing else has changed.",
+                    path.display()
+                )));
             }
-            // Gone from the working tree, so there is nothing here in the clear.
-            Err(_) => continue,
-        };
-        if head[..read] != crate::format::MAGIC {
-            open.push(bstr::BStr::new(&entry.path).to_string());
         }
     }
 

@@ -725,3 +725,68 @@ fn lock_refuses_to_delete_the_key_over_a_declared_file_it_left_in_the_clear() {
         );
     }
 }
+
+/// The same gate asked about a file it cannot read at all.
+///
+/// The first version of the check treated every `open` failure as "gone from
+/// the working tree, so there is no plain text here". Measured on macOS, on a
+/// repository already drifted apart by case: with the declared file at mode
+/// `000`, `lock --yes` skipped it, deleted the key and left `HUNTER2` readable
+/// the moment the mode was put back. That is "I could not tell" reported as
+/// "nothing is wrong", in front of the one step nothing undoes.
+///
+/// Only `NotFound` is an answer. Everything else is a question, and this gate
+/// refuses over questions.
+///
+/// Unix only: the mode is what makes the file unreadable, and Windows has no
+/// equivalent that `fs` can set. The branch it leaves uncovered there is the
+/// refusal, not the pass — a Windows run that cannot read a declared file gets
+/// the same refusal through the same arm.
+#[cfg(unix)]
+#[test]
+fn lock_refuses_over_a_declared_file_it_cannot_read_rather_than_assuming_it_is_gone() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let repo = TestRepo::init();
+    repo.git_ok(["config", "core.ignorecase", "true"]);
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.xcrypt_ok(["sync"]);
+    repo.write_file("secrets/db.env", b"hunter2-secret\n");
+    repo.commit_all("a secret");
+
+    let outside = elsewhere();
+    let key = outside.path().join("repo.key");
+    repo.xcrypt_ok(["export-key", &key.to_string_lossy()]);
+
+    fs::rename(repo.path().join("secrets"), repo.path().join("Secrets")).expect("renaming");
+    if !repo.git_ok(["status", "--porcelain"]).stdout.is_empty() {
+        // A case-sensitive filesystem: the declared path really is gone, and
+        // "gone" is the right answer there. Nothing to prove.
+        return;
+    }
+
+    let file = repo.path().join("Secrets/db.env");
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).expect("chmod");
+    let output = repo.xcrypt(["lock", "--yes"]);
+    // Put it back before any assertion, so a failure does not leave the
+    // temporary directory undeletable.
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).expect("chmod back");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a declared file that could not be read was taken for one that is not \
+         there, and the key went with it:\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        repo.path().join(".git/git-xcrypt/keys/default").exists(),
+        "the key was deleted over a file this run never managed to read"
+    );
+    assert_eq!(
+        fs::read(&file).expect("reading"),
+        b"hunter2-secret\n",
+        "and the plain text really was still there"
+    );
+}
