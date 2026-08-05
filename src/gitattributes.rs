@@ -1839,6 +1839,20 @@ mod tests {
             None,
         );
 
+        // The spelling the renderer emits for a POSIX class — the pair
+        // `[[:upper:][:lower:]]` — resolved through gix the way git resolves
+        // it. Discriminating on purpose: the class line must *beat* the `text`
+        // above it, so a resolver that failed to match the bracket would
+        // answer "converts" where git answers "untouched".
+        agrees_with_git(
+            &[Source {
+                path: ".gitattributes",
+                body: &format!("{catch_all}* text\n**/[[:upper:][:lower:]][dD][iI][rR]/** -text\n"),
+            }],
+            "xdir/db.env",
+            None,
+        );
+
         // An ordinary LFS line on paths no pattern of ours reaches.
         agrees_with_git(
             &[Source {
