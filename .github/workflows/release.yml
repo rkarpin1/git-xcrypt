@@ -198,7 +198,13 @@ jobs:
       # was never released — untidy, and the price of being able to prove this
       # step works before a tag depends on it.
       - name: Attest the archives
-        uses: actions/attest-build-provenance@v2
+        # v2 is a composite that calls `actions/attest@ce27ba3b`, which runs on
+        # Node 20 — the deprecation warning this job kept raising came from
+        # inside the action, not from anything written here. v4 pins a Node 24
+        # build and folds the predicate generator and the signer into one call
+        # instead of two. Its inputs are unchanged; `subject-path` is still the
+        # only one this uses.
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
             dist/*.tar.gz
