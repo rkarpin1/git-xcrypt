@@ -862,7 +862,14 @@ fn main_checkout(repo: &Repo) -> Option<String> {
                 .into(),
         );
     };
-    if gitconfig::get(&config, "core.bare").as_deref() == Some("true") {
+    // `is_true`, not a comparison against one spelling: git accepts `1`, `yes`
+    // and `on` beside `true`, and `gitconfig::is_true` documents that every
+    // caller branching on a git boolean must accept the same set. Measured
+    // with `core.bare = 1`: `lock` from the only worktree of a bare repository
+    // refused over "the main checkout, whose location this build could not
+    // determine" — a checkout that does not exist — while `core.bare = true`
+    // locked the same tree.
+    if gitconfig::get(&config, "core.bare").is_some_and(|value| gitconfig::is_true(&value)) {
         // A bare repository has no checkout of its own to strand.
         return None;
     }
@@ -1759,6 +1766,33 @@ mod tests {
                 .starts_with(&crate::format::MAGIC),
             "an earlier gate caught this, so the window after the pass is untested"
         );
+    }
+
+    #[test]
+    fn every_git_spelling_of_bare_reads_as_bare_to_the_worktree_refusal() {
+        // git accepts `1`, `yes` and `on` beside `true` for `core.bare`, and
+        // `gitconfig::is_true` documents the rule every caller must follow.
+        // Measured before this: with `core.bare = 1`, `lock` from the only
+        // worktree of a bare repository refused over "the main checkout, whose
+        // location this build could not determine" — a checkout that does not
+        // exist — exit 2, while `core.bare = true` locked the same tree at 0.
+        let dir = TempDir::new().expect("temporary directory");
+        git(dir.path(), &["init", "-q", "--bare", "store.git"]);
+        let store = dir.path().join("store.git");
+        git(&store, &["config", "user.name", "t"]);
+        git(&store, &["config", "user.email", "t@t.invalid"]);
+        git(&store, &["config", "core.bare", "1"]);
+        git(&store, &["worktree", "add", "-q", "../work"]);
+
+        let repo = Repo::discover(&dir.path().join("work")).expect("discovery");
+        super::super::init::run(&repo).expect("init must succeed");
+        fs::write(repo.xcrypt_config_path(), "secrets/\n").expect("declarations");
+
+        let outcome = run(&repo, &mut Scripted::new(true)).expect(
+            "core.bare = 1 is bare to git, so there is no main checkout to \
+             refuse over",
+        );
+        assert!(matches!(outcome, Outcome::Locked(_)));
     }
 
     #[test]
