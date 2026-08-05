@@ -186,3 +186,62 @@ fn a_secret_committed_before_its_pattern_is_found_fixed_forward_and_still_report
     );
     assert!(repo.blob_bytes("secrets/db.env").starts_with(MAGIC));
 }
+
+/// The same mistake, made on a branch nobody is standing on.
+///
+/// A secret does not have to be in `HEAD` to be at the hosting provider: it is
+/// pushed with its branch, it is in every clone, and the commit that carries it
+/// is reachable for ever. This is the ordinary shape of the mistake — the secret
+/// goes in on a feature branch, the branch is left alone, and by the time anyone
+/// declares the pattern the file is nowhere in the working tree.
+///
+/// Which means the scan has to start from **every** reference, not from the
+/// checked-out one. Measured: with the walk reduced to the current branch,
+/// nothing else in this suite goes red and `status` reports a clean bill of
+/// health over a plaintext blob that is one `git push` from public.
+#[test]
+fn a_secret_left_on_a_branch_nobody_has_checked_out_is_still_found() {
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("# nothing declared yet\n");
+    repo.xcrypt_ok(["sync"]);
+    repo.write_file("README.md", b"# ordinary project\n");
+    repo.commit_all("an ordinary start");
+
+    repo.git_ok(["checkout", "-q", "-b", "feature"]);
+    repo.write_file("secrets/db.env", SECRET);
+    repo.commit_all("wire the database up");
+    assert_eq!(
+        repo.blob_bytes("secrets/db.env"),
+        SECRET,
+        "the premise is a plaintext blob on the branch"
+    );
+
+    repo.git_ok(["checkout", "-q", "main"]);
+    assert!(
+        !repo.path().join("secrets/db.env").exists(),
+        "the premise is that nothing in the working tree shows this any more"
+    );
+
+    // The declaration arrives on `main`, where the file has never been seen.
+    repo.write_xcrypt_config("secrets/\n");
+    repo.xcrypt_ok(["sync"]);
+    repo.commit_all("declare the secrets directory");
+
+    let output = repo.xcrypt(["status"]);
+    let text = report(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(EXPOSED),
+        "a plaintext secret on another branch must fail the gate — it is pushed \
+         with that branch and it is in every clone:\n{text}"
+    );
+    assert!(
+        text.contains("leaked in history"),
+        "the finding must say where it is:\n{text}"
+    );
+    assert!(
+        text.contains("secrets/db.env"),
+        "the report must name the path:\n{text}"
+    );
+}

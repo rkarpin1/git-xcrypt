@@ -254,3 +254,66 @@ fn a_clone_without_the_key_reports_it_readably_rather_than_panicking() {
          diagnosis with no cure:\n{stderr}"
     );
 }
+
+/// A repository that declares *everything* still hands a clone what it needs to
+/// bootstrap itself.
+///
+/// `*` in `.git-xcrypt` is the obvious first thing to write, and it is the one
+/// declaration that reaches the two files the construction stands on. If either
+/// were encrypted, a clone would carry a `.gitattributes` git cannot read — so
+/// no `* filter=git-xcrypt` line, so no filter, so the next commit stores
+/// plaintext — and a `.git-xcrypt` the filter itself cannot read. Neither is
+/// recoverable from inside the clone, which is why the exclusion is
+/// unconditional rather than a pattern the user is trusted to write.
+///
+/// `.gitattributes` is excluded by *basename*, not by root path: git reads one
+/// per directory, so an encrypted `sub/.gitattributes` takes the attributes for
+/// that whole subtree with it.
+#[test]
+fn declaring_everything_still_leaves_a_clone_able_to_read_its_own_setup() {
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("*\n");
+    repo.xcrypt_ok(["sync"]);
+
+    repo.write_file("secrets/password.txt", PASSWORD);
+    repo.write_file("README.md", b"# ordinary project\n");
+    repo.write_file("sub/.gitattributes", b"*.md diff\n");
+    repo.commit_all("everything is a secret");
+
+    let remote = BareRemote::new();
+    repo.push_to(&remote, "main");
+
+    for path in [".git-xcrypt", ".gitattributes", "sub/.gitattributes"] {
+        let stored = remote.blob_bytes("main", path);
+        assert!(
+            !stored.starts_with(MAGIC),
+            "{path} was encrypted, so a clone cannot read the setup it needs in \
+             order to decrypt anything — including this file"
+        );
+    }
+    for path in ["secrets/password.txt", "README.md"] {
+        assert!(
+            remote.blob_bytes("main", path).starts_with(MAGIC),
+            "{path} is declared by `*` and reached the remote in the clear"
+        );
+    }
+
+    // And the clone really does bootstrap: the catch-all line is there to be
+    // read, and the key opens everything the declaration swept in.
+    let carried = TestRepo::init();
+    let key_file = carried.path().join("carried.key");
+    repo.xcrypt_ok(["export-key", &key_file.to_string_lossy()]);
+
+    let clone = remote.clone_to();
+    assert_eq!(
+        clone.worktree_bytes(".gitattributes"),
+        repo.worktree_bytes(".gitattributes"),
+        "the clone's attributes file is not the one the repository wrote"
+    );
+
+    clone.xcrypt_ok(["unlock", &key_file.to_string_lossy()]);
+    clone.assert_worktree_eq("secrets/password.txt", PASSWORD);
+    clone.assert_worktree_eq("README.md", b"# ordinary project\n");
+    clone.assert_status_clean();
+}
