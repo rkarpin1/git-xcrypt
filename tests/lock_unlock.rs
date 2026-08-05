@@ -243,6 +243,42 @@ fn lock_refuses_over_every_checkout_and_every_file_it_cannot_account_for() {
         &linked.path().to_string_lossy(),
     ]);
 
+    // --- The same question, unanswerable. -----------------------------------
+    //
+    // That refusal rests entirely on being able to list `.git/worktrees`, so a
+    // listing that fails must refuse too — an empty answer and an unobtainable
+    // one are the same bytes here, and only one of them means "no other
+    // checkout". Measured before this: `chmod 000 .git/worktrees` over the
+    // repository above took `lock --yes` to "locked; key … has been deleted",
+    // left the linked checkout reading `correct horse battery staple`, and
+    // `unlock` there answered "no repository key".
+    //
+    // Provoked with a *file* where the directory belongs rather than with a
+    // permission bit, so the arm runs on all three platforms: `chmod` is
+    // Unix-only, while every platform refuses to enumerate a regular file. What
+    // is being checked is the branch, not the errno.
+    let registrations = repo.path().join(".git/worktrees");
+    if registrations.exists() {
+        fs::remove_dir_all(&registrations).expect("the registration directory must be removable");
+    }
+    fs::write(&registrations, b"not a directory\n").expect("writing over the registrations");
+
+    let blinded = repo.xcrypt(["lock", "--yes"]);
+    let complaint = String::from_utf8_lossy(&blinded.stderr).into_owned();
+    assert_eq!(
+        blinded.status.code(),
+        Some(2),
+        "`lock` could not tell whether another checkout shares this key and \
+         deleted it anyway:\n{complaint}"
+    );
+    assert!(
+        key_path.is_file(),
+        "`lock` deleted the shared key over a question it could not answer"
+    );
+    repo.assert_worktree_eq("secrets/db.env", PASSWORD);
+
+    fs::remove_file(&registrations).expect("removing the blockage");
+
     // --- A declared file that appears while the prompt is waiting. ----------
     //
     // The prompt is the whole point of the interactive path, and it is also an

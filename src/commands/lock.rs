@@ -474,19 +474,40 @@ pub fn run(repo: &Repo, confirm: &mut dyn Confirm) -> Result<Outcome> {
 /// nothing. Both ended with the key deleted and a live checkout left in the
 /// clear. A registration git would really prune costs the user one
 /// `git worktree prune`, which the message names.
+///
+/// **An unreadable registration directory refuses, it does not read as "none".**
+/// This listing *is* the evidence the whole refusal rests on, so a failure to
+/// take it has to be fatal here the way it is in [`collect`] — only the
+/// directory being absent means there are no linked worktrees. Measured before
+/// this distinction existed: `chmod 000 .git/worktrees` over a repository with
+/// one linked checkout took `lock --yes` all the way to "locked; key … has been
+/// deleted", left `../side/secrets/db.env` reading `TOP SECRET`, and `unlock`
+/// there answered "no repository key". The permission is only the cheapest
+/// trigger — an I/O error, an exhausted descriptor table or a stale network
+/// handle reach the same line, and every one of them is a question rather than
+/// an answer. Note the contrast with [`crate::repo::Repo::work_trees`], which
+/// swallows the identical failure on purpose: that list is only ever used to
+/// *widen* a refusal, so a short one costs nothing, while a short list here is
+/// what deletes the key.
 fn refuse_other_worktrees(repo: &Repo) -> Result<()> {
     let mut others = Vec::new();
 
-    for entry in fs::read_dir(repo.common_dir().join("worktrees"))
-        .into_iter()
-        .flatten()
-        .flatten()
-    {
-        let registration = entry.path();
-        if same_path(&registration, repo.git_dir()) {
-            continue;
+    let registrations = repo.common_dir().join("worktrees");
+    match fs::read_dir(&registrations) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.map_err(|err| unverifiable(&registrations, &err))?;
+                let registration = entry.path();
+                if same_path(&registration, repo.git_dir()) {
+                    continue;
+                }
+                others.push(describe_worktree(repo, &registration));
+            }
         }
-        others.push(describe_worktree(repo, &registration));
+        // The ordinary case: a repository that has never had a linked worktree
+        // has no such directory at all.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(unverifiable(&registrations, &err)),
     }
 
     // And, when this *is* a linked worktree, the main checkout — which is not
