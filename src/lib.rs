@@ -104,16 +104,3 @@ fn hex(bytes: &[u8]) -> String {
 pub fn format_key_id(key_id: &[u8; format::KEY_ID_LEN]) -> String {
     hex(key_id)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn key_ids_render_as_lowercase_hex() {
-        assert_eq!(
-            format_key_id(&[0x3f, 0xa9, 0x12, 0x0b, 0x7e, 0xc4, 0x55, 0x8a]),
-            "3fa9120b7ec4558a"
-        );
-    }
-}

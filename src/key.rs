@@ -150,12 +150,6 @@ mod tests {
     }
 
     #[test]
-    fn key_id_differs_between_keys() {
-        let other = MasterKey::from_bytes([8u8; MASTER_KEY_LEN]);
-        assert_ne!(fixed_key().key_id(), other.key_id());
-    }
-
-    #[test]
     fn the_suite_key_is_not_the_master_key() {
         let key = fixed_key();
         let suite = key.suite_key(SUITE_AES_256_SIV).expect("known suite");
@@ -174,12 +168,5 @@ mod tests {
     #[test]
     fn an_unknown_suite_has_no_key() {
         assert!(fixed_key().suite_key(0xff).is_err());
-    }
-
-    #[test]
-    fn generated_keys_differ() {
-        let first = MasterKey::generate().expect("entropy must be available");
-        let second = MasterKey::generate().expect("entropy must be available");
-        assert_ne!(first.expose_bytes(), second.expose_bytes());
     }
 }

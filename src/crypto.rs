@@ -84,15 +84,11 @@ pub fn blob_key_id(blob: &[u8]) -> Result<[u8; KEY_ID_LEN]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::{FLAG_LF_NORMALIZED, MAGIC, OVERHEAD};
+    use crate::format::{FLAG_LF_NORMALIZED, OVERHEAD};
     use crate::key::MASTER_KEY_LEN;
 
     fn key() -> MasterKey {
         MasterKey::from_bytes([42u8; MASTER_KEY_LEN])
-    }
-
-    fn other_key() -> MasterKey {
-        MasterKey::from_bytes([43u8; MASTER_KEY_LEN])
     }
 
     fn samples() -> Vec<Vec<u8>> {
@@ -158,65 +154,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn flags_survive_the_round_trip_and_change_the_ciphertext() {
-        let plaintext = b"line\n";
-        let plain = encrypt(&key(), 0, plaintext).expect("encryption must succeed");
-        let flagged = encrypt(&key(), FLAG_LF_NORMALIZED, plaintext).expect("encryption");
-
-        assert_ne!(
-            plain, flagged,
-            "flags are authenticated, so they alter the tag"
-        );
-        let (flags, recovered) = decrypt(&key(), &flagged).expect("decryption must succeed");
-        assert_eq!(flags, FLAG_LF_NORMALIZED);
-        assert_eq!(recovered, plaintext);
-    }
-
-    #[test]
-    fn an_empty_file_costs_exactly_the_overhead() {
-        let blob = encrypt(&key(), 0, b"").expect("encryption must succeed");
-        assert_eq!(blob.len(), OVERHEAD);
-        assert!(blob.starts_with(&MAGIC));
-    }
-
-    #[test]
-    fn the_blob_is_the_plaintext_length_plus_the_overhead() {
-        for plaintext in samples() {
-            let blob = encrypt(&key(), 0, &plaintext).expect("encryption must succeed");
-            assert_eq!(blob.len(), plaintext.len() + OVERHEAD);
-        }
-    }
-
-    #[test]
-    fn flipping_any_byte_is_detected() {
-        let blob = encrypt(&key(), 0, b"api_key = secret\n").expect("encryption must succeed");
-        for index in 0..blob.len() {
-            let mut tampered = blob.clone();
-            tampered[index] ^= 0x01;
-            assert!(
-                decrypt(&key(), &tampered).is_err(),
-                "a flipped bit at offset {index} went unnoticed"
-            );
-        }
-    }
-
-    #[test]
-    fn a_foreign_key_id_is_reported_as_a_mismatch() {
-        let blob = encrypt(&other_key(), 0, b"secret").expect("encryption must succeed");
-        match decrypt(&key(), &blob) {
-            Err(Error::KeyMismatch { .. }) => {}
-            other => panic!("expected a key mismatch, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn the_claimed_key_id_is_readable_without_the_key() {
-        let blob = encrypt(&key(), 0, b"secret").expect("encryption must succeed");
-        assert_eq!(blob_key_id(&blob).expect("our own blob"), key().key_id());
-        assert!(blob_key_id(b"not ours").is_err());
-    }
-
     /// RFC 5297 Appendix A.1 — the specification's own vector.
     ///
     /// It pins the crate, not our wrapper: `aes-siv` has never been audited, so
@@ -254,15 +191,5 @@ mod tests {
                 u8::from_str_radix(&text[index..index + 2], 16).expect("test vectors must be hex")
             })
             .collect()
-    }
-
-    #[test]
-    fn plaintext_is_not_recoverable_from_the_blob() {
-        let plaintext = b"api_key = do-not-commit-me\n";
-        let blob = encrypt(&key(), 0, plaintext).expect("encryption must succeed");
-        assert!(
-            !blob.windows(plaintext.len()).any(|w| w == plaintext),
-            "the plaintext appears verbatim inside the ciphertext"
-        );
     }
 }

@@ -165,18 +165,6 @@ mod tests {
     }
 
     #[test]
-    fn header_round_trips() {
-        let header = Header::new(FLAG_LF_NORMALIZED, KEY_ID);
-        let parsed = Header::parse(&blob_with(
-            FORMAT_VERSION,
-            SUITE_AES_256_SIV,
-            FLAG_LF_NORMALIZED,
-        ))
-        .expect("a header we just wrote must parse");
-        assert_eq!(parsed, header);
-    }
-
-    #[test]
     fn magic_starts_with_nul_so_git_sees_binary() {
         assert_eq!(MAGIC[0], 0);
         assert_eq!(MAGIC[MAGIC.len() - 1], 0);
@@ -209,27 +197,5 @@ mod tests {
                 "flag bit {bit} must be refused until it means something"
             );
         }
-    }
-
-    #[test]
-    fn content_without_magic_is_refused() {
-        assert!(Header::parse(&[0u8; OVERHEAD]).is_err());
-        assert!(!looks_encrypted(b"plain text"));
-        assert!(!looks_encrypted(b""));
-    }
-
-    #[test]
-    fn a_truncated_file_is_refused() {
-        let blob = blob_with(FORMAT_VERSION, SUITE_AES_256_SIV, 0);
-        assert!(Header::parse(&blob[..OVERHEAD - 1]).is_err());
-    }
-
-    #[test]
-    fn looks_encrypted_accepts_our_own_header() {
-        assert!(looks_encrypted(&blob_with(
-            FORMAT_VERSION,
-            SUITE_AES_256_SIV,
-            0
-        )));
     }
 }

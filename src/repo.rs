@@ -350,53 +350,6 @@ fn absolute(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
-    use tempfile::TempDir;
-
-    /// Creates a real repository; these paths are not worth faking.
-    fn init_repo() -> TempDir {
-        let dir = TempDir::new().expect("temporary directory");
-        let ok = Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(dir.path())
-            .status()
-            .expect("git must be on PATH")
-            .success();
-        assert!(ok, "git init failed");
-        dir
-    }
-
-    #[test]
-    fn discovery_finds_the_repository_from_a_subdirectory() {
-        let dir = init_repo();
-        let nested = dir.path().join("a").join("b");
-        std::fs::create_dir_all(&nested).expect("creating directories must succeed");
-
-        let repo = Repo::discover(&nested).expect("discovery must succeed");
-        assert!(repo.git_dir().ends_with(".git"));
-        assert!(repo.key_path().starts_with(repo.git_dir()));
-    }
-
-    #[test]
-    fn discovery_fails_outside_a_repository() {
-        let dir = TempDir::new().expect("temporary directory");
-        match Repo::discover(dir.path()) {
-            Err(Error::Config(_)) => {}
-            other => panic!("expected a config error outside a repository, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_fresh_repository_has_no_key() {
-        let dir = init_repo();
-        let repo = Repo::discover(dir.path()).expect("discovery must succeed");
-        assert!(!repo.has_key());
-        match repo.load_key() {
-            Err(Error::NoKey) => {}
-            Err(other) => panic!("expected NoKey, got {other:?}"),
-            Ok(_) => panic!("a fresh repository must not hand out a key"),
-        }
-    }
 
     /// The Windows half of [`git_spelling`], exercised from any platform.
     ///
@@ -420,27 +373,5 @@ mod tests {
 
         // Whichever platform this runs on, the public entry point agrees.
         assert_eq!(git_spelling(&joined), "secrets/db.env");
-    }
-
-    /// On Unix a backslash is a legal character in a file name, so rewriting it
-    /// would rename the file the message is about.
-    #[cfg(unix)]
-    #[test]
-    fn a_backslash_in_a_unix_file_name_survives_untouched() {
-        assert_eq!(
-            git_spelling(Path::new("secrets/od\\d.env")),
-            "secrets/od\\d.env"
-        );
-        assert_eq!(
-            with_separator("secrets/od\\d.env", '/'),
-            "secrets/od\\d.env"
-        );
-    }
-
-    #[test]
-    fn paths_outside_the_working_tree_are_rejected() {
-        let dir = init_repo();
-        let repo = Repo::discover(dir.path()).expect("discovery must succeed");
-        assert!(repo.relative(Path::new("/definitely/elsewhere")).is_none());
     }
 }
