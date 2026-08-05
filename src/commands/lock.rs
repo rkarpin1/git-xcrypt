@@ -294,7 +294,7 @@ pub fn run(repo: &Repo, confirm: &mut dyn Confirm) -> Result<Outcome> {
         gitindex::object_hash(gitconfig::get(&git_config, "extensions.objectformat").as_deref());
 
     let mut walk = Walk::default();
-    let found = collect(repo, &config, &mut walk)?;
+    let found = collect(repo, &config, &mut walk, NOTHING_CHANGED)?;
     let stored = stored_ids(repo, hash, &found.selected, &found.residue)?;
 
     // Every name the first walk saw, captured before any sweep decision thins
@@ -471,6 +471,11 @@ pub fn run(repo: &Repo, confirm: &mut dyn Confirm) -> Result<Outcome> {
     // secrets are large.
     refuse_other_worktrees_with(repo, KEY_KEPT)?;
 
+    // And the tree itself, for the same window and the same reason. The gate
+    // above it reads the *index*, so it says nothing about a file that was never
+    // added — and a file created while the pass ran is exactly that.
+    refuse_if_a_declared_file_appeared(repo, &config, &surveyed_names)?;
+
     // Last, and only once every file above is ciphertext. A failure before this
     // point leaves the key in place, so re-running finishes the job.
     remove_key(repo, &mut report)?;
@@ -593,7 +598,7 @@ fn refuse_other_worktrees_with(repo: &Repo, tail: &str) -> Result<()> {
 /// contain, used to read as a file that "appeared" between the two walks.
 fn refuse_if_the_tree_moved(repo: &Repo, config: &Config, before: &[Vec<u8>]) -> Result<()> {
     let mut walk = Walk::default();
-    let now = collect(repo, config, &mut walk)?;
+    let now = collect(repo, config, &mut walk, NOTHING_CHANGED)?;
 
     let mut after: Vec<&[u8]> = now
         .selected
@@ -614,6 +619,57 @@ fn refuse_if_the_tree_moved(repo: &Repo, config: &Config, before: &[Vec<u8>]) ->
          has been kept; run lock again."
             .into(),
     ))
+}
+
+/// Refuses when a declared file appeared while the encryption pass was running.
+///
+/// The check above this one asks the same question of the *prompt*, and stops
+/// being able to answer it the moment the pass starts. The pass is not an
+/// instant: it reads, encrypts and rewrites every declared file, so it lasts as
+/// long as the secrets are large — minutes for a repository of big ones. A file
+/// created in that time is in no list this command holds, is not in the index
+/// either, and so is invisible to both gates that ran before it.
+///
+/// Measured on git 2.55, 2026-08-05, 4000 declared files: `printf … >
+/// secrets/late.env` once the pass had demonstrably started took `lock --yes` to
+/// exit **0**, "4000 file(s) are now encrypted and key 4ddee64b4e99741c has been
+/// deleted", with `secrets/late.env` reading `BRAND_NEW=hunter3` and no key left
+/// to close it.
+///
+/// **Additions only, which is what makes it safe to run here.** A name that
+/// disappeared is not a plaintext left behind — the sweep removes residue by
+/// design, and a deleted file holds nothing — so comparing whole sets would
+/// refuse over this command's own work. Only a name that was not there when the
+/// survey looked can hide an unexamined secret.
+fn refuse_if_a_declared_file_appeared(
+    repo: &Repo,
+    config: &Config,
+    before: &[Vec<u8>],
+) -> Result<()> {
+    let mut walk = Walk::default();
+    let now = collect(repo, config, &mut walk, KEY_KEPT)?;
+
+    let mut appeared: Vec<String> = now
+        .selected
+        .iter()
+        .chain(&now.residue)
+        .filter(|file| before.binary_search(&file.name).is_err())
+        .map(|file| git_spelling(&file.relative))
+        .collect();
+    if appeared.is_empty() {
+        return Ok(());
+    }
+
+    appeared.sort();
+    appeared.dedup();
+    Err(Error::Config(format!(
+        "refusing to delete the key: {} declared file(s) appeared while lock was \
+         encrypting, so nothing has looked at them and they are still in the \
+         clear — {}. Commit them, or take them out of the declaration, and run \
+         lock again. {KEY_KEPT}",
+        appeared.len(),
+        appeared.join(", ")
+    )))
 }
 
 /// Refuses while a declared file the index tracks still holds plain text.
@@ -884,21 +940,23 @@ struct Walk {
 /// **A directory holding a `.git` entry is another repository and is not
 /// entered.** A submodule has its own key, its own index and its own
 /// declaration; it needs its own `lock`.
-fn collect(repo: &Repo, config: &Config, walk: &mut Walk) -> Result<Found> {
+fn collect(repo: &Repo, config: &Config, walk: &mut Walk, tail: &str) -> Result<Found> {
     let mut found = Found::default();
     let mut pending = vec![repo.work_tree().to_path_buf()];
 
     while let Some(directory) = pending.pop() {
-        let entries = fs::read_dir(&directory).map_err(|err| unverifiable(&directory, &err))?;
+        let entries =
+            fs::read_dir(&directory).map_err(|err| unverifiable_with(&directory, &err, tail))?;
 
         for entry in entries {
-            let entry = entry.map_err(|err| unverifiable(&directory, &err))?;
+            let entry = entry.map_err(|err| unverifiable_with(&directory, &err, tail))?;
             if entry.file_name() == ".git" {
                 continue;
             }
 
             let path = entry.path();
-            let metadata = fs::symlink_metadata(&path).map_err(|err| unverifiable(&path, &err))?;
+            let metadata =
+                fs::symlink_metadata(&path).map_err(|err| unverifiable_with(&path, &err, tail))?;
             if metadata.is_symlink() {
                 continue;
             }
@@ -1639,6 +1697,62 @@ mod tests {
         // What separates this from the gates that run before the pass: they
         // refuse over an untouched working tree, so a run they stopped would
         // have left the file in the clear.
+        assert!(
+            fs::read(repo.work_tree().join("secrets/db.env"))
+                .expect("reading")
+                .starts_with(&crate::format::MAGIC),
+            "an earlier gate caught this, so the window after the pass is untested"
+        );
+    }
+
+    #[test]
+    fn a_declared_file_that_appears_during_the_encryption_pass_stops_the_run() {
+        // The twin of the test above, and of the prompt-window one beside it.
+        // A file created while the pass runs is in no list this command holds —
+        // the survey never saw it, `refuse_if_the_tree_moved` ran before it
+        // existed, and the index gate that runs last reads only tracked paths,
+        // which an untracked file is not.
+        //
+        // Measured on git 2.55, 2026-08-05, 4000 declared files: written once
+        // the pass had started, `lock --yes` exited 0 reporting "4000 file(s)
+        // are now encrypted and key 4ddee64b4e99741c has been deleted", with
+        // `secrets/late.env` still reading `BRAND_NEW=hunter3`.
+        const LATE: &[u8] = b"BRAND_NEW=written-while-the-pass-ran\n";
+
+        let (dir, repo) = prepared();
+        write_and_stage(&repo, &dir, "secrets/db.env", b"hunter2\n");
+        write_and_stage(&repo, &dir, "secrets/zz-slow.bin", &vec![7u8; SLOW]);
+
+        let late = repo.work_tree().join("secrets").join("late.env");
+        let written = late.clone();
+        let meddling =
+            during_the_encryption_pass(repo.work_tree().join("secrets/db.env"), move || {
+                fs::write(&written, LATE).expect("writing the late file");
+            });
+
+        let error = run(&repo, &mut Scripted::new(true))
+            .expect_err("a secret that appeared must not be locked around");
+
+        assert!(
+            meddling.join().expect("the meddling thread"),
+            "the pass never encrypted anything, so this proves nothing about it"
+        );
+        assert_eq!(error.exit_code(), crate::exit::CONFIG);
+        assert!(
+            repo.has_key(),
+            "the key went over a file nobody checked: {error}"
+        );
+        assert_eq!(
+            fs::read(&late).expect("reading"),
+            LATE,
+            "the new file was encrypted without ever being checked"
+        );
+        assert!(
+            error.to_string().contains("late.env"),
+            "the refusal does not name what stopped it: {error}"
+        );
+        // As above: the gates that run before the pass refuse over an untouched
+        // working tree, so a run they stopped would have left this in the clear.
         assert!(
             fs::read(repo.work_tree().join("secrets/db.env"))
                 .expect("reading")
