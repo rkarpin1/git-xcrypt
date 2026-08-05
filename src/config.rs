@@ -130,6 +130,17 @@ impl Config {
     pub fn parse(text: &str) -> Result<Self> {
         let mut config = Self::default();
 
+        // A UTF-8 byte-order mark is what PowerShell 5's `Set-Content
+        // -Encoding UTF8` writes and what no editor shows. It is not
+        // whitespace to `str::trim`, and it is not `#`, so it used to reach
+        // `gix-glob` glued to the first pattern — measured: a `.git-xcrypt`
+        // starting `\u{feff}secrets/` selected nothing, `git add
+        // secrets/db.env` exited 0 and the plaintext went into the object
+        // database with no word from anyone. Git strips one at the head of its
+        // own pattern files, so this parser does the same rather than refuse a
+        // file git itself reads happily.
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+
         for (number, line) in text.lines().enumerate() {
             // Deliberately not trimmed: a pattern's own leading whitespace is
             // significant in `.gitignore`, so `split_line` is left to refuse an
@@ -774,6 +785,24 @@ mod tests {
             );
         }
         assert!(config.decide(b"anything-else").encrypt);
+    }
+
+    #[test]
+    fn a_byte_order_mark_does_not_glue_itself_to_the_first_pattern() {
+        // What PowerShell 5's `Set-Content -Encoding UTF8` writes and no editor
+        // shows. Measured before this: `\u{feff}secrets/` selected nothing,
+        // `git add secrets/db.env` exited 0 and stored the plaintext. Git
+        // strips one at the head of its own pattern files — measured on 2.55,
+        // a `.gitignore` and a `.gitattributes` each opening with a BOM still
+        // apply their first line — so the declaration follows git.
+        let parsed = config("\u{feff}secrets/\n");
+        assert!(
+            parsed.decide(b"secrets/db.env").encrypt,
+            "the invisible BOM turned the first pattern into one matching nothing"
+        );
+        // Only the head of the file: later lines are unaffected either way.
+        let parsed = config("\u{feff}first/\nsecond/\n");
+        assert!(parsed.decide(b"second/x").encrypt);
     }
 
     /// Every shape the line parser refuses, and the word that says why.
