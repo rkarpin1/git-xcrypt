@@ -311,8 +311,14 @@ fn lock_refuses_over_every_checkout_and_every_file_it_cannot_account_for() {
         .expect("stdin was piped")
         .write_all(b"yes\n")
         .expect("could not answer the prompt");
+    // The rest from the handle `read_until` is holding: `wait_with_output`
+    // cannot collect a stream that was already taken, so everything the command
+    // says *after* the prompt — the refusal itself — would otherwise be lost,
+    // and a red CI run would report an exit code with no reason attached.
+    let mut rest = Vec::new();
+    std::io::Read::read_to_end(&mut stderr, &mut rest).expect("could not read the rest");
     let finished = child.wait_with_output().expect("git-xcrypt never ended");
-    let complaint = format!("{seen}{}", String::from_utf8_lossy(&finished.stderr));
+    let complaint = format!("{seen}{}", String::from_utf8_lossy(&rest));
 
     assert_eq!(
         finished.status.code(),
@@ -326,9 +332,81 @@ fn lock_refuses_over_every_checkout_and_every_file_it_cannot_account_for() {
     repo.assert_worktree_eq("secrets/late.env", LATE);
     repo.assert_worktree_eq("secrets/db.env", PASSWORD);
 
-    // And once the tree is settled, the same command goes through — the refusal
-    // is about not knowing, not about the file.
+    // --- A whole checkout that appears while the prompt is waiting. ---------
+    //
+    // The two windows above, at once. The worktree refusal runs before the
+    // question, so it fails fast — and that leaves the same unbounded wait
+    // between the answer and the deletion, with a much larger thing able to
+    // appear in it than a file: `git worktree add` checks the new tree out
+    // *through the smudge filter*, so every declared file lands there in the
+    // clear, and the walk cannot see any of it because it walks this tree.
+    //
+    // Measured before this refusal, git 2.55: the worktree added 1.5 s into the
+    // prompt, `yes` typed at 3 s. `lock` exited **0**, reported "1 file(s) are
+    // now encrypted and key … has been deleted", and left the new checkout
+    // reading `hunter2` with no key left anywhere to close it.
     std::fs::remove_file(repo.path().join("secrets/late.env")).expect("could not remove");
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_git-xcrypt"))
+        .current_dir(repo.path())
+        .arg("lock")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("could not run git-xcrypt");
+
+    let mut stderr = child.stderr.take().expect("stderr was piped");
+    let seen = read_until(&mut stderr, "Type `yes`");
+
+    // Added after the survey, exactly as a second terminal would.
+    let late = repo.add_worktree("late");
+    assert_eq!(
+        std::fs::read(late.path().join("secrets/db.env")).expect("the new checkout has the file"),
+        PASSWORD,
+        "the fixture no longer reproduces the shape it exists to catch: the new \
+         checkout did not come out in the clear"
+    );
+
+    child
+        .stdin
+        .take()
+        .expect("stdin was piped")
+        .write_all(b"yes\n")
+        .expect("could not answer the prompt");
+    // The rest from the handle `read_until` is holding: `wait_with_output`
+    // cannot collect a stream that was already taken, so everything the command
+    // says *after* the prompt — the refusal itself — would otherwise be lost,
+    // and a red CI run would report an exit code with no reason attached.
+    let mut rest = Vec::new();
+    std::io::Read::read_to_end(&mut stderr, &mut rest).expect("could not read the rest");
+    let finished = child.wait_with_output().expect("git-xcrypt never ended");
+    let complaint = format!("{seen}{}", String::from_utf8_lossy(&rest));
+
+    assert_eq!(
+        finished.status.code(),
+        Some(2),
+        "`lock` deleted the key over a checkout that appeared while it was \
+         asking:\n{complaint}"
+    );
+    assert!(
+        key_path.is_file(),
+        "the key went while a whole checkout lay in the clear:\n{complaint}"
+    );
+    assert_eq!(
+        std::fs::read(late.path().join("secrets/db.env")).expect("reading the new checkout"),
+        PASSWORD,
+        "the late checkout was left holding plain text behind a finished command"
+    );
+    assert!(
+        complaint.contains("late"),
+        "the refusal does not name the checkout that stopped it:\n{complaint}"
+    );
+
+    // And once the tree is settled, the same command goes through — every
+    // refusal here is about not knowing, not about the file or the checkout.
+    drop(late);
+    repo.git_ok(["worktree", "prune"]);
     repo.xcrypt_ok(["lock", "--yes"]);
     assert!(
         repo.worktree_bytes("secrets/db.env").starts_with(MAGIC),

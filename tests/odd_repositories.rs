@@ -159,6 +159,59 @@ fn every_unusual_repository_gets_an_answer_and_the_right_one() {
          partial:\n{text}"
     );
 
+    // --- A sparse index, with the declared subtree collapsed out of it. -----
+    //
+    // `git sparse-checkout --cone --sparse-index` replaces a whole directory
+    // with **one** entry, so `secrets/db.env` stops existing in the index and in
+    // the working tree alike. That reads like the perfect hiding place, and the
+    // question it raises is the one this file exists for: does a gate that walks
+    // the index still answer for what it can no longer see?
+    //
+    // Measured on git 2.55, 2026-08-05, three ways. It does, and not by luck:
+    // the history scan needs no index at all, and a directory is only allowed to
+    // collapse while everything under it is **identical to `HEAD`** — so the
+    // collapsed content is exactly the content the scan already covers, and
+    // anything staged that differs forces git to expand the directory again.
+    let sparse = TestRepo::init();
+    sparse.init_xcrypt();
+    sparse.write_xcrypt_config("# nothing declared yet\n");
+    sparse.write_file("secrets/db.env", SECRET);
+    sparse.write_file("keep/readme.md", b"# in the cone\n");
+    sparse.commit_all("the leak, before anything encrypted it");
+    sparse.write_xcrypt_config("secrets/\n");
+    sparse.xcrypt_ok(["sync"]);
+    sparse.commit_all("declare it, too late");
+
+    sparse.git_ok(["sparse-checkout", "init", "--cone", "--sparse-index"]);
+    sparse.git_ok(["sparse-checkout", "set", "keep"]);
+    // The premise, not a story about one: if the subtree is still spelled out
+    // entry by entry, this section is proving nothing.
+    let listing =
+        String::from_utf8_lossy(&sparse.git_ok(["ls-files", "--sparse"]).stdout).into_owned();
+    assert!(
+        listing.lines().any(|line| line == "secrets/"),
+        "a sparse index with the declared subtree collapsed: git did not collapse \
+         it, so this configuration is no longer the one being tested:\n{listing}"
+    );
+    assert!(
+        !sparse.path().join("secrets").exists(),
+        "a sparse index with the declared subtree collapsed: the directory is \
+         still in the working tree, so nothing was excluded"
+    );
+
+    let output = sparse.xcrypt(["status"]);
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    expect(
+        "a sparse index with a leak collapsed out of it",
+        &output,
+        EXPOSED,
+    );
+    assert!(
+        text.contains("leaked in history") && text.contains("secrets/db.env"),
+        "a sparse index with a leak collapsed out of it: the finding must name \
+         the path even though the index no longer spells it:\n{text}"
+    );
+
     // --- A shallow clone, which is what CI produces by default. -------------
     //
     // Nothing is wrong with it. A history that was never fetched simply cannot

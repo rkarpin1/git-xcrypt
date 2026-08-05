@@ -365,6 +365,22 @@ pub fn run(repo: &Repo, confirm: &mut dyn Confirm) -> Result<Outcome> {
     // created 1.5 s into the prompt survived a successful lock, in the clear.
     refuse_if_the_tree_moved(repo, &config, &surveyed_names)?;
 
+    // And the worktrees again, for the same reason and against the same window.
+    // The early call fails fast, so a repository that already has a linked
+    // checkout is never asked the question at all; this one is what closes the
+    // gap between the answer and the deletion. `git worktree add` checks the new
+    // checkout out through the smudge filter, so the file lands there in the
+    // clear — and the walk above cannot see it, because it walks *this* tree.
+    //
+    // Measured on git 2.55, 2026-08-05, before this line existed: `git worktree
+    // add` run 1.5 s into the prompt, `yes` typed at 3 s. `lock` exited **0**,
+    // reported "1 file(s) are now encrypted and key … has been deleted", and
+    // left `../side/secrets/db.env` reading `AWS_SECRET=hunter2` with no key
+    // anywhere able to close it. The same shape as the file-appeared window
+    // above and as the linked-worktree refusal itself; only the two together
+    // were unguarded.
+    refuse_other_worktrees(repo)?;
+
     // The last command run before the key goes is the last chance to notice that
     // git has no filter behind the catch-all attribute — and a locked repository
     // needs it more than an unlocked one, because there the clean path is what
