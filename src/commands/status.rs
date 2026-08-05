@@ -1220,6 +1220,27 @@ fn restage(
 
     for name in std::mem::take(&mut report.in_the_clear) {
         let path = repo.work_tree().join(working_tree_path(&name));
+        // The working-tree twin of `holds_content`. The index entry says
+        // regular file, but the disk decides what `fs::read` returns, and a
+        // path replaced by a symlink since it was staged would be read through
+        // — encrypting a file no pattern declared and repointing the entry at
+        // it, while `git add` would stage the typechange instead. `lock`,
+        // `unlock` and the history walk all decline symlinks; this is the one
+        // other working-tree read. A missing file falls through to the read
+        // below, whose message already covers it.
+        if let Ok(metadata) = std::fs::symlink_metadata(&path)
+            && !metadata.is_file()
+        {
+            report.warnings.push(format!(
+                "{}: not re-staged, it is no longer a regular file on disk, so \
+                 reading it would take content from somewhere else. The index \
+                 still holds it in the clear; `git add` records what is really \
+                 there.",
+                show(&name)
+            ));
+            kept.push(name);
+            continue;
+        }
         let content = match std::fs::read(&path) {
             Ok(content) => zeroize::Zeroizing::new(content),
             Err(err) => {
@@ -1505,6 +1526,54 @@ mod tests {
         assert_eq!(
             working_tree_path(b"secrets/db.env"),
             std::path::PathBuf::from("secrets/db.env")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fix_does_not_read_through_a_symlink_that_replaced_a_declared_file() {
+        // The index-side twin of this was measured and closed (`Tracked::mode`):
+        // a tracked symlink is not content. This is the working-tree side. The
+        // index still holds a regular-file entry with the plaintext blob, but
+        // the path on disk has since been replaced by a symlink — `git add`
+        // would stage the typechange, while `--fix` used to follow the link
+        // with `fs::read`, encrypt whatever it pointed at (a file no pattern
+        // declared), repoint the entry at that ciphertext and report the path
+        // as fixed. `lock`, `unlock` and the history walk all decline symlinks;
+        // this was the one working-tree read that did not ask.
+        let (dir, repo) = prepared();
+        fs::create_dir_all(repo.work_tree().join("secrets")).expect("directories");
+        fs::write(repo.work_tree().join("secrets/db.env"), b"hunter2\n").expect("writing");
+        stage_unfiltered(&dir, "secrets/db.env");
+
+        let outside = TempDir::new().expect("temporary directory");
+        fs::write(outside.path().join("victim"), b"not the secret\n").expect("writing");
+        fs::remove_file(repo.work_tree().join("secrets/db.env")).expect("removing");
+        std::os::unix::fs::symlink(
+            outside.path().join("victim"),
+            repo.work_tree().join("secrets/db.env"),
+        )
+        .expect("linking");
+
+        let report = run(&repo, true).expect("status must succeed");
+
+        assert!(
+            report.fixed.is_empty(),
+            "a symlink was followed and reported fixed: {:?}",
+            report.fixed
+        );
+        assert_eq!(
+            report.in_the_clear,
+            vec![b"secrets/db.env".to_vec()],
+            "the path must stay reported in the clear"
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("db.env")),
+            "the skip must be said out loud: {:?}",
+            report.warnings
         );
     }
 
