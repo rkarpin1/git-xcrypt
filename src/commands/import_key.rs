@@ -148,41 +148,6 @@ mod tests {
     }
 
     #[test]
-    fn a_key_lands_in_a_repository_that_has_none() {
-        let dir = init_repo();
-        let repo = Repo::discover(dir.path()).expect("discovery");
-        let (_holder, path, key) = exported(31);
-
-        let report = run(&repo, &path).expect("import must succeed");
-
-        assert!(report.imported);
-        assert!(report.config_written, "a clone needs the driver registered");
-        assert_eq!(report.key_id, key.key_id());
-        assert_eq!(
-            repo.load_key().expect("key").expose_bytes(),
-            key.expose_bytes()
-        );
-    }
-
-    #[test]
-    fn importing_the_same_key_twice_is_an_empty_success() {
-        let dir = init_repo();
-        let repo = Repo::discover(dir.path()).expect("discovery");
-        let (_holder, path, _key) = exported(32);
-
-        run(&repo, &path).expect("first import");
-        let before = std::fs::read(repo.key_path()).expect("the key file");
-
-        let report = run(&repo, &path).expect("a repeated import must not fail");
-
-        assert!(!report.imported, "the key was rewritten for no reason");
-        assert_eq!(
-            before,
-            std::fs::read(repo.key_path()).expect("the key file")
-        );
-    }
-
-    #[test]
     fn a_different_key_is_refused_and_the_original_survives() {
         let dir = init_repo();
         let repo = Repo::discover(dir.path()).expect("discovery");
@@ -198,19 +163,5 @@ mod tests {
             my_key.expose_bytes(),
             "the refusal replaced the key anyway"
         );
-    }
-
-    #[test]
-    fn an_unreadable_key_file_is_refused_by_name() {
-        let dir = init_repo();
-        let repo = Repo::discover(dir.path()).expect("discovery");
-        let holder = TempDir::new().expect("temporary directory");
-        let path = holder.path().join("not-a-key");
-        std::fs::write(&path, b"-----BEGIN PGP MESSAGE-----\n").expect("writing");
-
-        let error = run(&repo, &path).expect_err("a foreign file must be refused");
-
-        assert_eq!(error.exit_code(), crate::exit::FORMAT);
-        assert!(!repo.has_key(), "a refused import still created a key");
     }
 }

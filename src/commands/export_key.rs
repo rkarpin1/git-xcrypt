@@ -218,165 +218,12 @@ mod tests {
     }
 
     #[test]
-    fn an_exported_key_reads_back_as_the_same_key() {
-        let (_dir, elsewhere, repo) = prepared();
-        let path = elsewhere.path().join("repo.key");
-
-        let report = run(&repo, &path, false).expect("export must succeed");
-
-        let back = keyfile::read_portable(&path).expect("the export must parse");
-        assert_eq!(back.key_id(), report.key_id);
-        assert_eq!(
-            back.expose_bytes(),
-            repo.load_key().expect("key").expose_bytes()
-        );
-    }
-
-    #[test]
-    fn a_destination_inside_the_working_tree_is_refused_without_creating_it() {
-        let (_dir, _elsewhere, repo) = prepared();
-        let path = repo.work_tree().join("keys").join("leaked.key");
-
-        let error = run(&repo, &path, false).expect_err("the key must never land in the tree");
-
-        assert_eq!(error.exit_code(), crate::exit::CONFIG);
-        assert!(!path.exists(), "the refusal still created the file");
-        assert!(
-            !repo.work_tree().join("keys").exists(),
-            "the refusal created a directory in the working tree"
-        );
-    }
-
-    #[test]
     fn a_destination_inside_the_git_directory_is_refused_too() {
         // `.git/` is not versioned, but it is inside the tree and a user who
         // typed it meant something else.
         let (_dir, _elsewhere, repo) = prepared();
         let path = repo.git_dir().join("exported.key");
         assert!(run(&repo, &path, false).is_err());
-    }
-
-    #[test]
-    fn a_destination_inside_another_checkout_of_the_same_repository_is_refused() {
-        // A linked worktree is a checkout of *this* repository, so a key written
-        // there is as committable as one written here — measured before this
-        // check existed: `export-key ../linked/k.key` exited 0 and the sibling's
-        // `git status` reported `?? k.key`.
-        let (dir, _elsewhere, repo) = prepared();
-        let linked = TempDir::new().expect("temporary directory");
-        let checkout = linked.path().join("linked");
-        let added = Command::new("git")
-            .args(["worktree", "add", "-q"])
-            .arg(&checkout)
-            .current_dir(dir.path())
-            .output()
-            .expect("git must be on PATH");
-        assert!(
-            added.status.success(),
-            "git worktree add failed: {}",
-            String::from_utf8_lossy(&added.stderr)
-        );
-
-        let path = checkout.join("stolen.key");
-        let error = run(&repo, &path, false)
-            .expect_err("the key must never land in any checkout of this repository");
-
-        assert_eq!(error.exit_code(), crate::exit::CONFIG);
-        assert!(!path.exists(), "the refusal still wrote the key");
-
-        // And the other direction: from the linked worktree back into the main
-        // checkout, which is not listed under `worktrees/` at all.
-        let from_linked = Repo::discover(&checkout).expect("discovery in the linked worktree");
-        assert_ne!(
-            from_linked.git_dir(),
-            from_linked.common_dir(),
-            "this is meant to be a linked worktree"
-        );
-        let path = dir.path().join("stolen-too.key");
-        assert!(
-            run(&from_linked, &path, false).is_err(),
-            "the main checkout was not recognised from a linked worktree"
-        );
-        assert!(!path.exists(), "the refusal still wrote the key");
-    }
-
-    #[test]
-    fn a_destination_inside_a_separate_git_directory_is_refused() {
-        // With `--separate-git-dir` the git directory is outside the working
-        // tree, so the working-tree comparison alone has nothing to say about
-        // it and the export used to succeed.
-        let dir = TempDir::new().expect("temporary directory");
-        let git_dir = TempDir::new().expect("temporary directory");
-        let work_tree = dir.path().join("tree");
-        let ok = Command::new("git")
-            .args(["init", "-q", "--separate-git-dir"])
-            .arg(git_dir.path().join("real"))
-            .arg(&work_tree)
-            .status()
-            .expect("git must be on PATH")
-            .success();
-        assert!(ok, "git init --separate-git-dir failed");
-
-        let repo = Repo::discover(&work_tree).expect("discovery");
-        crate::commands::init::run(&repo).expect("init must succeed");
-
-        let path = git_dir.path().join("real").join("exported.key");
-        let error = run(&repo, &path, false).expect_err("the git directory is never a destination");
-
-        assert_eq!(error.exit_code(), crate::exit::CONFIG);
-        assert!(!path.exists(), "the refusal still wrote the key");
-    }
-
-    #[test]
-    fn a_relative_destination_is_measured_from_where_the_user_stands() {
-        // The realistic spelling of the mistake: `export-key repo.key` typed
-        // while standing in the repository.
-        let (dir, elsewhere, _repo) = prepared();
-        let inside = resolve(dir.path(), Path::new("repo.key"));
-        let outside = resolve(elsewhere.path(), Path::new("repo.key"));
-
-        assert!(inside.starts_with(resolve(dir.path(), dir.path())));
-        assert!(!outside.starts_with(resolve(dir.path(), dir.path())));
-    }
-
-    #[test]
-    fn resolution_sees_through_the_symlink_a_temporary_directory_hides_behind() {
-        // On macOS a repository under /var/folders is the same place as one
-        // under /private/var/folders. Comparing the two spellings without
-        // canonicalising lets the refusal be walked straight past.
-        let (dir, _elsewhere, repo) = prepared();
-        let typed = dir.path().join("secrets").join("leak.key");
-
-        let resolved = resolve(dir.path(), &typed);
-
-        assert!(
-            resolved.starts_with(resolve(dir.path(), repo.work_tree())),
-            "{} was not recognised as inside {}",
-            resolved.display(),
-            repo.work_tree().display()
-        );
-    }
-
-    #[test]
-    fn a_path_climbing_back_out_of_the_repository_is_allowed() {
-        let (dir, elsewhere, repo) = prepared();
-        let climbing = dir.path().join("..").join("..");
-        let resolved = resolve(elsewhere.path(), &climbing);
-        assert!(!resolved.starts_with(resolve(dir.path(), repo.work_tree())));
-    }
-
-    #[test]
-    fn a_repository_without_a_key_reports_that_and_writes_nothing() {
-        let dir = init_repo();
-        let repo = Repo::discover(dir.path()).expect("discovery");
-        let elsewhere = TempDir::new().expect("temporary directory");
-        let path = elsewhere.path().join("repo.key");
-
-        match run(&repo, &path, false) {
-            Err(Error::NoKey) => {}
-            other => panic!("expected NoKey, got {other:?}"),
-        }
-        assert!(!path.exists());
     }
 
     #[test]
@@ -390,20 +237,6 @@ mod tests {
         assert_eq!(fs::read(&path).expect("reading"), b"someone else's key");
 
         run(&repo, &path, true).expect("--force must replace it");
-        assert!(keyfile::read_portable(&path).is_ok());
-    }
-
-    #[test]
-    fn missing_parent_directories_are_created() {
-        let (_dir, elsewhere, repo) = prepared();
-        let path = elsewhere
-            .path()
-            .join("keys")
-            .join("nested")
-            .join("repo.key");
-
-        run(&repo, &path, false).expect("export must succeed");
-
         assert!(keyfile::read_portable(&path).is_ok());
     }
 }

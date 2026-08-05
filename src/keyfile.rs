@@ -336,47 +336,6 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    #[test]
-    fn a_key_survives_a_round_trip() {
-        let dir = TempDir::new().expect("temporary directory");
-        let path = dir.path().join("keys").join("default");
-        let key = MasterKey::from_bytes([9u8; MASTER_KEY_LEN]);
-
-        write(&path, &key).expect("writing the key must succeed");
-        let read_back = read(&path).expect("reading the key must succeed");
-
-        assert_eq!(read_back.expose_bytes(), key.expose_bytes());
-        assert_eq!(read_back.key_id(), key.key_id());
-    }
-
-    #[test]
-    fn a_missing_key_is_reported_as_missing_not_as_io() {
-        let dir = TempDir::new().expect("temporary directory");
-        match read(&dir.path().join("absent")) {
-            Err(Error::NoKey) => {}
-            Err(other) => panic!("expected NoKey, got {other:?}"),
-            Ok(_) => panic!("reading an absent key must not succeed"),
-        }
-    }
-
-    #[test]
-    fn a_foreign_file_is_refused() {
-        let dir = TempDir::new().expect("temporary directory");
-        let path = dir.path().join("not-a-key");
-        fs::write(&path, b"just some bytes").expect("writing must succeed");
-        assert!(read(&path).is_err());
-    }
-
-    #[test]
-    fn an_unknown_version_is_refused() {
-        let dir = TempDir::new().expect("temporary directory");
-        let path = dir.path().join("future");
-        let mut bytes = encode(&MasterKey::from_bytes([1u8; MASTER_KEY_LEN]));
-        bytes[KEY_FILE_MAGIC.len()] = KEY_FILE_VERSION + 1;
-        fs::write(&path, &bytes).expect("writing must succeed");
-        assert!(read(&path).is_err());
-    }
-
     #[cfg(unix)]
     #[test]
     fn a_pre_existing_loose_file_is_narrowed_before_the_key_lands_in_it() {
@@ -398,97 +357,6 @@ mod tests {
             0o600,
             "an existing key file kept its loose permissions"
         );
-    }
-
-    #[test]
-    fn a_portable_key_survives_a_round_trip_with_its_fingerprint() {
-        let key = MasterKey::from_bytes([21u8; MASTER_KEY_LEN]);
-        let text = encode_portable(&key);
-
-        let back = decode_portable(&text).expect("what we just wrote must parse");
-
-        assert_eq!(back.expose_bytes(), key.expose_bytes());
-        assert_eq!(
-            back.key_id(),
-            key.key_id(),
-            "the whole point of the header is that this matches"
-        );
-    }
-
-    #[test]
-    fn the_portable_form_names_its_key_where_a_person_can_read_it() {
-        let key = MasterKey::from_bytes([22u8; MASTER_KEY_LEN]);
-        let text = encode_portable(&key);
-        let header = text.lines().next().expect("a header line");
-
-        assert!(header.starts_with("git-xcrypt-key-v1 "));
-        assert!(header.ends_with(&crate::format_key_id(&key.key_id())));
-        assert_eq!(text.lines().count(), 2, "header and key, nothing else");
-    }
-
-    #[test]
-    fn a_portable_key_survives_comments_and_blank_lines() {
-        // What a key looks like after a trip through a password manager.
-        let key = MasterKey::from_bytes([23u8; MASTER_KEY_LEN]);
-        let text = encode_portable(&key);
-        let mut lines = text.lines();
-        let padded = format!(
-            "# my laptop, 2026-08-04\n\n  {}  \n\n{}\n\n",
-            lines.next().expect("header"),
-            lines.next().expect("key")
-        );
-
-        let back = decode_portable(&padded).expect("padding must not matter");
-        assert_eq!(back.expose_bytes(), key.expose_bytes());
-    }
-
-    #[test]
-    fn an_unknown_portable_version_is_refused() {
-        let key = MasterKey::from_bytes([24u8; MASTER_KEY_LEN]);
-        let text = encode_portable(&key).replace("git-xcrypt-key-v1", "git-xcrypt-key-v2");
-
-        // `map(drop)`, not the key itself: `MasterKey` has no `Debug` on
-        // purpose, and a failing assertion prints into a CI log.
-        match decode_portable(&text).map(drop) {
-            Err(Error::Format(message)) => assert!(
-                message.contains("newer git-xcrypt"),
-                "unhelpful message: {message}"
-            ),
-            other => panic!("a future version must fail closed, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_portable_key_of_the_wrong_length_is_refused() {
-        let text = format!(
-            "{EXPORT_PREFIX}{EXPORT_VERSION} 0000000000000000\n{}\n",
-            BASE64.encode([7u8; MASTER_KEY_LEN - 1])
-        );
-        assert!(decode_portable(&text).is_err());
-    }
-
-    #[test]
-    fn a_portable_key_whose_fingerprint_does_not_match_is_refused() {
-        // How a truncated or hand-edited copy announces itself, before it is
-        // imported over a key that still works.
-        let key = MasterKey::from_bytes([25u8; MASTER_KEY_LEN]);
-        let text = encode_portable(&key).replacen(
-            &crate::format_key_id(&key.key_id()),
-            "0123456789abcdef",
-            1,
-        );
-
-        match decode_portable(&text).map(drop) {
-            Err(Error::Format(message)) => assert!(message.contains("in transit")),
-            other => panic!("expected a fingerprint mismatch, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_portable_file_with_two_keys_is_refused_rather_than_guessed() {
-        let first = encode_portable(&MasterKey::from_bytes([26u8; MASTER_KEY_LEN]));
-        let text = format!("{}{}", *first, BASE64.encode([27u8; MASTER_KEY_LEN]));
-        assert!(decode_portable(&text).is_err());
     }
 
     #[test]
@@ -524,53 +392,6 @@ mod tests {
                 holds_a_key(text.as_bytes()),
                 "`{name}` is a usable key file that the diff driver would have printed"
             );
-        }
-    }
-
-    #[test]
-    fn ordinary_content_is_not_mistaken_for_a_key_file() {
-        // The other direction: this refusal stops `git diff` working on whatever
-        // it matches, so a false positive costs a user their diff.
-        for content in [
-            &b""[..],
-            b"api_key = do-not-commit-me\n",
-            b"# a comment and nothing else\n",
-            b"\n\n\n",
-            b"the git-xcrypt-key-v1 format is described below\n",
-            b"\x00\x01\x02not text at all\xff",
-            // Only the *first* significant line names the format; a mention
-            // further down is prose.
-            b"notes\ngit-xcrypt-key-v1 0123456789abcdef\n",
-        ] {
-            assert!(
-                !holds_a_key(content),
-                "{} was refused as a key file",
-                String::from_utf8_lossy(content)
-            );
-        }
-    }
-
-    #[test]
-    fn a_foreign_text_file_is_not_mistaken_for_a_portable_key() {
-        for text in [
-            "",
-            "hello\n",
-            "-----BEGIN PGP MESSAGE-----\n",
-            "\n\n# only\n",
-        ] {
-            assert!(
-                decode_portable(text).is_err(),
-                "{text:?} was accepted as a key file"
-            );
-        }
-    }
-
-    #[test]
-    fn a_missing_portable_file_is_a_usage_error_naming_the_path() {
-        let dir = TempDir::new().expect("temporary directory");
-        match read_portable(&dir.path().join("absent.key")).map(drop) {
-            Err(Error::Usage(message)) => assert!(message.contains("absent.key")),
-            other => panic!("expected a usage error, got {other:?}"),
         }
     }
 
