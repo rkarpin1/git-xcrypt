@@ -511,11 +511,12 @@ fn two_megabytes() -> Vec<u8> {
         .collect()
 }
 
-/// The two attribute shapes that make git convert a ciphertext, and nothing else.
+/// The attribute shapes that make git convert a ciphertext, and nothing else —
+/// paired with what `git check-attr text` answers for each, so the fixture can
+/// prove it still reproduces the shape it exists to catch.
 ///
-/// Both are measured on git 2.55 against a 2 MB blob, by the only test that
-/// settles it — a byte-for-byte round trip through `git add`, `git commit`, `rm`
-/// and `git checkout`:
+/// All measured on git 2.55 by the only test that settles it — a byte-for-byte
+/// round trip through `git add`, `git commit`, `rm` and `git checkout`:
 ///
 /// * `secrets/** text` — `git check-attr text` answers `set`, 32 `CR` bytes are
 ///   eaten out of the ciphertext and the file is gone at checkout;
@@ -523,12 +524,24 @@ fn two_megabytes() -> Vec<u8> {
 ///   it is git's own rule, not an accident: an `eol` attribute promotes an
 ///   undefined `crlf_action` straight to `CRLF_TEXT_INPUT`, and only the
 ///   `CRLF_AUTO*` actions consult binary detection. Measured the same way, 39
-///   bytes short and the file gone.
+///   bytes short and the file gone;
+/// * `secrets/** text=input` — the one value besides `auto` that
+///   `git_path_check_crlf` recognises, and it converts without binary
+///   detection. It used to be read as `text=auto` and pass the gate;
+/// * `secrets/** !text` with `secrets/** crlf` — the pre-1.7.2 spelling, which
+///   git still honours whenever `text` says nothing. A bare `crlf` below a
+///   *current* managed section is neutralised by the managed `-text` (the
+///   `text` axis wins), so the dangerous shape needs `text` silenced first —
+///   the same structure as the bare-`eol=` row. It used to not be resolved at
+///   all.
 ///
-/// `-text`, `binary` and `text=auto` are exempt, at every `core.autocrlf` value.
-const DANGEROUS: [&[u8]; 2] = [
-    b"secrets/** text\n",
-    b"secrets/** !text\nsecrets/** eol=lf\n",
+/// `-text`, `binary`, `text=auto`, `text=<junk>`, `-crlf` and `crlf=auto` are
+/// exempt, at every `core.autocrlf` value.
+const DANGEROUS: [(&[u8], &str); 4] = [
+    (b"secrets/** text\n", "set"),
+    (b"secrets/** !text\nsecrets/** eol=lf\n", "unspecified"),
+    (b"secrets/** text=input\n", "input"),
+    (b"secrets/** !text\nsecrets/** crlf\n", "unspecified"),
 ];
 
 #[test]
@@ -550,7 +563,7 @@ fn a_foreign_text_line_below_the_managed_section_is_refused_before_the_file_is_l
     // never enough on its own — it only resolves paths the index already knows,
     // so on a *new* file the first warning arrives when the file is already
     // gone.
-    for foreign in DANGEROUS {
+    for (foreign, expected_text) in DANGEROUS {
         let secret = two_megabytes();
 
         let repo = TestRepo::init();
@@ -576,11 +589,7 @@ fn a_foreign_text_line_below_the_managed_section_is_refused_before_the_file_is_l
         // The premise really is the failure mode, not a story about one.
         assert_eq!(
             repo.check_attr("text", "secrets/store.p12"),
-            if foreign == DANGEROUS[0] {
-                "set"
-            } else {
-                "unspecified"
-            },
+            expected_text,
             "the fixture no longer reproduces the shape it exists to catch"
         );
 

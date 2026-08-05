@@ -969,48 +969,92 @@ fn spell_assignment(assignment: gix_attributes::AssignmentRef<'_>) -> String {
     }
 }
 
-/// Whether the resolved `text` and `eol` make git convert the stored bytes.
+/// One axis' contribution to git's `crlf_action`, before `eol` is consulted.
 ///
-/// The whole table, measured on git 2.55 with a 2 MB file whose ciphertext
-/// carries `CRLF` pairs, judged by a byte-for-byte round trip through `git add`,
-/// `git commit`, `rm` and `git checkout`:
+/// The mapping is `git_path_check_crlf`, and one function serves two
+/// attributes on purpose: git consults `text` first and, when it says nothing,
+/// falls back to the pre-1.7.2 `crlf` attribute — which it still honours.
+/// Measured on git 2.55 rather than read from the sources, on a file whose
+/// leading NUL would satisfy any binary detection: `set` and the value `input`
+/// convert unconditionally, `unset` is binary and skips `eol` entirely (the
+/// `-crlf eol=lf` row was measured untouched, like `-text`), the value `auto`
+/// keeps binary detection, and any other value is as if the attribute were not
+/// on the line at all — inert alone, promoted by a bare `eol=` exactly as
+/// `unspecified` is.
+enum CrlfAction<'a> {
+    /// `text` / `crlf`: converts on the way in, direction from `eol` and the
+    /// configuration on the way out.
+    Convert(&'a Culprit),
+    /// `text=input` / `crlf=input`: converts on the way in, writes `LF` on the
+    /// way out whatever the configuration says — measured, a blob of lone `LF`
+    /// under `text=input` checked out untouched at `core.autocrlf=true`.
+    ConvertAsInput(&'a Culprit),
+    /// `-text` / `-crlf`: no conversion, and `eol` is skipped entirely.
+    Binary,
+    /// `text=auto` / `crlf=auto`: binary detection, which our leading NUL answers.
+    Auto,
+}
+
+/// What one of the two text axes says, or `None` when it says nothing.
+fn crlf_action(resolved: Option<&Resolved>) -> Option<CrlfAction<'_>> {
+    use gix_attributes::State;
+    match resolved {
+        Some((State::Set, culprit)) => Some(CrlfAction::Convert(culprit)),
+        Some((State::Unset, _)) => Some(CrlfAction::Binary),
+        Some((State::Value(value), culprit)) => match value.as_ref().as_bstr() {
+            value if value == "auto" => Some(CrlfAction::Auto),
+            value if value == "input" => Some(CrlfAction::ConvertAsInput(culprit)),
+            _ => None,
+        },
+        Some((State::Unspecified, _)) | None => None,
+    }
+}
+
+/// Whether the resolved `text`, `crlf` and `eol` make git convert stored bytes.
 ///
-/// | `text`        | `eol`      | result                                    |
-/// | ------------- | ---------- | ----------------------------------------- |
-/// | `unset`       | any        | untouched — `-text` beats `eol`           |
-/// | `auto`        | any        | untouched — binary detection sees the NUL |
-/// | `unspecified` | unset      | untouched, at every `core.autocrlf` value |
-/// | `set`         | any        | **converted, file lost at checkout**      |
-/// | `unspecified` | `lf`/`crlf`| **converted, file lost at checkout**      |
+/// The whole table, measured on git 2.55 — the 2 MB rows by a byte-for-byte
+/// round trip through `git add`, `git commit`, `rm` and `git checkout`, the
+/// remaining rows on a NUL-led file with `CRLF` pairs and `core.autocrlf=false`,
+/// judged by the stored blob's size:
 ///
-/// The last row is the one nobody expects, and it is not an accident of the
-/// implementation — it is git's, in `convert_attrs`: an `eol` attribute promotes
-/// an undefined `crlf_action` straight to `CRLF_TEXT_INPUT`/`CRLF_TEXT_CRLF`,
-/// and only the `CRLF_AUTO*` actions consult binary detection. `-text` is
-/// exempt because git skips the `eol` attribute entirely when the action is
-/// `CRLF_BINARY`, which is exactly the guarantee the managed section buys.
+/// | `text`        | `crlf`       | `eol`      | result                               |
+/// | ------------- | ------------ | ---------- | ------------------------------------ |
+/// | `unset`       | any          | any        | untouched — `-text` beats both       |
+/// | `auto`        | any          | any        | untouched — detection sees the NUL   |
+/// | `set`         | —            | any        | **converted, file lost at checkout** |
+/// | `input`       | —            | any        | **converted** — no binary detection  |
+/// | says nothing  | `set`/`input`| any        | **converted** — the legacy fallback  |
+/// | says nothing  | `unset`      | any        | untouched — `-crlf` beats `eol` too  |
+/// | says nothing  | `auto`       | any        | untouched — detection sees the NUL   |
+/// | says nothing  | says nothing | unset      | untouched, at every `core.autocrlf`  |
+/// | says nothing  | says nothing | `lf`/`crlf`| **converted, file lost at checkout** |
+///
+/// "Says nothing" covers `unspecified` *and* any value other than `auto` and
+/// `input` — `text=junk` was measured inert alone and fatal with a bare
+/// `eol=crlf` beside it, exactly like `unspecified`. The promotion row is
+/// git's own rule, in `convert_attrs`: an `eol` attribute promotes an undefined
+/// `crlf_action` straight to `CRLF_TEXT_INPUT`/`CRLF_TEXT_CRLF`, and only the
+/// `CRLF_AUTO*` actions consult binary detection.
 ///
 /// The safe rows are as load-bearing as the dangerous ones: a gate that fires on
 /// `text=auto` or on an ordinary `core.autocrlf=true` teaches a user to ignore
 /// it, and an ignored gate protects nothing.
-fn converts(text: Option<&Resolved>, eol: Option<&Resolved>) -> EolConversion {
+fn converts(
+    text: Option<&Resolved>,
+    crlf: Option<&Resolved>,
+    eol: Option<&Resolved>,
+) -> EolConversion {
     use gix_attributes::State;
 
-    let text_state = text.map(|(state, _)| state);
-    match text_state {
-        Some(State::Set) => {
-            return EolConversion::On(text.expect("matched just above").1.clone());
+    match crlf_action(text).or_else(|| crlf_action(crlf)) {
+        Some(CrlfAction::Convert(culprit) | CrlfAction::ConvertAsInput(culprit)) => {
+            return EolConversion::On(culprit.clone());
         }
-        // `-text` and the `binary` macro. Git never converts, and never even
-        // looks at `eol`.
-        Some(State::Unset) => return EolConversion::Off,
-        // `text=auto`, and anything else a value could spell: git keeps binary
-        // detection, and the leading NUL of our magic answers it.
-        Some(State::Value(_)) => return EolConversion::Off,
-        Some(State::Unspecified) | None => {}
+        Some(CrlfAction::Binary | CrlfAction::Auto) => return EolConversion::Off,
+        None => {}
     }
 
-    // `text` unspecified. A bare `eol=` is enough on its own.
+    // Neither axis says anything. A bare `eol=` is enough on its own.
     match eol {
         Some((State::Value(value), culprit)) => {
             let value = value.as_ref().as_bstr();
@@ -1135,7 +1179,10 @@ impl AttributeResolver {
         let mut outcome = gix_attributes::search::Outcome::default();
         // Order matters: `iter_selected` yields one item per name, in this
         // order, with a placeholder where nothing matched.
-        outcome.initialize_with_selection(&collection, ["filter", "text", "eol"]);
+        // `crlf` is the pre-1.7.2 spelling of `text`, and git still consults it
+        // whenever `text` says nothing — leaving it out is how a `secrets/**
+        // crlf` line converted a ciphertext with no gate firing anywhere.
+        outcome.initialize_with_selection(&collection, ["filter", "text", "eol", "crlf"]);
 
         Self {
             search,
@@ -1177,6 +1224,17 @@ impl AttributeResolver {
         let filter = found.next();
         let text = found.next();
         let eol = found.next();
+        let crlf = found.next();
+
+        // `text=input` and `crlf=input` fix the check-out direction to `LF`
+        // whatever the configuration says — measured on git 2.55, a blob of
+        // lone `LF` under `text=input` checked out untouched at
+        // `core.autocrlf=true`. An explicit `eol=` still wins, so the override
+        // applies only where the attribute said nothing.
+        let checked_in_as_input = matches!(
+            crlf_action(text.as_ref()).or_else(|| crlf_action(crlf.as_ref())),
+            Some(CrlfAction::ConvertAsInput(_))
+        );
 
         Resolution {
             filter: filter.map_or(FilterAttribute::Unspecified, |(state, _)| match state {
@@ -1192,17 +1250,24 @@ impl AttributeResolver {
                 State::Unset => FilterAttribute::Unset,
                 State::Unspecified => FilterAttribute::Unspecified,
             }),
-            conversion: converts(text.as_ref(), eol.as_ref()),
-            eol: match eol.as_ref().map(|(state, _)| state) {
-                Some(State::Value(value)) => match value.as_ref().as_bstr() {
-                    value if value == "lf" => DeclaredEol::Lf,
-                    value if value == "crlf" => DeclaredEol::Crlf,
-                    // `eol=native` and anything else git does not recognise:
-                    // `git_path_check_eol` answers `EOL_UNSET` for them, so the
-                    // configuration decides, exactly as with no `eol=` at all.
+            conversion: converts(text.as_ref(), crlf.as_ref(), eol.as_ref()),
+            eol: {
+                let declared = match eol.as_ref().map(|(state, _)| state) {
+                    Some(State::Value(value)) => match value.as_ref().as_bstr() {
+                        value if value == "lf" => DeclaredEol::Lf,
+                        value if value == "crlf" => DeclaredEol::Crlf,
+                        // `eol=native` and anything else git does not recognise:
+                        // `git_path_check_eol` answers `EOL_UNSET` for them, so
+                        // the configuration decides, exactly as with no `eol=`
+                        // at all.
+                        _ => DeclaredEol::Unspecified,
+                    },
                     _ => DeclaredEol::Unspecified,
-                },
-                _ => DeclaredEol::Unspecified,
+                };
+                match declared {
+                    DeclaredEol::Unspecified if checked_in_as_input => DeclaredEol::Lf,
+                    declared => declared,
+                }
             },
         }
     }
@@ -1414,16 +1479,24 @@ mod tests {
         // proves the *resolution* — precedence, macros, the global file — not
         // the table in `converts`, which is settled against git's behaviour by
         // the round trips in `tests/status_command.rs`.
-        let (text, eol) = (ask("text"), ask("eol"));
-        let converts = matches!(
-            (text.as_str(), eol.as_str()),
-            ("set", _) | ("unspecified", "lf" | "crlf")
-        );
+        let (text, eol, crlf) = (ask("text"), ask("eol"), ask("crlf"));
+        // `git_path_check_crlf`, as the measured table in `converts` records it:
+        // `set` and `input` convert, `unset` and `auto` do not and stop the
+        // question, anything else defers — to the legacy `crlf` attribute
+        // first, then to the bare-`eol=` promotion.
+        let action = |value: &str| match value {
+            "set" | "input" => Some(true),
+            "unset" | "auto" => Some(false),
+            _ => None,
+        };
+        let converts = action(&text)
+            .or_else(|| action(&crlf))
+            .unwrap_or_else(|| matches!(eol.as_str(), "lf" | "crlf"));
         assert_eq!(
             matches!(ours.conversion, EolConversion::On(_)),
             converts,
-            "git says text={text} eol={eol} for {path}, and git-xcrypt read the \
-             stack differently"
+            "git says text={text} eol={eol} crlf={crlf} for {path}, and \
+             git-xcrypt read the stack differently"
         );
     }
 
@@ -1448,6 +1521,42 @@ mod tests {
             &[Source {
                 path: ".gitattributes",
                 body: &format!("{catch_all}secrets/** -filter\n"),
+            }],
+            "secrets/db.env",
+            None,
+        );
+
+        // `text=input` converts without consulting binary detection — the one
+        // value besides `auto` that `git_path_check_crlf` recognises. It used
+        // to be read as `text=auto` here, and the gate stayed silent while git
+        // ate the `CR` bytes out of the ciphertext.
+        agrees_with_git(
+            &[Source {
+                path: ".gitattributes",
+                body: &format!("{catch_all}secrets/** -text\nsecrets/** text=input\n"),
+            }],
+            "secrets/db.env",
+            None,
+        );
+
+        // The pre-1.7.2 `crlf` attribute, which git still honours whenever
+        // `text` says nothing. `text=junk` says nothing, so the fallback is
+        // what decides here.
+        agrees_with_git(
+            &[Source {
+                path: ".gitattributes",
+                body: &format!("{catch_all}secrets/** text=junk\nsecrets/** crlf\n"),
+            }],
+            "secrets/db.env",
+            None,
+        );
+
+        // And the safe side of both: `-crlf` beats a bare `eol=` exactly as
+        // `-text` does, so a gate firing here would be one shape too wide.
+        agrees_with_git(
+            &[Source {
+                path: ".gitattributes",
+                body: &format!("{catch_all}secrets/** -crlf\nsecrets/** eol=lf\n"),
             }],
             "secrets/db.env",
             None,
