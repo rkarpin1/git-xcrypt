@@ -731,12 +731,20 @@ fn references_that_cannot_be_read_fail_the_gate_instead_of_reading_as_clean() {
     repo.write_xcrypt_config("# nothing declared yet\n");
     repo.write_file("secrets/db.env", b"hunter2\n");
     repo.commit_all("leak");
-    // Declared and re-committed, so the index holds ciphertext and the only
-    // thing left to find is in history — which is exactly what the unreadable
-    // reference store hides. Without this the index carried a finding of its
-    // own and the test could not tell the two verdicts apart.
+    // Declared and re-staged through the filter, so the index holds ciphertext
+    // and the only thing left to find is in history — which is exactly what the
+    // unreadable reference store hides. Without this the index carried a finding
+    // of its own and the test could not tell the two verdicts apart.
+    //
+    // `--renormalize`, not a bare `git add -A`, and it is what makes this test
+    // deterministic: git decides from the cached stat whether to call the
+    // filter at all, so an unchanged file is re-cleaned only when the add lands
+    // inside the racy-clean window — which a loaded test run misses, leaving
+    // the plaintext staged and this test asserting 6 against an honest 5. That
+    // stat-cache skip is the measured gap `--fix` exists for.
     repo.write_xcrypt_config("secrets/\n");
     repo.xcrypt_ok(["sync"]);
+    repo.git_ok(["add", "--renormalize", "."]);
     repo.commit_all("declare");
     repo.git_ok(["pack-refs", "--all"]);
 
