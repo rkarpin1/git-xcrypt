@@ -396,6 +396,108 @@ impl TestRepo {
             "{relative_path} reached the index although the filter failed"
         );
     }
+
+    /// Sets one git configuration key locally.
+    pub fn set_config(&self, key: &str, value: &str) {
+        self.git_ok(["config", key, value]);
+    }
+
+    /// Sets the pair the smudge path reads, together.
+    ///
+    /// The two are one setting in practice — `core.eol` only gets a say while
+    /// `core.autocrlf` is false — so a helper that took one of them would invite
+    /// a matrix that never reaches the interesting half of the table.
+    pub fn set_eol_config(&self, autocrlf: &str, eol: &str) {
+        self.set_config("core.autocrlf", autocrlf);
+        self.set_config("core.eol", eol);
+    }
+
+    /// Adopts a key minted elsewhere, then sets the repository up.
+    ///
+    /// The order matters and is the one a second machine uses: the key has to be
+    /// in place before `init` looks for one, or `init` mints a second one and
+    /// every `key_id` in the headers stops matching.
+    pub fn init_xcrypt_with(&self, key: &SharedKey) {
+        self.xcrypt_ok(["import-key", &key.as_arg()]);
+        self.init_xcrypt();
+    }
+
+    /// Deletes `relative_path` and checks it back out through the smudge filter.
+    ///
+    /// The only way to observe what smudge writes: git will not re-run it for a
+    /// file it believes is already correct in the working tree.
+    pub fn recheckout(&self, relative_path: &str) {
+        fs::remove_file(self.path.join(relative_path)).expect("could not remove the file");
+        self.git_ok(["checkout", "--", relative_path]);
+    }
+
+    /// Whether the blob at `HEAD` carries our magic.
+    pub fn blob_is_encrypted(&self, relative_path: &str) -> bool {
+        self.blob_bytes(relative_path).starts_with(MAGIC)
+    }
+
+    /// Whether the stored header records that the plaintext was normalised.
+    ///
+    /// Bit 0 of the `flags` byte, at offset 13 of the frozen header. It is the
+    /// only place the text/binary verdict is observable from outside, and it is
+    /// what smudge later reads instead of asking `.git-xcrypt` again.
+    pub fn blob_records_normalisation(&self, relative_path: &str) -> bool {
+        let blob = self.blob_bytes(relative_path);
+        assert!(
+            blob.starts_with(MAGIC),
+            "{relative_path} is not encrypted, so it records no verdict"
+        );
+        blob[13] & 1 == 1
+    }
+
+    /// Fetches and merges `branch` from `remote`.
+    pub fn pull_from(&self, remote: &BareRemote, branch: &str) {
+        self.git_ok(["pull", "-q", "--ff-only", &remote.url(), branch]);
+    }
+}
+
+/// Our file header's magic, and the fixed cost of wearing it.
+pub const MAGIC: &[u8] = b"\0GITXCRYPT\0";
+
+/// Header plus synthetic IV. SIV encrypts in CTR mode, so a stored file is
+/// exactly this much longer than the plaintext that went in — which makes the
+/// length a usable assertion about *which* plaintext that was.
+pub const OVERHEAD: usize = 38;
+
+/// One repository key, minted once and carried into every repository a test
+/// needs.
+///
+/// Not a convenience. `key_id` is in the authenticated header, so two
+/// repositories that minted their own keys store different bytes for the same
+/// content — and a test comparing blobs across them would be asserting nothing
+/// while looking like it asserts determinism.
+pub struct SharedKey {
+    _dir: TempDir,
+    path: PathBuf,
+}
+
+impl SharedKey {
+    /// Mints a key in a throwaway repository and exports it.
+    pub fn minted() -> Self {
+        let dir = TempDir::new().expect("could not create a temporary directory");
+        let path = dir.path().join("shared.key");
+
+        let source = TestRepo::init();
+        source.init_xcrypt();
+        source.xcrypt_ok(["export-key", &path.to_string_lossy()]);
+
+        Self { _dir: dir, path }
+    }
+
+    /// The key file itself.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The key file as a command-line argument.
+    pub fn as_arg(&self) -> String {
+        self.path.to_string_lossy().into_owned()
+    }
 }
 
 /// Compares byte buffers and reports where they diverge.
@@ -463,6 +565,28 @@ impl BareRemote {
     /// The URL a push or clone should use.
     pub fn url(&self) -> String {
         self.path.display().to_string()
+    }
+
+    /// The bare repository's own directory.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Runs `git-xcrypt` **inside** the bare repository.
+    ///
+    /// A hosting service's own directory is a git repository with no working
+    /// tree, and every command here filters, encrypts or decrypts one. Running
+    /// them there has to end in a refusal rather than a panic or a guess.
+    pub fn xcrypt<I, S>(&self, args: I) -> Output
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        Command::new(BIN)
+            .current_dir(&self.path)
+            .args(args)
+            .output()
+            .expect("could not run git-xcrypt")
     }
 
     /// Raw bytes of the blob this repository stores for `relative_path`.
