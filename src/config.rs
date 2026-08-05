@@ -183,6 +183,14 @@ impl Config {
     ///
     /// [`Error::Io`] when the file exists but cannot be read, [`Error::Config`]
     /// when it cannot be understood.
+    ///
+    /// The failure names the file, which is not decoration on this path. It is
+    /// reached from the filter, so every git operation in the repository stops
+    /// until it is fixed, and git's own accompanying `fatal:` line names whatever
+    /// file it was cleaning when this one could not be read — measured on git
+    /// 2.55, that was an innocent `secrets/db.env`. A bare
+    /// `stream did not contain valid UTF-8` beside it left nothing pointing at
+    /// the real culprit.
     pub fn load(path: &std::path::Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
             Ok(text) => Self::parse(&text),
@@ -190,7 +198,21 @@ impl Config {
                 missing: true,
                 ..Self::default()
             }),
-            Err(err) => Err(Error::Io(err)),
+            // The kind is spelled out rather than passed through: `read_to_string`
+            // reports "not valid UTF-8" for a file that is perfectly readable and
+            // simply is not text, and patterns are text. Saying so is the
+            // difference between a remedy and a puzzle.
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
+                Err(Error::Io(std::io::Error::other(format!(
+                    "{}: this file must be UTF-8 text and is not ({err}), so \
+                     nothing here declares what to encrypt",
+                    path.display()
+                ))))
+            }
+            Err(err) => Err(Error::Io(std::io::Error::other(format!(
+                "{}: could not be read ({err})",
+                path.display()
+            )))),
         }
     }
 
@@ -403,6 +425,42 @@ mod tests {
 
     fn config(text: &str) -> Config {
         Config::parse(text).expect("the test configuration must parse")
+    }
+
+    #[test]
+    fn a_declaration_file_that_is_not_text_names_itself_in_the_refusal() {
+        // Patterns are text, so a `.git-xcrypt` holding a stray byte cannot be
+        // read — correctly, and this half is not in question: the check-in path
+        // refuses and git aborts, which is what "fail closed" means here.
+        //
+        // What was in question is whether anyone can find out why. The refusal
+        // was `i/o failure: stream did not contain valid UTF-8`, naming no file
+        // at all, while git's own line beside it named whichever file it happened
+        // to be cleaning — measured on git 2.55, `fatal: secrets/db.env: clean
+        // filter 'git-xcrypt' failed` over a `secrets/db.env` that was perfectly
+        // fine. Every git operation in the repository is dead in that state and
+        // the only two messages point at the wrong file, so a user has nothing to
+        // go on. Every other reader in this crate — `keyfile`, `gitconfig`,
+        // `atomic`, `lock`, `status` — puts the path in front of the failure.
+        //
+        // Reachable on any platform, since this is the file's *content*; the
+        // reason to write such a pattern is a Linux one, where a file name may be
+        // any byte string and a negation has to be able to spell it.
+        let dir = tempfile::TempDir::new().expect("temporary directory");
+        let path = dir.path().join(CONFIG_FILE);
+        std::fs::write(&path, b"secrets/\n!secrets/pa\xffssword.env\n").expect("writing");
+
+        let error = Config::load(&path).expect_err("a file that is not text must not load");
+
+        let message = error.to_string();
+        assert!(
+            message.contains(CONFIG_FILE),
+            "the refusal names no file, so nothing says which one to look at: {message}"
+        );
+        assert!(
+            message.contains("UTF-8"),
+            "the refusal must still say what is wrong with it: {message}"
+        );
     }
 
     #[test]
