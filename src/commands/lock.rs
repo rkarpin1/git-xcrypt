@@ -459,6 +459,18 @@ pub fn run(repo: &Repo, confirm: &mut dyn Confirm) -> Result<Outcome> {
     // done what it is about to promise.
     refuse_if_a_declared_file_is_still_open(repo, &config, hash)?;
 
+    // And the checkouts one last time, because the encryption pass is a window
+    // of its own. The call before it closes the prompt; this one closes the work.
+    // Measured on git 2.55, 2026-08-05, 4000 declared files: `git worktree add`
+    // run once the pass had demonstrably started (the first file on disk was
+    // already ciphertext) took `lock --yes` to exit **0**, "4000 file(s) are now
+    // encrypted and key … has been deleted", with `../side/secrets/s1.env`
+    // reading `AWS_SECRET=hunter2-1` and no key left anywhere to close it. The
+    // same shape as the prompt window, on the other side of the answer — and
+    // unbounded in the same practical sense, since the pass is as long as the
+    // secrets are large.
+    refuse_other_worktrees_with(repo, KEY_KEPT)?;
+
     // Last, and only once every file above is ciphertext. A failure before this
     // point leaves the key in place, so re-running finishes the job.
     remove_key(repo, &mut report)?;
@@ -506,13 +518,24 @@ pub fn run(repo: &Repo, confirm: &mut dyn Confirm) -> Result<Outcome> {
 /// *widen* a refusal, so a short one costs nothing, while a short list here is
 /// what deletes the key.
 fn refuse_other_worktrees(repo: &Repo) -> Result<()> {
+    refuse_other_worktrees_with(repo, NOTHING_CHANGED)
+}
+
+/// [`refuse_other_worktrees`], with the sentence that is true where it is asked.
+///
+/// The question is the same on both sides of the encryption pass; what a refusal
+/// may claim about the repository is not. Before the pass nothing has been
+/// written, after it some files are ciphertext — and a refusal that says
+/// "nothing has been changed" over a half-converted working tree is the kind of
+/// wording this module treats as part of the safeguard rather than as decoration.
+fn refuse_other_worktrees_with(repo: &Repo, tail: &str) -> Result<()> {
     let mut others = Vec::new();
 
     let registrations = repo.common_dir().join("worktrees");
     match fs::read_dir(&registrations) {
         Ok(entries) => {
             for entry in entries {
-                let entry = entry.map_err(|err| unverifiable(&registrations, &err))?;
+                let entry = entry.map_err(|err| unverifiable_with(&registrations, &err, tail))?;
                 let registration = entry.path();
                 if same_path(&registration, repo.git_dir()) {
                     continue;
@@ -523,7 +546,7 @@ fn refuse_other_worktrees(repo: &Repo) -> Result<()> {
         // The ordinary case: a repository that has never had a linked worktree
         // has no such directory at all.
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(unverifiable(&registrations, &err)),
+        Err(err) => return Err(unverifiable_with(&registrations, &err, tail)),
     }
 
     // And, when this *is* a linked worktree, the main checkout — which is not
@@ -551,7 +574,7 @@ fn refuse_other_worktrees(repo: &Repo) -> Result<()> {
          Locking only this one would leave their files in the clear with no key left \
          to close them. Lock each checkout first, or remove it with \
          `git worktree remove`; if one of them is already gone, `git worktree prune` \
-         clears the registration. Nothing has been changed.",
+         clears the registration. {tail}",
         others.len()
     )))
 }
@@ -940,11 +963,28 @@ fn collect(repo: &Repo, config: &Config, walk: &mut Walk) -> Result<Found> {
     Ok(found)
 }
 
+/// The closing sentence of a refusal made before anything has been written.
+const NOTHING_CHANGED: &str = "Nothing has been changed.";
+
+/// The closing sentence of a refusal made on the far side of the encryption pass.
+///
+/// Everything before the pass can truthfully say nothing moved; everything after
+/// it cannot, and the difference is what tells a reader whether to expect a
+/// half-converted working tree. Running `lock` again from either state finishes
+/// the job — a file that is already ciphertext is skipped.
+const KEY_KEPT: &str = "The key has been kept and every file lock did encrypt is \
+                        encrypted; nothing else has changed.";
+
 /// The refusal for anything that stops `lock` proving its own promise.
 fn unverifiable(path: &Path, err: &std::io::Error) -> Error {
+    unverifiable_with(path, err, NOTHING_CHANGED)
+}
+
+/// [`unverifiable`], with the sentence that is true where it is raised.
+fn unverifiable_with(path: &Path, err: &std::io::Error, tail: &str) -> Error {
     Error::Config(format!(
         "{}: lock cannot promise this working tree holds no plaintext, because this \
-         path could not be read ({err}). Nothing has been changed.",
+         path could not be read ({err}). {tail}",
         path.display()
     ))
 }
@@ -1515,6 +1555,95 @@ mod tests {
             fs::read(repo.work_tree().join("secrets/db.env")).expect("reading"),
             b"hunter2\n",
             "the run wrote something despite refusing"
+        );
+    }
+
+    /// A file large enough that encrypting it outlasts anything a test does.
+    ///
+    /// The synchronisation is the pass's own output, not a timer: the meddling
+    /// thread waits until the first declared file on disk really is ciphertext,
+    /// which cannot happen before both pre-flight gates have passed. What the
+    /// megabyte buys is only the margin on the other side — a debug build cleans
+    /// roughly 2 MiB a second, so the write that follows the signal lands a
+    /// thousandfold inside the window rather than racing it.
+    const SLOW: usize = 1 << 20;
+
+    /// Waits for `path` to become ciphertext, then runs `meddle`.
+    ///
+    /// Gives up rather than hanging: a run that refuses before it ever encrypts
+    /// anything must fail the assertions below, not the CI job's timeout.
+    fn during_the_encryption_pass(
+        path: PathBuf,
+        meddle: impl FnOnce() + Send + 'static,
+    ) -> std::thread::JoinHandle<bool> {
+        std::thread::spawn(move || {
+            for _ in 0..30_000 {
+                if fs::read(&path).is_ok_and(|bytes| bytes.starts_with(&crate::format::MAGIC)) {
+                    meddle();
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            false
+        })
+    }
+
+    #[test]
+    fn a_checkout_that_appears_during_the_encryption_pass_stops_the_run() {
+        // The window the prompt refusal does not cover. `refuse_other_worktrees`
+        // ran before the question and once after it, and then the command spent
+        // the whole encryption pass — as long as the secrets are large — with
+        // nothing looking at the other checkouts again.
+        //
+        // Measured on git 2.55, 2026-08-05, 4000 declared files: `git worktree
+        // add` once the pass had started took `lock --yes` to exit 0, "4000
+        // file(s) are now encrypted and key … has been deleted", leaving
+        // `../side/secrets/s1.env` reading `AWS_SECRET=hunter2-1` with no key
+        // anywhere able to close it.
+        //
+        // The registration is written by hand rather than by `git worktree add`,
+        // for one reason and with one consequence. The reason: `init` registers
+        // the *test* binary as the filter here, so a real checkout cannot be made
+        // in this process. The consequence: what this proves is that the gate is
+        // consulted after the pass — that a real `git worktree add` produces this
+        // exact directory, and that the checkout comes out in the clear, is what
+        // `tests/lock_unlock.rs` measures for the prompt window.
+        let (dir, repo) = prepared();
+        write_and_stage(&repo, &dir, "secrets/db.env", b"hunter2\n");
+        write_and_stage(&repo, &dir, "secrets/zz-slow.bin", &vec![7u8; SLOW]);
+
+        let registration = repo.common_dir().join("worktrees").join("side");
+        let meddling =
+            during_the_encryption_pass(repo.work_tree().join("secrets/db.env"), move || {
+                fs::create_dir_all(&registration).expect("the registration directory");
+                fs::write(registration.join("gitdir"), b"/somewhere/side/.git\n")
+                    .expect("the back-pointer");
+            });
+
+        let error = run(&repo, &mut Scripted::new(true))
+            .expect_err("a checkout that appeared must not be locked around");
+
+        assert!(
+            meddling.join().expect("the meddling thread"),
+            "the pass never encrypted anything, so this proves nothing about it"
+        );
+        assert_eq!(error.exit_code(), crate::exit::CONFIG);
+        assert!(
+            repo.has_key(),
+            "the key went while another checkout read it: {error}"
+        );
+        assert!(
+            error.to_string().contains("other checkout"),
+            "the refusal does not say what stopped it: {error}"
+        );
+        // What separates this from the gates that run before the pass: they
+        // refuse over an untouched working tree, so a run they stopped would
+        // have left the file in the clear.
+        assert!(
+            fs::read(repo.work_tree().join("secrets/db.env"))
+                .expect("reading")
+                .starts_with(&crate::format::MAGIC),
+            "an earlier gate caught this, so the window after the pass is untested"
         );
     }
 
