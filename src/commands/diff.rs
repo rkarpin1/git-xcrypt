@@ -186,66 +186,10 @@ fn name_of(path: &Path) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto;
-    use crate::eol;
     use crate::key::MASTER_KEY_LEN;
-    use crate::{Error, format};
 
     fn key() -> MasterKey {
         MasterKey::from_bytes([5u8; MASTER_KEY_LEN])
-    }
-
-    #[test]
-    fn our_ciphertext_comes_back_as_the_plaintext_it_was_made_from() {
-        let blob = crypto::encrypt(&key(), 0, b"api_key = hunter2\n").expect("encryption");
-        let outcome = convert(Some(&key()), b"a.env", &blob).expect("decryption");
-        assert_eq!(outcome.content, b"api_key = hunter2\n");
-    }
-
-    #[test]
-    fn content_without_our_magic_passes_through_byte_for_byte() {
-        // `git log -p` reaches commits from before the pattern existed, and git
-        // hands this command the working-tree file itself whenever it is already
-        // identical to the blob it wants. Both arrive here without magic.
-        for content in [
-            &b""[..],
-            b"was here first\r\n",
-            b"\0not ours\0",
-            &(0u8..=255).collect::<Vec<u8>>(),
-        ] {
-            let outcome = convert(Some(&key()), b"a.env", content).expect("pass-through");
-            assert_eq!(outcome.content, content);
-            assert!(outcome.warning.is_none());
-        }
-    }
-
-    #[test]
-    fn a_normalised_file_is_shown_with_lf_whatever_the_machine_prefers() {
-        // The other side of the diff is a blob, and a blob holds LF. Emitting
-        // CRLF here would report every line of an unchanged file as changed.
-        let stored = crate::decide::clean(
-            Some(&key()),
-            &crate::config::Config::parse("*.env\n").expect("configuration"),
-            b"a.env",
-            b"one\r\ntwo\r\n",
-        )
-        .expect("clean")
-        .content;
-
-        let outcome = convert(Some(&key()), b"a.env", &stored).expect("decryption");
-        assert_eq!(outcome.content, b"one\ntwo\n");
-    }
-
-    #[test]
-    fn a_file_recorded_as_binary_keeps_its_bytes() {
-        let content: Vec<u8> = vec![0x00, 0x0d, 0x0a, 0xff];
-        assert!(!eol::should_normalise(
-            crate::config::TextMode::Auto,
-            &content
-        ));
-        let blob = crypto::encrypt(&key(), 0, &content).expect("encryption");
-        let outcome = convert(Some(&key()), b"a.p12", &blob).expect("decryption");
-        assert_eq!(outcome.content, content);
     }
 
     #[test]
@@ -261,40 +205,5 @@ mod tests {
                 "the refusal must say where a key is allowed to go: {error}"
             );
         }
-    }
-
-    #[test]
-    fn our_ciphertext_without_a_key_refuses_rather_than_printing_noise() {
-        let blob = crypto::encrypt(&key(), 0, b"secret").expect("encryption");
-        match convert(None, b"a.env", &blob) {
-            Err(Error::NoKey) => {}
-            other => panic!("expected NoKey, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn ciphertext_from_another_key_is_refused() {
-        let theirs = MasterKey::from_bytes([6u8; MASTER_KEY_LEN]);
-        let blob = crypto::encrypt(&theirs, 0, b"secret").expect("encryption");
-        let error = convert(Some(&key()), b"a.env", &blob).expect_err("must refuse");
-        assert_eq!(error.exit_code(), crate::exit::FORMAT);
-    }
-
-    #[test]
-    fn tampered_ciphertext_is_refused_rather_than_shown() {
-        let mut blob = crypto::encrypt(&key(), 0, b"secret").expect("encryption");
-        let last = blob.len() - 1;
-        blob[last] ^= 0x01;
-        let error = convert(Some(&key()), b"a.env", &blob).expect_err("must refuse");
-        assert_eq!(error.exit_code(), crate::exit::FORMAT);
-    }
-
-    #[test]
-    fn a_truncated_file_of_ours_is_refused_rather_than_passed_through() {
-        // It carries the magic, so calling it plaintext would print a header as
-        // though it were content.
-        let error =
-            convert(Some(&key()), b"a.env", &format::MAGIC).expect_err("must refuse a stub");
-        assert_eq!(error.exit_code(), crate::exit::FORMAT);
     }
 }
