@@ -209,6 +209,15 @@ differently:
   key will ever bring it back. This is what the managed `-text` prevents, and
   why `sync` belongs in your workflow rather than being cosmetic.
 
+  **Since 2026-08-05 the filter refuses this outright**, so the sentence above
+  describes what *would* happen rather than what does. Git converts the filter's
+  output, which means that when the filter is asked, nothing is damaged yet: it
+  resolves the same attribute stack `status` does, and answers `git add` with an
+  error naming the file and line number of the line that outranks the managed
+  `-text`. With `required = true` the `git add` stops there and no blob is
+  written. A refused commit is the cheapest outcome available; the alternative
+  was a file nobody can decrypt again.
+
 `git-xcrypt status` resolves both attributes for every declared path the index
 holds, using git's own precedence rules, macros included, and fails with exit `2`
 either way — both are setup gaps, and the remedy is the attribute line — the report names the winning line and the file and line number it
@@ -223,7 +232,9 @@ readable `git diff` and touches no stored byte. `status` does not fail over it.
 
 The boundary: only paths the index already tracks are resolved. A line that
 would disable the filter for a file nobody has committed yet is reported as a
-note, not a finding.
+note, not a finding — which is exactly why the conversion half of this lives in
+the filter as well. On a brand-new file `status` has nothing to resolve and
+exits 0, and the first thing that would have told you was the failed checkout.
 
 ## Known limitations
 
