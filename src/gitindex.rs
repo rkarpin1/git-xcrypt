@@ -24,11 +24,22 @@
 //! git keeps the one it was added under, the directory keeps the one on disk.
 //! Measured on git 2.55/APFS — a file added as `secret.env` and renamed to
 //! `SECRET.env` reads as untracked here, and an NFD name on disk does not match
-//! the NFC name in the index. The consequences are on the safe side for `lock`,
-//! which then refuses rather than proceeds, and both callers now notice when a
-//! name they know is tracked does not match. It is the same underlying gap as
-//! the `core.ignorecase` question recorded against `S-02`, and closing it is a
-//! decision about what a *pattern* means, not one this module can take.
+//! the NFC name in the index. Both callers notice when a name they know is
+//! tracked does not match. It is the same underlying gap as the
+//! `core.ignorecase` question recorded against `S-02`, and closing *that* is a
+//! decision about what a pattern means, not one this module can take.
+//!
+//! **Correction, 2026-08-05: the consequences were not "on the safe side for
+//! `lock`, which then refuses rather than proceeds", as this comment claimed
+//! until now.** Measured on git 2.55 and APFS: after `mv secrets Secrets` the
+//! index still said `secrets/db.env`, `git status` was clean, the working-tree
+//! walk selected nothing, and `lock --yes` printed "no file here is declared for
+//! encryption", exited 0 and deleted the key over a readable plaintext secret —
+//! the interactive path did the same after a typed `yes`. `lock` now proves the
+//! opposite by content rather than assuming it: see
+//! `commands::lock::refuse_if_a_declared_file_is_still_open`, which reads this
+//! module's listing and refuses while any declared tracked path still holds
+//! plain text on disk.
 //!
 //! Measured on git 2.55, in a clone unlocked with the right key:
 //!

@@ -268,6 +268,33 @@ pub fn lexically_normal(path: &Path) -> PathBuf {
     out
 }
 
+/// The working-tree path an index entry names, without decoding it.
+///
+/// The index spells paths as raw bytes with forward slashes, and on Unix that is
+/// what a filename is — going through a lossy `String` would turn any byte that
+/// is not UTF-8 into U+FFFD and open a file that does not exist, or worse, a
+/// different one. The same mistake was found and fixed on the filter path in the
+/// S-01 review.
+///
+/// Shared rather than spelled once per caller: `status` reads working-tree files
+/// by index name and `lock` proves them closed by index name, and two answers to
+/// "which file does this entry mean" is one answer too many. Messages take a
+/// different route — they may be lossy, and they say so.
+#[must_use]
+pub fn working_tree_path(name: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        PathBuf::from(std::ffi::OsStr::from_bytes(name))
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows filenames are UTF-16 and git spells them as UTF-8 here, so
+        // there is no lossless byte route and nothing is lost by this one.
+        PathBuf::from(String::from_utf8_lossy(name).into_owned())
+    }
+}
+
 /// The separator this platform's [`Path`] renders, and the only character it is
 /// safe to rewrite into git's spelling.
 ///

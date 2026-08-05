@@ -427,6 +427,22 @@ pub fn run(repo: &Repo, confirm: &mut dyn Confirm) -> Result<Outcome> {
         gitindex::Outcome::Skipped(why) => report.warnings.push(why),
     }
 
+    // The last thing asked before the irreversible step, and the only one asked
+    // of the *index* rather than of the walk. Everything above trusts that a
+    // walk of the working tree sees every declared file; that is true only while
+    // the two agree on how a name is spelled. Measured on git 2.55 and APFS,
+    // where they need not: `mv secrets Secrets` leaves the index saying
+    // `secrets/db.env`, the disk saying `Secrets/`, `git status` saying nothing
+    // at all — and this command saying "no file here is declared for
+    // encryption", exiting 0 with the key deleted over a plaintext secret.
+    // `src/gitindex.rs` described that case and called the outcome safe for
+    // `lock` because it "refuses rather than proceeds". It did not.
+    //
+    // Asked about content, not about spelling, so it settles nothing about what
+    // a pattern ought to mean on such a filesystem — only whether this run has
+    // done what it is about to promise.
+    refuse_if_a_declared_file_is_still_open(repo, &config, hash)?;
+
     // Last, and only once every file above is ciphertext. A failure before this
     // point leaves the key in place, so re-running finishes the job.
     remove_key(repo, &mut report)?;
@@ -538,6 +554,95 @@ fn refuse_if_the_tree_moved(repo: &Repo, config: &Config, before: &[Vec<u8>]) ->
          has been kept; run lock again."
             .into(),
     ))
+}
+
+/// Refuses while a declared file the index tracks still holds plain text.
+///
+/// The walk this command is built on reads directory entries; the index keeps
+/// whatever spelling a path was added under. On a case-insensitive filesystem —
+/// APFS, and NTFS with `core.ignorecase`, which git sets by default on both —
+/// those two can drift apart with **no signal anywhere**: after `mv secrets
+/// Secrets` the index still says `secrets/db.env`, `git status` is clean, and
+/// the walk selects nothing, because selection matches bytes. Measured on git
+/// 2.55 before this existed: `lock --yes` printed "no file here is declared for
+/// encryption", exited 0, deleted the key, and left `hunter2-secret` readable in
+/// the working tree. The interactive path did the same after a typed `yes`.
+///
+/// Asked last, after the encryption pass, because before it every declared path
+/// legitimately holds plain text — that is what the pass is for. Asked of the
+/// content rather than of the two spellings, which is what keeps it free of the
+/// open question about what a pattern means on such a filesystem: whatever the
+/// answer to that turns out to be, a command that is one statement away from
+/// "the key is gone" must not make it over a file it can still read.
+///
+/// A declared entry with nothing at its path is not a finding: a staged deletion
+/// leaves the index naming a file that is gone, and there is no plain text in a
+/// file that does not exist. Symlinks and gitlinks are skipped for the reason
+/// `gitindex::Tracked::holds_content` gives — their blob is not file content and
+/// no filter ever ran on them.
+///
+/// An index that cannot be read is a refusal too, not a pass. This is the last
+/// gate in front of an irreversible step, and "I could not check" is the one
+/// answer it must never round down.
+fn refuse_if_a_declared_file_is_still_open(
+    repo: &Repo,
+    config: &Config,
+    hash: gix_hash::Kind,
+) -> Result<()> {
+    let index_path = repo.git_dir().join("index");
+    let entries = match gitindex::list(&index_path, hash)? {
+        gitindex::Listed::Read(entries) => entries,
+        gitindex::Listed::Unavailable(why) => {
+            return Err(Error::Config(format!(
+                "{} could not be read ({why}), so lock cannot prove that every \
+                 declared file here is closed. The key has been kept and every \
+                 file it did encrypt is encrypted; nothing else has changed.",
+                index_path.display()
+            )));
+        }
+    };
+
+    let mut open: Vec<String> = Vec::new();
+    for entry in entries {
+        if !entry.holds_content() || !config.decide(&entry.path).encrypt {
+            continue;
+        }
+        let path = repo
+            .work_tree()
+            .join(crate::repo::working_tree_path(&entry.path));
+        // Only the header is needed, and reading the whole file would be a
+        // pointless copy of a secret into this process for the large ones.
+        let mut head = [0u8; crate::format::MAGIC.len()];
+        let read = match std::fs::File::open(&path) {
+            Ok(mut file) => {
+                use std::io::Read as _;
+                file.read(&mut head).unwrap_or(0)
+            }
+            // Gone from the working tree, so there is nothing here in the clear.
+            Err(_) => continue,
+        };
+        if head[..read] != crate::format::MAGIC {
+            open.push(bstr::BStr::new(&entry.path).to_string());
+        }
+    }
+
+    if open.is_empty() {
+        return Ok(());
+    }
+    open.sort();
+    Err(Error::Config(format!(
+        "refusing to delete the key: {} declared file(s) the index tracks still \
+         hold plain text in the working tree, so locking now would leave them \
+         readable with no key left to close them — {}. The usual cause is a name \
+         spelled one way in the index and another on disk, which a \
+         case-insensitive filesystem hides completely: `git ls-files` shows the \
+         index's spelling, `ls` shows the disk's. Rename the file to the \
+         spelling `git ls-files` gives, or declare it as it is on disk, then run \
+         lock again. The key has been kept and every file lock did encrypt is \
+         encrypted.",
+        open.len(),
+        open.join(", ")
+    )))
 }
 
 /// Writes the managed section only when the catch-all line is missing entirely.

@@ -1290,7 +1290,7 @@ fn restage(
     let mut kept: Vec<Vec<u8>> = Vec::new();
 
     for name in std::mem::take(&mut report.in_the_clear) {
-        let path = repo.work_tree().join(working_tree_path(&name));
+        let path = repo.work_tree().join(crate::repo::working_tree_path(&name));
         // The working-tree twin of `holds_content`. The index entry says
         // regular file, but the disk decides what `fs::read` returns, and a
         // path replaced by a symlink since it was staged would be read through
@@ -1408,27 +1408,6 @@ fn restage(
     report.in_the_clear.sort();
     report.fixed.sort();
     Ok(())
-}
-
-/// The working-tree path an index entry names, without decoding it.
-///
-/// The index spells paths as raw bytes with forward slashes, and on Unix that
-/// is what a filename is — going through a lossy `String` would turn any byte
-/// that is not UTF-8 into U+FFFD and open a file that does not exist, or worse,
-/// a different one. The same mistake was found and fixed on the filter path in
-/// the S-01 review; [`show`] is for messages only.
-fn working_tree_path(name: &[u8]) -> std::path::PathBuf {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt as _;
-        std::path::PathBuf::from(std::ffi::OsStr::from_bytes(name))
-    }
-    #[cfg(not(unix))]
-    {
-        // Windows filenames are UTF-16 and git spells them as UTF-8 here, so
-        // there is no lossless byte route and nothing is lost by this one.
-        std::path::PathBuf::from(String::from_utf8_lossy(name).into_owned())
-    }
 }
 
 /// Puts a path in front of an error that only knew about content.
@@ -1647,13 +1626,13 @@ mod tests {
             use std::os::unix::ffi::OsStrExt as _;
             let raw = b"secrets/bad\xff.env";
             assert_eq!(
-                working_tree_path(raw).as_os_str().as_bytes(),
+                crate::repo::working_tree_path(raw).as_os_str().as_bytes(),
                 raw,
                 "the path was decoded on its way to the filesystem"
             );
         }
         assert_eq!(
-            working_tree_path(b"secrets/db.env"),
+            crate::repo::working_tree_path(b"secrets/db.env"),
             std::path::PathBuf::from("secrets/db.env")
         );
     }
