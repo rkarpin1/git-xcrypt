@@ -78,8 +78,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      # `--no-fail-fast` is not tidiness. Without it cargo stops at the first
+      # failing test target, so a platform the work is not done on reveals one
+      # broken target per push — and each fix costs a whole CI round trip before
+      # the next unknown appears. Twice now a Windows run has ended after a
+      # single target with the rest never executed.
       - name: Test
-        run: cargo test --all-targets --locked
+        run: cargo test --all-targets --locked --no-fail-fast
 
       # `--all-targets` skips doctests; the crate has none today, and this is
       # what notices when it gains one.

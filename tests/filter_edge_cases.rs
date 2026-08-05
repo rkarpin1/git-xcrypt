@@ -316,6 +316,13 @@ fn the_declaration_can_still_be_restored_after_it_is_deleted() {
     );
 }
 
+// Unix only, and what Windows loses is covered rather than dropped: Win32 strips
+// a trailing space from a file name, so `secrets/README.md ` lands on disk — and
+// in the commit — as `secrets/README.md`, and the premise cannot be built there
+// at all. The rule itself is platform-neutral, so it is guarded everywhere by
+// `filter::tests::a_pathname_keeps_the_space_it_legally_ends_in`, which drives
+// the same `pathname=` payload straight through the request parser.
+#[cfg(unix)]
 #[test]
 fn a_file_whose_name_ends_in_a_space_is_still_encrypted() {
     // The pathname arrives as `pathname=<name>\n`; trimming more than that one

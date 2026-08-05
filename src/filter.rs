@@ -432,6 +432,27 @@ mod tests {
     }
 
     #[test]
+    fn a_pathname_keeps_the_space_it_legally_ends_in() {
+        // `trim_end()` here once matched a file against a pattern it does not
+        // match, and in the pass-through direction that stores a secret in the
+        // clear. The integration test that guards the same rule builds the file
+        // on disk, which Windows cannot do — NTFS strips a trailing space from
+        // a name — so this drives the request parser directly instead, and runs
+        // everywhere. `a.env ` is not `a.env`: the declaration is `*.env`, so a
+        // parser that trims hands back ciphertext and one that does not hands
+        // back the bytes it was given.
+        let mut reply = Vec::new();
+        let input = conversation("clean", "a.env ", b"secret\n");
+        run(&mut context(), &mut input.as_slice(), &mut reply).expect("the protocol must complete");
+        assert_eq!(
+            reply_content(&reply),
+            b"secret\n",
+            "the trailing space was trimmed, so the file matched `*.env` under a \
+             name it does not have"
+        );
+    }
+
+    #[test]
     fn a_smudge_request_comes_back_decrypted() {
         let mut context = context();
         let stored =
