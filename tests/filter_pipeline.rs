@@ -4,6 +4,7 @@ mod harness;
 
 use harness::TestRepo;
 
+#[cfg(unix)]
 const SECRET: &[u8] = b"api_key = do-not-commit-me\n";
 
 /// The whole user-facing setup, as the product promises it.

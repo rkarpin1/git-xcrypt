@@ -334,6 +334,7 @@ pub fn read_portable(path: &Path) -> Result<MasterKey> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use tempfile::TempDir;
 
     #[cfg(unix)]
