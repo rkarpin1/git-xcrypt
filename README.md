@@ -218,6 +218,20 @@ differently:
   written. A refused commit is the cheapest outcome available; the alternative
   was a file nobody can decrypt again.
 
+  **If the line arrives after the commit, the checkout says so — since
+  2026-08-05.** The refusal above has nothing left to stop there: the blob was
+  written while the attributes were still right, and it is intact. But git
+  converts on the way *out* too — the order is blob, then git's conversion, then
+  the filter — so the authentication tag is handed bytes that were never stored,
+  fails, and git reports `smudge filter git-xcrypt failed` with no file in the
+  working tree. That used to be printed as `the file has been altered`, which is
+  a false alarm at the worst possible moment: nothing is altered and nothing is
+  lost. The filter now recognises the case and prints the line number that
+  caused it, says outright that the object database is untouched, and tells you
+  to delete or narrow that line, run `sync`, and check the file out again. The
+  verdict itself is unchanged — the bytes really are not what was encrypted, so
+  they are refused, exactly as a tampered file would be.
+
 `git-xcrypt status` resolves both attributes for every declared path the index
 holds, using git's own precedence rules, macros included, and fails with exit `2`
 either way — both are setup gaps, and the remedy is the attribute line — the report names the winning line and the file and line number it
