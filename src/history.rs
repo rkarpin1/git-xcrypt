@@ -588,9 +588,30 @@ fn collect_tips(
                         // and failing the gate over one was a false alarm on a
                         // state git itself shrugs at. A reference that *is* one
                         // and will not resolve is caught when it is peeled.
-                        Err(err) => scan
-                            .notes
-                            .push(format!("a file under refs/ is not a reference ({err})")),
+                        //
+                        // **Only that one variant, though.** The other three mean
+                        // a reference exists and was *not* walked: a ref file
+                        // that could not be read, a directory traversal that
+                        // failed, a `packed-refs` line that would not parse.
+                        // Measured before this split, with `chmod 000
+                        // .git/refs/heads/leak` over a branch holding a
+                        // plain-text `secrets/db.env`: `VERDICT: no findings.`
+                        // and exit 0, under a note claiming the file "is not a
+                        // reference" when gix had said it "could not be read in
+                        // full". That is the packed-refs failure this module was
+                        // already fixed for, one file over.
+                        Err(gix_ref::file::iter::loose_then_packed::Error::ReferenceCreation {
+                            source,
+                            relative_path,
+                        }) => scan.notes.push(format!(
+                            "a file under refs/ is not a reference \
+                             ({relative_path:?}: {source})"
+                        )),
+                        Err(err) => note_unresolved(
+                            scan,
+                            "a reference under refs/",
+                            &format!("it could not be read ({err})"),
+                        ),
                     }
                 }
             }

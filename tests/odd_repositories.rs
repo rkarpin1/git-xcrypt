@@ -226,6 +226,73 @@ fn every_unusual_repository_gets_an_answer_and_the_right_one() {
     );
     std::fs::remove_file(main.path().join(".git/info/attributes")).expect("removing it again");
 
+    // --- One reference that will not parse, among others that do. -----------
+    //
+    // The store enumerates fine here; a single reference inside it does not.
+    // Every such failure used to be filed as "a file under refs/ is not a
+    // reference" — true of crash residue, which names no history, and false of
+    // the three other things that error there: a ref file that could not be
+    // read, a failed traversal, a `packed-refs` line that will not parse. Those
+    // are references that exist and were not walked. Measured with `chmod 000
+    // .git/refs/heads/leak` over a branch holding a plain-text `secrets/db.env`:
+    // `VERDICT: no findings.` and exit 0, under a note calling it "not a
+    // reference" while gix had said it "could not be read in full".
+    //
+    // Provoked through the `packed-refs` line rather than a permission bit, so
+    // the arm runs on all three platforms — the two reach the same match arm.
+    // The leak is put on a branch of its own and `HEAD` left on `main`, because
+    // `HEAD` failing is separately reported and would mask the arm under test.
+    let one_bad_ref = TestRepo::init();
+    one_bad_ref.init_xcrypt();
+    one_bad_ref.write_xcrypt_config("# nothing declared yet\n");
+    one_bad_ref.write_file("keep.txt", b"ordinary\n");
+    one_bad_ref.commit_all("main has nothing to hide");
+    one_bad_ref.git_ok(["checkout", "-q", "-b", "leak"]);
+    one_bad_ref.write_file("secrets/db.env", SECRET);
+    one_bad_ref.commit_all("the leak, reachable only from this branch");
+    one_bad_ref.git_ok(["checkout", "-q", "main"]);
+    one_bad_ref.write_xcrypt_config("secrets/\n");
+    one_bad_ref.xcrypt_ok(["sync"]);
+    one_bad_ref.commit_all("declare");
+    one_bad_ref.git_ok(["pack-refs", "--all"]);
+
+    let packed_refs = one_bad_ref.path().join(".git/packed-refs");
+    let intact = std::fs::read_to_string(&packed_refs).expect("packed-refs must be readable");
+    // Only the line naming the branch that carries the leak: everything else,
+    // `HEAD` included, still resolves, so the run turns on this one reference.
+    let corrupted: String = intact
+        .lines()
+        .map(|line| {
+            if line.ends_with("refs/heads/leak") {
+                "this line names a reference and cannot be read\n".to_string()
+            } else {
+                format!("{line}\n")
+            }
+        })
+        .collect();
+    assert_ne!(intact, corrupted, "the leak branch was not in packed-refs");
+    std::fs::write(&packed_refs, corrupted).expect("writing packed-refs");
+    expect(
+        "a repository with one unreadable reference hiding a leak",
+        &one_bad_ref.xcrypt(["status"]),
+        UNDETERMINED,
+    );
+
+    // And the shape the note is genuinely right about, so the fix above did not
+    // buy its honesty by turning crash residue into a permanently red gate:
+    // a stray file under `refs/` names no history and git shrugs at it too.
+    std::fs::write(&packed_refs, &intact).expect("restoring packed-refs");
+    std::fs::write(
+        one_bad_ref.path().join(".git/refs/heads/notes.txt"),
+        b"this is not a reference\n",
+    )
+    .expect("writing the stray file");
+    expect(
+        "a repository with crash residue under refs/",
+        &one_bad_ref.xcrypt(["status"]),
+        EXPOSED,
+    );
+
     // --- A reference store that cannot be enumerated. -----------------------
     //
     // The measured failure this section exists for: no tips means the walk
