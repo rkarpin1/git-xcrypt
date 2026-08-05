@@ -327,10 +327,26 @@ fn fold_class(pattern: &str, start: usize) -> Option<(String, usize)> {
 
     while index < bytes.len() {
         if bytes[index] == b']' {
+            // A literal `-` is a member only when nothing follows it, so the
+            // case counterparts have to slide in *before* it. Appending them
+            // after made `[a-]` render as `[a-A]` — measured on git 2.55 with
+            // `core.ignorecase=false`, that line matches `a.env` and neither
+            // `A.env` nor `-.env`, both of which the filter selects: encrypted
+            // paths with no `-text`, the half of the covering rule that costs
+            // the file. An *escaped* trailing dash stays where it is — it
+            // cannot open a range.
+            let (kept, trailing_dash) = if body.ends_with('-') && !body.ends_with("\\-") {
+                (&body[..body.len() - 1], true)
+            } else {
+                (body.as_str(), false)
+            };
             let mut out = String::with_capacity(body.len() + extra.len() + 2);
             out.push('[');
-            out.push_str(&body);
+            out.push_str(kept);
             out.push_str(&extra);
+            if trailing_dash {
+                out.push('-');
+            }
             out.push(']');
             return Some((out, index + 1));
         }
@@ -1344,7 +1360,13 @@ mod tests {
             ("a negated class folds too", "[!ab]", "[!abAB]"),
             ("…including the other spelling of it", "[^a]", "[^aA]"),
             ("a `]` first is a member", "[]a]", "[]aA]"),
-            ("a `-` last is a member", "[a-]", "[a-A]"),
+            // The counterparts land *before* the trailing dash: `[a-A]` is a
+            // reversed range to git's wildmatch and matches none of `a`, `A`,
+            // `-` — measured with `git check-attr` at `core.ignorecase=false`,
+            // while the filter's folded match selects all three.
+            ("a `-` last is a member", "[a-]", "[aA-]"),
+            ("a `-` after a range is a member", "[a-z-]", "[a-zA-Z-]"),
+            ("an escaped `-` last stays put", "[a\\-]", "[a\\-A]"),
             (
                 "a POSIX class is named, not spelled",
                 "[[:alpha:]]",
