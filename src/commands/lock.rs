@@ -297,6 +297,22 @@ pub fn run(repo: &Repo, confirm: &mut dyn Confirm) -> Result<Outcome> {
     let found = collect(repo, &config, &mut walk)?;
     let stored = stored_ids(repo, hash, &found.selected, &found.residue)?;
 
+    // Every name the first walk saw, captured before any sweep decision thins
+    // the lists. The late "did the tree move" check compares a fresh walk
+    // against this, and the fresh walk cannot know which residue was sweepable
+    // — so the two sides have to count the same things, or a *tracked* residue
+    // file (excluded from the sweep, and possibly from the selection) reads as
+    // "appeared while lock was running" and refuses for ever over a tree that
+    // never moved.
+    let mut surveyed_names: Vec<Vec<u8>> = found
+        .selected
+        .iter()
+        .chain(&found.residue)
+        .map(|file| file.name.clone())
+        .collect();
+    surveyed_names.sort_unstable();
+    surveyed_names.dedup();
+
     // The sweep is settled first, because what it takes must not then be
     // surveyed: residue is untracked by construction, so surveying it would
     // refuse every lock that has any.
@@ -347,7 +363,7 @@ pub fn run(repo: &Repo, confirm: &mut dyn Confirm) -> Result<Outcome> {
     // is not in the selection, and locking around it would delete the key over a
     // plaintext secret nobody mentioned. Measured before this check: a file
     // created 1.5 s into the prompt survived a successful lock, in the clear.
-    refuse_if_the_tree_moved(repo, &config, &selected, &residue)?;
+    refuse_if_the_tree_moved(repo, &config, &surveyed_names)?;
 
     // The last command run before the key goes is the last chance to notice that
     // git has no filter behind the catch-all attribute — and a locked repository
@@ -493,30 +509,26 @@ fn refuse_other_worktrees(repo: &Repo) -> Result<()> {
 /// selection is caught later, by the object id [`survey`] recorded; this catches
 /// the other half — a declared file that **appeared** or **vanished** meanwhile,
 /// which no per-file check can see because it was never in the list.
-fn refuse_if_the_tree_moved(
-    repo: &Repo,
-    config: &Config,
-    selected: &[Candidate],
-    residue: &[&Candidate],
-) -> Result<()> {
+///
+/// `before` is the full name set of the first walk — selection and residue
+/// candidates alike, sorted and deduplicated — and the fresh walk here is
+/// reduced to exactly the same shape. Comparing anything narrower is how a
+/// tracked residue file, which the sweep declines and the selection may not
+/// contain, used to read as a file that "appeared" between the two walks.
+fn refuse_if_the_tree_moved(repo: &Repo, config: &Config, before: &[Vec<u8>]) -> Result<()> {
     let mut walk = Walk::default();
     let now = collect(repo, config, &mut walk)?;
 
-    let mut before: Vec<&[u8]> = selected
-        .iter()
-        .map(|file| file.name.as_slice())
-        .chain(residue.iter().map(|file| file.name.as_slice()))
-        .collect();
     let mut after: Vec<&[u8]> = now
         .selected
         .iter()
         .chain(&now.residue)
         .map(|file| file.name.as_slice())
         .collect();
-    before.sort_unstable();
     after.sort_unstable();
     after.dedup();
 
+    let before: Vec<&[u8]> = before.iter().map(Vec::as_slice).collect();
     if before == after {
         return Ok(());
     }
@@ -1657,6 +1669,46 @@ mod tests {
         };
         assert!(!residue.exists(), "a decrypted leftover survived lock");
         assert_eq!(report.swept.len(), 1, "the sweep went unreported");
+    }
+
+    #[test]
+    fn a_tracked_residue_shaped_file_whose_own_name_is_not_declared_does_not_stop_lock() {
+        // Under `secrets/` the residue-shaped name is itself selected, so the
+        // existing tracked-residue test never sees this: with `*.env`, the file
+        // `a.env.git-xcrypt-….tmp` is a residue *candidate* (its target is
+        // declared) but its own name matches nothing. Being tracked, it is not
+        // sweepable — and the late "did the tree move" check used to count it on
+        // one side only, so lock refused with "the set of declared files changed
+        // while lock was running" and "run lock again", which failed identically
+        // for ever over a tree that never moved at all.
+        let (dir, repo) = prepared();
+        fs::write(repo.xcrypt_config_path(), "*.env\n").expect("declarations");
+        write_and_stage(&repo, &dir, "a.env", b"hunter2\n");
+        write_and_stage(
+            &repo,
+            &dir,
+            "a.env.git-xcrypt-0123456789abcdef.tmp",
+            b"a file the user committed\n",
+        );
+
+        let outcome = run(&repo, &mut Scripted::new(true)).expect("lock must succeed");
+
+        let Outcome::Locked(report) = outcome else {
+            panic!("lock did not run");
+        };
+        assert!(report.key_removed);
+        assert_eq!(
+            fs::read(
+                repo.work_tree()
+                    .join("a.env.git-xcrypt-0123456789abcdef.tmp")
+            )
+            .expect("reading"),
+            b"a file the user committed\n",
+            "a tracked file of the user's was touched"
+        );
+        assert!(format::looks_encrypted(
+            &fs::read(repo.work_tree().join("a.env")).expect("reading")
+        ));
     }
 
     #[test]
