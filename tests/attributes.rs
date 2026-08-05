@@ -352,8 +352,28 @@ fn two_megabytes() -> Vec<u8> {
         .collect()
 }
 
+/// The two attribute shapes that make git convert a ciphertext, and nothing else.
+///
+/// Both are measured on git 2.55 against a 2 MB blob, by the only test that
+/// settles it — a byte-for-byte round trip through `git add`, `git commit`, `rm`
+/// and `git checkout`:
+///
+/// * `secrets/** text` — `git check-attr text` answers `set`, 32 `CR` bytes are
+///   eaten out of the ciphertext and the file is gone at checkout;
+/// * `secrets/** !text` with `secrets/** eol=lf` — the one nobody expects, and
+///   it is git's own rule, not an accident: an `eol` attribute promotes an
+///   undefined `crlf_action` straight to `CRLF_TEXT_INPUT`, and only the
+///   `CRLF_AUTO*` actions consult binary detection. Measured the same way, 39
+///   bytes short and the file gone.
+///
+/// `-text`, `binary` and `text=auto` are exempt, at every `core.autocrlf` value.
+const DANGEROUS: [&[u8]; 2] = [
+    b"secrets/** text\n",
+    b"secrets/** !text\nsecrets/** eol=lf\n",
+];
+
 #[test]
-fn a_foreign_text_line_below_the_managed_section_is_caught_before_the_file_is_lost() {
+fn a_foreign_text_line_below_the_managed_section_is_refused_before_the_file_is_lost() {
     // The managed section is *current* here: `sync` has run and the `-text`
     // line is exactly right. One line below it puts `text` back on, and git
     // takes the last match.
@@ -362,66 +382,210 @@ fn a_foreign_text_line_below_the_managed_section_is_caught_before_the_file_is_lo
     // own CRLF conversion over the ciphertext, `CR` bytes are eaten out of the
     // blob, `git add` and `git commit` both exit 0, and the checkout fails the
     // authentication tag and leaves no file at all. Nobody can decrypt what was
-    // committed, ever. This is the one gap that destroys data silently, so
-    // `status` has to fail the gate over it.
-    let secret = two_megabytes();
+    // committed, ever.
+    //
+    // **Since 2026-08-05 the filter refuses instead.** Git's order leaves room
+    // for exactly that: clean runs *before* git converts, so at the moment the
+    // filter is asked, nothing is damaged yet and a `status=error` costs a
+    // refused `git add` rather than a file. `status` reporting it afterwards was
+    // never enough on its own — it only resolves paths the index already knows,
+    // so on a *new* file the first warning arrives when the file is already
+    // gone.
+    for foreign in DANGEROUS {
+        let secret = two_megabytes();
 
+        let repo = TestRepo::init();
+        repo.init_xcrypt();
+        repo.write_xcrypt_config("secrets/\n");
+        repo.xcrypt_ok(["sync"]);
+
+        // Committed while the configuration is still healthy, so there is an
+        // intact blob to prove nothing damaged it later — and so the index knows
+        // the path, which is what `status` needs to have anything to resolve.
+        repo.write_file("secrets/store.p12", &secret);
+        repo.commit_all("a secret, while the attributes are still right");
+        assert_eq!(
+            repo.blob_bytes("secrets/store.p12").len(),
+            OVERHEAD + secret.len(),
+            "the fixture did not store an intact ciphertext to begin with"
+        );
+
+        let mut attributes = repo.worktree_bytes(".gitattributes");
+        attributes.extend_from_slice(foreign);
+        repo.write_file(".gitattributes", &attributes);
+
+        // The premise really is the failure mode, not a story about one.
+        assert_eq!(
+            repo.check_attr("text", "secrets/store.p12"),
+            if foreign == DANGEROUS[0] {
+                "set"
+            } else {
+                "unspecified"
+            },
+            "the fixture no longer reproduces the shape it exists to catch"
+        );
+
+        // Touching the file is what puts it back through the filter: git's
+        // cached `stat` skips a file it considers unchanged, so the damage can
+        // only happen on a path that is cleaned again.
+        let mut modified = secret.clone();
+        modified.extend_from_slice(b"one more line\r\n");
+        repo.write_file("secrets/store.p12", &modified);
+
+        let add = repo.git(["add", "-A"]);
+        let complaint = String::from_utf8_lossy(&add.stderr).into_owned();
+        assert!(
+            !add.status.success(),
+            "`git add` stored a ciphertext git is about to convert, and exited \
+             {:?}:\n{complaint}",
+            add.status.code()
+        );
+        assert!(
+            complaint.contains("secrets/store.p12"),
+            "the refusal must name the path it is about:\n{complaint}"
+        );
+        assert!(
+            complaint.contains(".gitattributes:"),
+            "the refusal must name the file and line that outrank the managed \
+             section, or nobody can find it:\n{complaint}"
+        );
+        assert!(
+            complaint.contains("-text"),
+            "the refusal must name the attribute that prevents it:\n{complaint}"
+        );
+
+        // Nothing was stored, so nothing is lost: the intact blob is still what
+        // `HEAD` holds, and it still checks out byte for byte.
+        assert_eq!(
+            repo.blob_bytes("secrets/store.p12").len(),
+            OVERHEAD + secret.len(),
+            "the committed ciphertext was damaged after all"
+        );
+        std::fs::remove_file(repo.path().join("secrets/store.p12")).expect("could not remove");
+        repo.git_ok(["checkout", "--", "secrets/store.p12"]);
+        assert_eq!(
+            repo.worktree_bytes("secrets/store.p12"),
+            secret,
+            "the file did not survive the round trip the refusal exists to protect"
+        );
+
+        // And `status` still says so, with the exit code a CI gate reads — the
+        // refusal stops the damage, it does not repair the configuration.
+        let output = repo.xcrypt(["status"]);
+        let text = String::from_utf8_lossy(&output.stdout).into_owned();
+
+        // Code `2`, not `5`: since 2026-08-05 a setup gap is a configuration
+        // finding, and the remedy here is an attribute line, not a rotated
+        // secret. Nothing was stored in the clear over this — what it costs is
+        // the ciphertext — so the exit code and the wording have to agree.
+        assert_eq!(
+            output.status.code(),
+            Some(CONFIG_ERROR),
+            "a repository whose ciphertext git converts must fail the gate as a \
+             configuration problem:\n{text}"
+        );
+        assert!(
+            text.contains("secrets/store.p12"),
+            "the report must name the path whose ciphertext git converts:\n{text}"
+        );
+        assert!(
+            text.contains("-text"),
+            "the report must name the attribute that prevents it:\n{text}"
+        );
+    }
+}
+
+#[test]
+fn the_shapes_git_leaves_alone_never_provoke_a_refusal() {
+    // The other half, and it carries the same weight: with `required = true` a
+    // refusal blocks *every* git operation in the repository, so a predicate one
+    // shape too wide is its own outage. Every line below is ordinary — this
+    // repository has to commit, check out and round-trip exactly as it would
+    // with no foreign line at all.
     let repo = TestRepo::init();
     repo.init_xcrypt();
-    repo.write_xcrypt_config("secrets/\n");
+    // `binary` on one declared pattern, plain selection on the other, so the
+    // managed section renders both `-text` and the `-diff` variant.
+    repo.write_xcrypt_config("secrets/\nvault/  binary\n");
     repo.xcrypt_ok(["sync"]);
 
     let mut attributes = repo.worktree_bytes(".gitattributes");
-    attributes.extend_from_slice(b"secrets/** text\n");
-    repo.write_file(".gitattributes", &attributes);
-
-    repo.write_file("secrets/store.p12", &secret);
-    repo.commit_all("a secret under a foreign text line");
-
-    // The premise really is the failure mode, not a story about one.
-    assert_eq!(
-        repo.check_attr("text", "secrets/store.p12"),
-        "set",
-        "the fixture no longer puts `text` back on the declared path"
+    attributes.extend_from_slice(
+        // Every line below outranks the managed section, and every one of them
+        // is measured harmless.
+        b"# `text=auto` winning outright on a declared path: git keeps binary\n\
+          # detection, and the leading NUL of our magic answers it\n\
+          vault/** text=auto\n\
+          # a foreign driver on a path of its own is the ordinary case\n\
+          *.psd filter=lfs\n\
+          # one restating what the managed section already says\n\
+          secrets/** -text\n\
+          # and the shape that matters most: a bare `eol=`, the very assignment\n\
+          # that is fatal over a ciphertext, on a path stored in the clear,\n\
+          # where it is git doing exactly its job. `notes/` is in no declaration,\n\
+          # so a gate that asked about every file instead of every *encrypted*\n\
+          # file would refuse here and take the repository down with it.\n\
+          notes/** eol=lf\n",
     );
-    assert_ne!(
+    repo.write_file(".gitattributes", &attributes);
+    // The machine's own answer taken out of it, then put back the other way
+    // round below.
+    repo.set_eol_config("true", "");
+
+    let secret = two_megabytes();
+    repo.write_file("secrets/store.p12", &secret);
+    repo.write_file("vault/keys.bin", BINARY);
+    repo.write_file("notes/readme.txt", CRLF);
+    repo.commit_all("ordinary attribute lines everywhere");
+
+    // The premises, so this test cannot quietly stop covering what it names.
+    assert_eq!(
+        repo.check_attr("text", "vault/keys.bin"),
+        "auto",
+        "`text=auto` no longer wins on the declared path it is here to cover"
+    );
+    assert_eq!(
+        repo.check_attr("eol", "notes/readme.txt"),
+        "lf",
+        "the bare `eol=` no longer reaches the path stored in the clear"
+    );
+    assert_eq!(
+        repo.check_attr("text", "notes/readme.txt"),
+        "unspecified",
+        "something now sets `text` on that path, so it is no longer the shape \
+         that would be fatal over a ciphertext"
+    );
+
+    assert!(
+        repo.blob_is_encrypted("secrets/store.p12"),
+        "a healthy repository stopped encrypting"
+    );
+    assert!(
+        repo.blob_is_encrypted("vault/keys.bin"),
+        "the path `text=auto` reaches stopped being encrypted"
+    );
+    assert_eq!(
+        repo.blob_bytes("vault/keys.bin").len(),
+        OVERHEAD + BINARY.len(),
+        "the ciphertext under `text=auto` was converted after all"
+    );
+    assert_eq!(
         repo.blob_bytes("secrets/store.p12").len(),
         OVERHEAD + secret.len(),
-        "this test no longer reproduces the corruption it exists to catch"
+        "the ciphertext was converted after all, so one of these lines is not \
+         as harmless as it looks"
     );
-    std::fs::remove_file(repo.path().join("secrets/store.p12")).expect("could not remove");
-    repo.git(["checkout", "--", "secrets/store.p12"]);
-    assert!(
-        !repo.path().join("secrets/store.p12").is_file(),
-        "the damaged blob checked out, so the premise is gone"
-    );
+    repo.recheckout("secrets/store.p12");
+    repo.assert_worktree_eq("secrets/store.p12", &secret);
+    repo.assert_status_clean();
 
-    // And `status` has to say so, with the exit code a CI gate reads.
-    let output = repo.xcrypt(["status"]);
-    let text = String::from_utf8_lossy(&output.stdout).into_owned();
-
-    // Code `2`, not `5`: since 2026-08-05 a setup gap is a configuration
-    // finding, and the remedy here is an attribute line, not a rotated secret.
-    // Nothing was stored in the clear over this — what it costs is the
-    // ciphertext — so the exit code and the wording have to agree on that.
-    assert_eq!(
-        output.status.code(),
-        Some(CONFIG_ERROR),
-        "a repository whose ciphertext git converts must fail the gate as a \
-         configuration problem:\n{text}"
-    );
-    assert!(
-        text.contains("secrets/store.p12"),
-        "the report must name the path whose ciphertext git converts:\n{text}"
-    );
-    assert!(
-        text.contains("secrets/** text"),
-        "the report must name the winning line itself, or nobody can find it:\n{text}"
-    );
-    assert!(
-        text.contains("-text"),
-        "the report must name the attribute that prevents it:\n{text}"
-    );
+    // `core.autocrlf=input` too: the gate must not depend on the machine's
+    // line-ending configuration, because that configuration cannot reach the
+    // ciphertext at all once `-text` is on it.
+    repo.set_eol_config("input", "");
+    repo.write_file("secrets/store.p12", &secret);
+    repo.git_ok(["add", "-A"]);
+    repo.assert_status_clean();
 }
 
 /// The exit code the frozen table gives to a configuration error.

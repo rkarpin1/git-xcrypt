@@ -14,6 +14,7 @@ use bstr::ByteSlice as _;
 
 use crate::config::Config;
 use crate::decide;
+use crate::gitattributes;
 use crate::key::MasterKey;
 use crate::pktline::{self, Packet};
 use crate::repo::Repo;
@@ -40,6 +41,14 @@ pub struct Context {
     /// What [`crate::history::HeadLookup::open`] needs, kept so it can be built
     /// later.
     location: Option<Location>,
+    /// Git's own attribute stack, built on first use.
+    ///
+    /// Lazy for the same reason as `head`, and it costs more: building it walks
+    /// the working tree for every `.gitattributes` in it. A repository that
+    /// encrypts nothing must never pay for that, so it is built only when a path
+    /// is actually about to be encrypted — and then once, for the whole
+    /// operation, which is what the long-running protocol is for.
+    attributes: Option<gitattributes::AttributeResolver>,
     /// What the `HEAD` lookup answered for each path this process has seen.
     ///
     /// Both answers are kept, and the negative one matters more. One process
@@ -53,11 +62,16 @@ pub struct Context {
     answered: std::collections::HashMap<Vec<u8>, bool>,
 }
 
-/// Where this repository's objects and references live.
+/// Where this repository's objects, references and attribute sources live.
 struct Location {
     git_dir: std::path::PathBuf,
     common_dir: std::path::PathBuf,
+    work_tree: std::path::PathBuf,
     hash: gix_hash::Kind,
+    /// `core.attributesFile`, the global attribute source.
+    attributes_file: Option<std::path::PathBuf>,
+    /// `core.ignorecase`, which git applies to attribute matching too.
+    ignore_case: bool,
 }
 
 impl Context {
@@ -96,12 +110,20 @@ impl Context {
             autocrlf: crate::gitconfig::get(&git_config, "core.autocrlf"),
             core_eol: crate::gitconfig::get(&git_config, "core.eol"),
             head: None,
+            attributes: None,
             location: Some(Location {
                 git_dir: repo.git_dir().to_path_buf(),
+                // The common directory, not this worktree's: `info/attributes`
+                // is shared by every checkout — see [`gitattributes::AttributeResolver::new`].
                 common_dir: repo.common_dir().to_path_buf(),
+                work_tree: repo.work_tree().to_path_buf(),
                 hash: crate::gitindex::object_hash(
                     crate::gitconfig::get(&git_config, "extensions.objectformat").as_deref(),
                 ),
+                attributes_file: crate::gitconfig::get(&git_config, "core.attributesFile")
+                    .map(std::path::PathBuf::from),
+                ignore_case: crate::gitconfig::get(&git_config, "core.ignorecase")
+                    .is_some_and(|value| crate::gitconfig::is_true(&value)),
             }),
             answered: std::collections::HashMap::new(),
         })
@@ -139,6 +161,73 @@ impl Context {
             .is_some_and(|head| head.holds_in_the_clear(path));
         self.answered.insert(path.to_vec(), found);
         found
+    }
+
+    /// Whether git would run **its own** line-ending conversion over the
+    /// ciphertext this filter is about to hand back, and which line decides it.
+    ///
+    /// Git's order on the check-in side is `clean` → blob → git's conversion, so
+    /// the conversion lands on the filter's *output*. On a path where some other
+    /// attribute source resolves `text` to `set`, or leaves it unspecified while
+    /// a bare `eol=` is in force, that eats the `CR` bytes out of a ciphertext:
+    /// measured on git 2.55, 32 bytes gone from a 2 MB blob, `git add` and
+    /// `git commit` both exit 0, and the checkout fails the authentication tag
+    /// and leaves no file at all.
+    ///
+    /// Asked of git's own attribute stack, never of the managed section alone:
+    /// the managed `-text` is one line among many and git takes the last match,
+    /// so the only thing that answers this is a full resolution.
+    fn ciphertext_would_be_converted(&mut self, path: &[u8]) -> Option<gitattributes::Culprit> {
+        if self.attributes.is_none() {
+            let location = self.location.as_ref()?;
+            let resolver = gitattributes::AttributeResolver::new(
+                &location.work_tree,
+                &location.common_dir,
+                location.attributes_file.as_deref(),
+                location.ignore_case,
+            );
+            self.attributes = Some(resolver);
+        }
+
+        match self.attributes.as_mut()?.resolve(path).conversion {
+            gitattributes::EolConversion::On(culprit) => Some(culprit),
+            gitattributes::EolConversion::Off => None,
+        }
+    }
+
+    /// Turns that answer into the refusal git aborts the operation with.
+    ///
+    /// A refusal nobody can act on is only half of one: the stack has four
+    /// levels, and the one that outranks the rest — `$GIT_DIR/info/attributes` —
+    /// is not versioned and cannot be seen in a pull request at all. So the
+    /// message names the file, the line, the pattern and the assignment, spelled
+    /// relative to the working tree where there is one.
+    fn refuse_conversion(&self, culprit: &gitattributes::Culprit) -> Error {
+        let shown = match (&culprit.source, self.location.as_ref()) {
+            (Some(source), Some(location)) => gitattributes::Culprit {
+                source: Some(
+                    source
+                        .strip_prefix(&location.work_tree)
+                        .unwrap_or(source)
+                        .to_path_buf(),
+                ),
+                ..culprit.clone()
+            }
+            .to_string(),
+            _ => culprit.to_string(),
+        };
+
+        Error::Config(format!(
+            "git would convert this path's line endings itself, because this line \
+             outranks the managed `-text`:\n  {shown}\nThat conversion runs over \
+             the **ciphertext** this filter produces, not over the plain text: it \
+             eats the `CR` bytes out of it, `git add` and `git commit` both exit 0, \
+             and the next checkout fails the authentication tag and leaves no file \
+             at all — measured on git 2.55, 32 bytes gone from a 2 MB blob, \
+             unrecoverable with any key. Nothing has been stored, so nothing is \
+             lost. Delete or narrow that line so the managed `-text` wins, run \
+             `git-xcrypt sync`, and try again"
+        ))
     }
 
     /// Looks for `.git-xcrypt` again if it was absent when the process started.
@@ -293,9 +382,25 @@ fn serve(context: &mut Context, request: &Request, output: &mut impl Write) -> R
             // shape of mistake that once turned a 301-file checkout into 301
             // warnings. Content that already carries our magic is not a first
             // encryption either: that is a re-add of something already stored.
-            if context.config.decide(&request.pathname).encrypt
-                && !crate::format::looks_encrypted(&request.content)
+            let stored_as_ciphertext = !crate::config::is_never_encrypted(&request.pathname)
+                && context.config.decide(&request.pathname).encrypt;
+
+            // Before the encryption, not after it, and unlike the warning below
+            // this one *does* refuse. Git converts the filter's output, so what
+            // this repository is one `git add` away from is not a leaked secret
+            // but a blob nobody can ever decrypt again. At this instant nothing
+            // is damaged yet: with `required = true` a `status=error` costs a
+            // refused `git add`, which is the cheapest outcome on offer. The
+            // question is asked only of a path that is genuinely about to become
+            // ciphertext — a path stored in the clear is git's to convert, and
+            // refusing over that would be an outage in a healthy repository.
+            if stored_as_ciphertext
+                && let Some(culprit) = context.ciphertext_would_be_converted(&request.pathname)
             {
+                return Err(context.refuse_conversion(&culprit));
+            }
+
+            if stored_as_ciphertext && !crate::format::looks_encrypted(&request.content) {
                 first_encryption = Some(request.pathname.clone());
             }
             decide::clean(
@@ -375,8 +480,13 @@ mod tests {
             core_eol: None,
             // No repository behind these unit tests, so there is nothing for the
             // first-encryption warning to look in; `head_holds_in_the_clear`
-            // answers `false` and the protocol is exercised on its own.
+            // answers `false` and the protocol is exercised on its own. The
+            // conversion check needs `location` for the same reason and skips
+            // itself without it — what it does when there *is* a repository is
+            // a question only a real git can answer, and
+            // `tests/attributes.rs` asks it there.
             head: Some(None),
+            attributes: None,
             location: None,
             answered: std::collections::HashMap::new(),
         }
