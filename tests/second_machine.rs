@@ -71,6 +71,40 @@ fn a_clone_becomes_a_working_second_machine_and_its_edits_come_home() {
     let key_file = courier.path().join("repo.key");
     first.xcrypt_ok(["export-key", &key_file.to_string_lossy()]);
 
+    // The wrong one first, which is what a directory of exported keys makes
+    // easy. Every file here is encrypted under a `key_id` this key does not
+    // answer for, and the command has to find that out *before* it writes
+    // anything: an unlock that installed the key and then gave up would leave a
+    // repository whose `.git/config` says one thing and whose blobs say another,
+    // and the next commit would be made under a key that decrypts nothing.
+    let stranger = TestRepo::init();
+    stranger.init_xcrypt();
+    let wrong_key = courier.path().join("some-other-project.key");
+    stranger.xcrypt_ok(["export-key", &wrong_key.to_string_lossy()]);
+
+    let before = second.worktree_bytes("secrets/db.env");
+    let refused = second.xcrypt(["unlock", &wrong_key.to_string_lossy()]);
+    let complaint = String::from_utf8_lossy(&refused.stderr).into_owned();
+    assert_eq!(
+        refused.status.code(),
+        Some(4),
+        "unlocking with a key from another repository was not refused:\n{complaint}"
+    );
+    assert!(
+        complaint.contains("secrets/db.env"),
+        "the refusal must name the file it stopped on:\n{complaint}"
+    );
+    assert_eq!(
+        second.worktree_bytes("secrets/db.env"),
+        before,
+        "a refused unlock still rewrote a file"
+    );
+    assert!(
+        !second.path().join(".git/git-xcrypt/keys/default").exists(),
+        "a refused unlock installed the wrong key anyway"
+    );
+    second.assert_status_clean();
+
     second.xcrypt_ok(["unlock", &key_file.to_string_lossy()]);
 
     second.assert_worktree_eq("secrets/db.env", FIRST);
@@ -126,4 +160,67 @@ fn a_clone_becomes_a_working_second_machine_and_its_edits_come_home() {
     // the first one wrote before the key ever travelled.
     second.git_ok(["checkout", "-q", "HEAD~1", "--", "secrets/db.env"]);
     second.assert_worktree_eq("secrets/db.env", FIRST);
+}
+
+/// A second machine set up from a repository whose `.gitattributes` never
+/// reached a commit — and which therefore has to be repaired on arrival.
+///
+/// `init` writes that file but does not commit it, so a project set up with a
+/// selective `git add`, or with `.gitattributes` in somebody's global ignore
+/// file, reaches its clones without the `* filter=git-xcrypt` line. Registering
+/// the driver in the clone is not enough on its own: git treats a missing
+/// attribute exactly like a missing driver, so the next commit stored the very
+/// plaintext `unlock` had just written into the working tree — exit code 0, no
+/// warning anywhere. Measured on git 2.55.
+///
+/// Driven to the remote rather than stopping at the local blob, because the
+/// claim is about what the hosting service ends up holding.
+#[test]
+fn a_clone_of_a_repository_that_never_committed_its_attributes_still_encrypts() {
+    let first = TestRepo::init();
+    first.init_xcrypt();
+    first.write_xcrypt_config("secrets/\n");
+    // Keeps `.gitattributes` out of the commits without deleting it, the way a
+    // user's own ignore rules or a selective `git add` would.
+    std::fs::write(
+        first.path().join(".git").join("info").join("exclude"),
+        b".gitattributes\n",
+    )
+    .expect("writing the exclude file");
+    first.write_file("secrets/db.env", FIRST);
+    first.commit_all("a secret, with no attributes file behind it");
+    assert!(first.blob_is_encrypted("secrets/db.env"));
+
+    let remote = BareRemote::new();
+    first.push_to(&remote, "main");
+
+    let courier = TempDir::new().expect("could not create a temporary directory");
+    let key_file = courier.path().join("repo.key");
+    first.xcrypt_ok(["export-key", &key_file.to_string_lossy()]);
+
+    let second = remote.clone_to();
+    assert!(
+        !second.path().join(".gitattributes").exists(),
+        "the fixture is wrong: the clone inherited the attributes file"
+    );
+
+    second.xcrypt_ok(["unlock", &key_file.to_string_lossy()]);
+    second.assert_worktree_eq("secrets/db.env", FIRST);
+
+    // The work the second machine then does has to leave the remote no worse
+    // off than the first machine did.
+    second.write_file("secrets/db.env", FROM_THE_OTHER_MACHINE);
+    second.commit_all("rotate the database password");
+    second.push_to(&remote, "main");
+
+    assert!(
+        remote
+            .blob_bytes("main", "secrets/db.env")
+            .starts_with(MAGIC),
+        "the clone pushed the secret to the remote in the clear"
+    );
+    assert!(
+        !remote.object_exists_for(FROM_THE_OTHER_MACHINE),
+        "the plaintext the clone committed is an object in the remote"
+    );
 }

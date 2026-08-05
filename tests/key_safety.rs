@@ -72,15 +72,84 @@ fn the_key_survives_every_route_out_of_the_repository_that_ordinary_work_takes()
         "the key landed in a checkout somebody else is going to commit from"
     );
 
+    // And the git directory, which is the other place a key must not be put:
+    // `lock` deletes what it finds there, and a copy stored inside the
+    // repository it protects is not a copy at all.
+    let into_git_dir = repo.path().join(".git/exported.key");
+    let inwards = repo.xcrypt(["export-key", &into_git_dir.to_string_lossy()]);
+    assert_eq!(
+        inwards.status.code(),
+        Some(2),
+        "export-key wrote into the git directory:\n{}",
+        String::from_utf8_lossy(&inwards.stderr)
+    );
+    assert!(
+        !into_git_dir.exists(),
+        "the refusal still left a key inside the repository's own directory"
+    );
+
+    // --- And a mistyped destination never overwrites what is there. ---------
+    //
+    // The file being replaced is somebody's only way back into a repository, so
+    // the second export has to say so rather than take the path at its word.
+    // `--force` is the sentence where the user says they meant it.
+    let other = vault.path().join("some-other-project.key");
+    fs::write(&other, b"the only copy of another repository's key\n").expect("writing");
+
+    let clobber = repo.xcrypt(["export-key", &other.to_string_lossy()]);
+    assert_eq!(
+        clobber.status.code(),
+        Some(2),
+        "export-key replaced an existing file without being asked:\n{}",
+        String::from_utf8_lossy(&clobber.stderr)
+    );
+    assert_eq!(
+        fs::read(&other).expect("reading"),
+        b"the only copy of another repository's key\n",
+        "the refusal still overwrote the file"
+    );
+    assert!(
+        String::from_utf8_lossy(&clobber.stderr).contains("--force"),
+        "the refusal must name the flag that means it:\n{}",
+        String::from_utf8_lossy(&clobber.stderr)
+    );
+
+    repo.xcrypt_ok(["export-key", "--force", &other.to_string_lossy()]);
+    assert_eq!(
+        key_material(&other),
+        material,
+        "`--force` did not write this repository's key"
+    );
+
     // --- A key that did reach the working tree is still never printed. ------
     //
     // Copied in by hand rather than by `export-key`, which is how it happens:
     // under a declared pattern, so git renders it through our own `textconv`
     // driver, and named something no path rule would recognise.
-    repo.write_file(
-        "secrets/notes.txt",
-        &fs::read(&exported).expect("the export must exist"),
+    let raw = fs::read(&exported).expect("the export must exist");
+    repo.write_file("secrets/notes.txt", &raw);
+
+    // And the same key wearing the annotation it picks up on the way through a
+    // password manager or an email body: a comment line, a blank line, an
+    // indent. `import-key` accepts all three, so a refusal that looked at the
+    // first byte instead of the first line answered "not a key file" and
+    // `git-xcrypt diff` printed the master key in base64 with exit code 0.
+    let annotated = format!(
+        "# my laptop\n\n  {}\n",
+        String::from_utf8(raw.clone())
+            .expect("an export is text")
+            .trim()
+            .replace('\n', "\n  ")
     );
+    repo.write_file("secrets/annotated.txt", annotated.as_bytes());
+
+    // The premise, proved rather than assumed: this shape really is a working
+    // key, which is what makes printing it a leak rather than a curiosity.
+    let adopter = TestRepo::init();
+    let carried = vault.path().join("annotated.key");
+    fs::write(&carried, annotated.as_bytes()).expect("writing");
+    adopter.xcrypt_ok(["import-key", &carried.to_string_lossy()]);
+
     repo.commit_all("a key nobody meant to commit");
 
     for arguments in [
@@ -104,7 +173,9 @@ fn the_key_survives_every_route_out_of_the_repository_that_ordinary_work_takes()
     for target in [
         key_path.clone(),
         exported.clone(),
+        carried.clone(),
         repo.path().join("secrets/notes.txt"),
+        repo.path().join("secrets/annotated.txt"),
     ] {
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_git-xcrypt"))
             .current_dir(vault.path())
@@ -128,13 +199,16 @@ fn the_key_survives_every_route_out_of_the_repository_that_ordinary_work_takes()
     }
 
     // --- Nothing the key file is stored as leaks it either. -----------------
-    assert!(
-        !repo
-            .blob_bytes("secrets/notes.txt")
-            .windows(material.len())
-            .any(|window| window == material.as_bytes()),
-        "the committed copy of the key is readable in the object database"
-    );
+    for path in ["secrets/notes.txt", "secrets/annotated.txt"] {
+        assert!(
+            !repo
+                .blob_bytes(path)
+                .windows(material.len())
+                .any(|window| window == material.as_bytes()),
+            "{path}: the committed copy of the key is readable in the object \
+             database"
+        );
+    }
 }
 
 #[test]
@@ -185,4 +259,68 @@ fn the_filter_puts_nothing_but_content_on_the_channel_git_reads_as_content() {
     repo.recheckout("secrets/db.env");
     repo.assert_worktree_eq("secrets/db.env", SECRET);
     repo.assert_status_clean();
+}
+
+/// The same refusal where the working-tree check has nothing to say: a
+/// repository whose git directory is somewhere else entirely.
+///
+/// `git init --separate-git-dir` leaves a `.git` *file* in the working tree and
+/// puts the real directory elsewhere — the arrangement dotfile setups and some
+/// tools produce. The key lives in that directory, so writing an export next to
+/// it is the one destination that is neither "outside the repository" nor
+/// inside any working tree, and the check that covers it is a separate one.
+/// Measured: with that check removed, the working-tree refusal answers every
+/// other route out and this one goes through.
+///
+/// Portable on purpose — no symlinks, no permissions, no unusual names.
+#[test]
+fn export_key_refuses_a_git_directory_that_sits_outside_the_working_tree() {
+    let elsewhere = TempDir::new().expect("could not create a temporary directory");
+    let work_tree = elsewhere.path().join("work");
+    let git_dir = elsewhere.path().join("git-dir");
+
+    let init = std::process::Command::new("git")
+        .args(["init", "-q", "-b", "main"])
+        .arg(format!("--separate-git-dir={}", git_dir.display()))
+        .arg(&work_tree)
+        .output()
+        .expect("could not run git init");
+    assert!(
+        init.status.success(),
+        "git init --separate-git-dir failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    let xcrypt = |arguments: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_git-xcrypt"))
+            .current_dir(&work_tree)
+            .args(arguments)
+            .output()
+            .expect("could not run git-xcrypt")
+    };
+
+    let prepared = xcrypt(&["init"]);
+    assert!(
+        prepared.status.success(),
+        "git-xcrypt init failed in a separate-git-dir repository: {}",
+        String::from_utf8_lossy(&prepared.stderr)
+    );
+    assert!(
+        git_dir.join("git-xcrypt/keys/default").is_file(),
+        "the premise is wrong: the key is not in the separate git directory"
+    );
+
+    let destination = git_dir.join("exported.key");
+    let refused = xcrypt(&["export-key", &destination.to_string_lossy()]);
+
+    assert_eq!(
+        refused.status.code(),
+        Some(2),
+        "export-key wrote a key next to the one it protects:\n{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(
+        !destination.exists(),
+        "the refusal still left a key inside the git directory"
+    );
 }

@@ -222,6 +222,127 @@ fn every_declared_attribute_reaches_the_header_the_rendered_line_and_the_round_t
     repo.assert_status_clean();
 }
 
+/// The paths a floating declaration selects, and what git must answer for each.
+///
+/// Every one of these is a path the *filter* encrypts, because `.gitignore`
+/// floats a pattern that carries no slash of its own and `*.env` can name a
+/// directory as readily as a file. The rendered section has to reach exactly
+/// this far and no further: narrower leaves ciphertext without `-text`, which
+/// was measured costing a 2 MB file at checkout; broader puts `-text` on files
+/// stored in the clear.
+const REACHED: &[&str] = &[
+    "secrets/a.txt",
+    "app/secrets/a.txt",
+    "a/b/secrets/c/d.txt",
+    "deep/one.env",
+    "config.env/inner.txt",
+];
+
+/// And the path next door, which the same declaration must not touch.
+const UNTOUCHED: &str = "notsecrets/a.txt";
+
+#[test]
+fn a_forgotten_sync_fails_the_gate_and_running_it_reaches_the_whole_subtree() {
+    // The flow FR-003 is written about: a pattern is added, `sync` is forgotten,
+    // and CI is the thing that says so. Then the section is regenerated and has
+    // to reach every path the filter reaches — including the nested ones, which
+    // are the half that no root-level declaration can tell apart. Measured in
+    // S-02: a directory pattern rendered as `secrets/**` instead of
+    // `**/secrets/**` looks right, agrees with every root-level check, and drops
+    // `-text` from exactly the deep paths it was protecting.
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.xcrypt_ok(["sync"]);
+
+    let checked = repo.xcrypt(["sync", "--check"]);
+    assert_eq!(
+        checked.status.code(),
+        Some(0),
+        "a section that was just written must satisfy its own check:\n{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+
+    // --- A second pattern is declared, and `sync` is forgotten. -------------
+    let before = repo.worktree_bytes(".gitattributes");
+    repo.write_xcrypt_config("secrets/\n*.env\n");
+
+    let stale = repo.xcrypt(["sync", "--check"]);
+    assert_eq!(
+        stale.status.code(),
+        Some(1),
+        "a stale section passed the gate, so CI would never notice:\n{}",
+        String::from_utf8_lossy(&stale.stderr)
+    );
+    assert_eq!(
+        repo.worktree_bytes(".gitattributes"),
+        before,
+        "`--check` wrote to the working tree, which is the one thing a check \
+         must never do"
+    );
+
+    // The filter, meanwhile, is already encrypting under the new pattern:
+    // selection is immediate and the section is what lags behind.
+    repo.write_file("deep/one.env", b"api_key = deep\n");
+    repo.commit_all("a secret under the undeclared-in-gitattributes pattern");
+    assert!(
+        repo.blob_is_encrypted("deep/one.env"),
+        "the filter reads `.git-xcrypt` directly, so this must not wait for sync"
+    );
+
+    // --- `sync` closes it. ---------------------------------------------------
+    repo.xcrypt_ok(["sync"]);
+    assert_eq!(
+        repo.xcrypt(["sync", "--check"]).status.code(),
+        Some(0),
+        "`sync` left a section its own check still calls stale"
+    );
+
+    // --- And git agrees, at every depth. ------------------------------------
+    for path in REACHED {
+        assert_eq!(
+            repo.check_attr("filter", path),
+            "git-xcrypt",
+            "{path}: the filter encrypts this path, so git must run it here"
+        );
+        assert_eq!(
+            repo.check_attr("text", path),
+            "unset",
+            "{path}: the filter encrypts this path and the rendered line does \
+             not reach it, so git may convert its ciphertext and destroy it"
+        );
+    }
+    assert_eq!(
+        repo.check_attr("text", UNTOUCHED),
+        "unspecified",
+        "{UNTOUCHED}: the line reaches past what the filter encrypts, so a file \
+         stored in the clear is carrying `-text`"
+    );
+
+    // The reach is not a claim about attributes alone: a nested secret has to
+    // make the whole round trip.
+    for path in REACHED {
+        repo.write_file(path, b"api_key = nested\n");
+    }
+    repo.write_file(UNTOUCHED, b"nothing secret here\n");
+    repo.commit_all("one secret per depth");
+    repo.assert_status_clean();
+
+    for path in REACHED {
+        assert!(
+            repo.blob_is_encrypted(path),
+            "{path}: a declared path was stored in the clear"
+        );
+        repo.recheckout(path);
+        repo.assert_worktree_eq(path, b"api_key = nested\n");
+    }
+    assert!(
+        !repo.blob_is_encrypted(UNTOUCHED),
+        "{UNTOUCHED}: an undeclared path was encrypted"
+    );
+    repo.assert_status_clean();
+}
+
 /// 2 MB whose bytes cover the whole range.
 ///
 /// The plaintext shape barely matters — what git would convert is the

@@ -117,6 +117,42 @@ fn every_unusual_repository_gets_an_answer_and_the_right_one() {
         UNDETERMINED,
     );
 
+    // --- A split index over a repository that also leaked. ------------------
+    //
+    // Precedence, and the only place in this command where getting it backwards
+    // is silent: a run that both found a leak and could not read the index has
+    // found a leak. `6` says "fix the checkout and ask again", `5` says "rotate
+    // the secret" — so letting the unanswered question win would turn a real
+    // exposure into a housekeeping note, and the operator would do the wrong
+    // thing while the gate stayed technically red.
+    let both = TestRepo::init();
+    both.init_xcrypt();
+    both.write_xcrypt_config("# nothing declared yet\n");
+    both.write_file("secrets/db.env", SECRET);
+    both.commit_all("the leak");
+    both.write_xcrypt_config("secrets/\n");
+    both.xcrypt_ok(["sync"]);
+    both.git_ok(["update-index", "--split-index"]);
+
+    let output = both.xcrypt(["status"]);
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    expect(
+        "a split index over a repository that also leaked a secret",
+        &output,
+        EXPOSED,
+    );
+    assert!(
+        text.contains("leaked in history"),
+        "a split index over a repository that also leaked a secret: the finding \
+         must survive being reported next to a question:\n{text}"
+    );
+    assert!(
+        text.contains("undetermined"),
+        "a split index over a repository that also leaked a secret: the question \
+         must still be reported, or the operator cannot tell the scan was \
+         partial:\n{text}"
+    );
+
     // --- A shallow clone, which is what CI produces by default. -------------
     //
     // Nothing is wrong with it. A history that was never fetched simply cannot

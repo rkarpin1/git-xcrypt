@@ -29,6 +29,16 @@ fn report(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+/// The bytes the **index** currently points at for `path`.
+///
+/// The index is what `--fix` writes, and the only place its work is observable
+/// before a commit — after which git's own re-read of a changed file could have
+/// produced the same result without it.
+fn staged_blob(repo: &TestRepo, path: &str) -> Vec<u8> {
+    repo.git_ok(["cat-file", "blob", &format!(":{path}")])
+        .stdout
+}
+
 #[test]
 fn a_secret_committed_before_its_pattern_is_found_fixed_forward_and_still_reported() {
     // --- The mistake: committed while nothing declared it. ------------------
@@ -47,6 +57,17 @@ fn a_secret_committed_before_its_pattern_is_found_fixed_forward_and_still_report
     );
 
     // --- The declaration arrives, too late. ---------------------------------
+    //
+    // Past git's racy-clean window first, and deliberately. Inside the same
+    // second git re-reads every file whatever its cached `stat` says, so a run
+    // that stayed inside it would have the clean filter encrypt this file on the
+    // next `git add` regardless of the index — and every assertion below would
+    // pass with `--fix` removed entirely. That is measured, not theoretical:
+    // with `gitindex::restage` reduced to "report success, write nothing", this
+    // file was green.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    repo.git_ok(["update-index", "--refresh"]);
+
     repo.write_xcrypt_config("secrets/\n");
     repo.xcrypt_ok(["sync"]);
 
@@ -83,6 +104,20 @@ fn a_secret_committed_before_its_pattern_is_found_fixed_forward_and_still_report
         "a rewrite must not be allowed to read as a fix:\n{text}"
     );
 
+    // --- The gap `--fix` exists for, shown before it is closed. -------------
+    //
+    // Declaring a pattern reaches the filter immediately, and does *not* reach a
+    // file git considers unchanged: `git add -A` consults the cached `stat`,
+    // decides there is nothing to do and never asks the filter. The staged blob
+    // is still the plaintext one.
+    repo.git_ok(["add", "-A"]);
+    assert_eq!(
+        staged_blob(&repo, "secrets/db.env"),
+        SECRET,
+        "git re-read the file anyway, so this run is inside the racy-clean \
+         window and proves nothing about `--fix`"
+    );
+
     // --- `--fix` repairs what is repairable: the next commit. ---------------
     let fixed = repo.xcrypt(["status", "--fix"]);
     let fixed_text = report(&fixed);
@@ -92,11 +127,18 @@ fn a_secret_committed_before_its_pattern_is_found_fixed_forward_and_still_report
         "`--fix` cannot clear a finding it did not fix:\n{fixed_text}"
     );
 
+    // What `--fix` promises is an index entry, so that is what is read back —
+    // not a later commit, which git's own re-read could produce on its own.
+    assert!(
+        staged_blob(&repo, "secrets/db.env").starts_with(MAGIC),
+        "`--fix` reported success over an index still pointing at the plaintext"
+    );
+
     // The working tree stays readable — `--fix` touches the index and nothing
     // else, so the user goes on working on plaintext.
     repo.assert_worktree_eq("secrets/db.env", SECRET);
 
-    repo.commit_all("declare the secret");
+    repo.git_ok(["commit", "-q", "-m", "declare the secret"]);
     assert!(
         repo.blob_is_encrypted("secrets/db.env"),
         "the commit after `--fix` still stored the secret in the clear"
