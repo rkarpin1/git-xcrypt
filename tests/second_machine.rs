@@ -1,0 +1,129 @@
+//! The second machine: clone, carry the key, unlock, and work from both sides.
+//!
+//! US-01 is the only user story the PRD writes out in full, and it is not about
+//! a command — it is about a repository that exists in two places at once. The
+//! per-command files each prove one half of it; this drives the whole loop,
+//! including the half nothing else does: an edit made on the *second* machine
+//! coming back to the first and still matching, byte for byte, with `git status`
+//! quiet on both sides.
+//!
+//! Everything goes through a bare remote rather than a direct clone, because
+//! `receive-pack` re-reads and re-packs every object it accepts and a claim
+//! about "what the hosting service holds" is not a claim about a local clone.
+
+mod harness;
+
+use harness::{BareRemote, MAGIC, OVERHEAD, TestRepo};
+use tempfile::TempDir;
+
+/// The exit code the frozen table gives to "an exposure was found".
+const EXPOSED: i32 = 5;
+
+const FIRST: &[u8] = b"DATABASE_URL=postgres://user:hunter2@localhost/app\n";
+const FROM_THE_OTHER_MACHINE: &[u8] = b"DATABASE_URL=postgres://user:swordfish@db/app\n";
+
+#[test]
+fn a_clone_becomes_a_working_second_machine_and_its_edits_come_home() {
+    // --- The first machine sets the repository up and pushes. ---------------
+    let first = TestRepo::init();
+    first.init_xcrypt();
+    first.write_xcrypt_config("secrets/\n*.env\n");
+    first.xcrypt_ok(["sync"]);
+    first.write_file("secrets/db.env", FIRST);
+    first.write_file("README.md", b"# ordinary project\n");
+    first.commit_all("declare a secret");
+
+    let remote = BareRemote::new();
+    first.push_to(&remote, "main");
+    first.assert_status_clean();
+
+    // --- The second machine clones, and has nothing but ciphertext. ---------
+    let second = remote.clone_to();
+
+    let seen = second.worktree_bytes("secrets/db.env");
+    assert!(
+        seen.starts_with(MAGIC),
+        "a clone with no key showed the secret in the clear"
+    );
+    assert!(
+        !seen.windows(FIRST.len()).any(|window| window == FIRST),
+        "the plaintext is readable in a clone that holds no key"
+    );
+
+    // And it says so rather than looking healthy. `.git/config` is not cloned,
+    // so the catch-all line in `.gitattributes` has no driver behind it: git
+    // filters nothing here and the next `git add` on a secret would exit 0 with
+    // the plaintext stored.
+    let unfiltered = second.xcrypt(["status"]);
+    let text = String::from_utf8_lossy(&unfiltered.stdout).into_owned();
+    assert_eq!(
+        unfiltered.status.code(),
+        Some(EXPOSED),
+        "a clone that cannot filter must not pass the gate:\n{text}"
+    );
+    assert!(
+        text.contains("filter.git-xcrypt.process"),
+        "the report must name the registration that is missing:\n{text}"
+    );
+
+    // --- The key is carried across, by hand, as the PRD says it is. ---------
+    let courier = TempDir::new().expect("could not create a temporary directory");
+    let key_file = courier.path().join("repo.key");
+    first.xcrypt_ok(["export-key", &key_file.to_string_lossy()]);
+
+    second.xcrypt_ok(["unlock", &key_file.to_string_lossy()]);
+
+    second.assert_worktree_eq("secrets/db.env", FIRST);
+    second.assert_worktree_eq("README.md", b"# ordinary project\n");
+    second.assert_status_clean();
+
+    let healthy = second.xcrypt(["status"]);
+    assert_eq!(
+        healthy.status.code(),
+        Some(0),
+        "an unlocked clone must pass the gate:\n{}\n{}",
+        String::from_utf8_lossy(&healthy.stdout),
+        String::from_utf8_lossy(&healthy.stderr)
+    );
+
+    // --- The second machine does the work now. ------------------------------
+    second.write_file("secrets/db.env", FROM_THE_OTHER_MACHINE);
+    second.commit_all("rotate the database password");
+    second.push_to(&remote, "main");
+    second.assert_status_clean();
+
+    let stored = remote.blob_bytes("main", "secrets/db.env");
+    assert!(
+        stored.starts_with(MAGIC),
+        "the second machine pushed the secret in the clear"
+    );
+    assert_eq!(stored.len(), OVERHEAD + FROM_THE_OTHER_MACHINE.len());
+    assert!(
+        !remote.object_exists_for(FROM_THE_OTHER_MACHINE),
+        "the second machine's plaintext is an object in the remote"
+    );
+
+    // --- And the first machine gets it back, unchanged. ---------------------
+    first.pull_from(&remote, "main");
+
+    first.assert_worktree_eq("secrets/db.env", FROM_THE_OTHER_MACHINE);
+    first.assert_status_clean();
+
+    // The cross-machine determinism claim, made explicit: the first machine
+    // re-cleans the content the second machine encrypted, and git sees no
+    // change. Two machines that derived different keys, normalised differently
+    // or wrote a different header would part company right here — and every
+    // other assertion in this file would still pass.
+    first.git_ok(["add", "--renormalize", "."]);
+    first.assert_status_clean();
+    assert_eq!(
+        first.blob_bytes("secrets/db.env"),
+        stored,
+        "the two machines store different bytes for the same secret"
+    );
+
+    // Closing the loop the other way: the second machine can still read what
+    // the first one wrote before the key ever travelled.
+    second.git_ok(["checkout", "-q", "HEAD~1", "--", "secrets/db.env"]);
+    second.assert_worktree_eq("secrets/db.env", FIRST);
+}
