@@ -769,4 +769,211 @@ mod tests {
         }
         assert!(config.decide(b"anything-else").encrypt);
     }
+
+    /// Every shape the line parser refuses, and the word that says why.
+    ///
+    /// A scenario walks one path per run, so it can prove that a good file is
+    /// read correctly and that one bad file is caught — it cannot economically
+    /// cover eleven refusals. Measured on 2026-08-05, when this table did not
+    /// exist: dropping the unterminated-quote guard left all 91 tests green, so
+    /// `.git-xcrypt` could open a quote and never close it and still be read as
+    /// a declaration. The other ten are here because a parser is a table and is
+    /// cheapest to guard as one.
+    ///
+    /// Each row asserts a fragment of the message, not the whole of it. The
+    /// wording is free to improve; what must not change is that the refusal
+    /// happens and names the reason, because the alternative to a refusal here
+    /// is a pattern that matches nothing and a file that stops being encrypted
+    /// without saying so.
+    #[test]
+    fn every_shape_the_parser_refuses_is_refused_and_says_why() {
+        let refused: &[(&str, &str, &str)] = &[
+            ("an unterminated quote", "\"my secrets/\n", "never closes"),
+            (
+                "text after the closing quote",
+                "\"my secrets/\"oops\n",
+                "follows the closing",
+            ),
+            ("nothing but a negation", "!\n", "there is no pattern here"),
+            (
+                "the pre-2026-08-05 backslash escape",
+                "my\\ secrets/\n",
+                "ends with a backslash",
+            ),
+            (
+                "an old line quoted whole",
+                "\"secrets/*.sh text eol=lf\"\n",
+                "ends with the attribute",
+            ),
+            (
+                "an escape that is not one",
+                "\"secrets/\\q.env\"\n",
+                "is not an escape",
+            ),
+            (
+                "an octal escape past a byte",
+                "\"secrets/\\777.env\"\n",
+                "is not a byte",
+            ),
+            (
+                "octal escapes that do not spell UTF-8",
+                "\"secrets/\\377.env\"\n",
+                "do not spell",
+            ),
+            (
+                "an attribute nobody defined",
+                "secrets/ text=maybe\n",
+                "unknown attribute",
+            ),
+            (
+                "attributes on a negation",
+                "!secrets/README.md text\n",
+                "cannot carry",
+            ),
+        ];
+
+        for (label, text, fragment) in refused {
+            let error = Config::parse(text)
+                .err()
+                .unwrap_or_else(|| panic!("{label}: this must not parse, but it did"));
+            let message = error.to_string();
+            assert!(
+                message.contains(fragment),
+                "{label}: the refusal must say `{fragment}`, and says: {message}"
+            );
+            assert!(
+                message.contains(CONFIG_FILE),
+                "{label}: the refusal must name the file it is about: {message}"
+            );
+        }
+    }
+
+    /// Every shape the line parser accepts, and what it makes of it.
+    ///
+    /// The awkward half of this table is not decoration. A leading `!` and a
+    /// leading `#` inside quotes are parts of a name, not syntax — both were
+    /// real defects, found on 2026-08-05, that ended in git dropping the
+    /// generated `.gitattributes` line and taking the file's ciphertext with
+    /// it. A trailing space is the case a backslash never really closed,
+    /// because editors strip it; quotes close it.
+    #[test]
+    fn every_shape_the_parser_accepts_means_what_it_says() {
+        // (label, declaration, path, encrypted?, text mode, eol)
+        type Row<'a> = (&'a str, &'a str, &'a [u8], bool, TextMode, Option<EolMode>);
+        let accepted: &[Row] = &[
+            (
+                "a bare pattern",
+                "secrets/\n",
+                b"secrets/db.env",
+                true,
+                TextMode::Auto,
+                None,
+            ),
+            (
+                "a bare pattern with attributes",
+                "secrets/deploy.ps1 text eol=crlf\n",
+                b"secrets/deploy.ps1",
+                true,
+                TextMode::Text,
+                Some(EolMode::Crlf),
+            ),
+            (
+                "a quoted name holding a space",
+                "\"my secrets/\"\n",
+                b"my secrets/db.env",
+                true,
+                TextMode::Auto,
+                None,
+            ),
+            (
+                "a quoted name with attributes",
+                "\"my secrets/*.sh\" text eol=lf\n",
+                b"my secrets/go.sh",
+                true,
+                TextMode::Text,
+                Some(EolMode::Lf),
+            ),
+            (
+                "a name that ends in a space",
+                "\"secrets /\"\n",
+                b"secrets /a.env",
+                true,
+                TextMode::Auto,
+                None,
+            ),
+            (
+                "a leading ! that is part of the name",
+                "\"!odd.env\"\n",
+                b"!odd.env",
+                true,
+                TextMode::Auto,
+                None,
+            ),
+            (
+                "a leading # that is part of the name",
+                "\"#notes.env\"\n",
+                b"#notes.env",
+                true,
+                TextMode::Auto,
+                None,
+            ),
+            (
+                "a quote inside the name",
+                "\"od\\\"d.env\"\n",
+                b"od\"d.env",
+                true,
+                TextMode::Auto,
+                None,
+            ),
+            (
+                "an octal escape spelling a letter",
+                "\"secrets/\\101.env\"\n",
+                b"secrets/A.env",
+                true,
+                TextMode::Auto,
+                None,
+            ),
+            (
+                "binary suppresses the diff driver",
+                "secrets/key.p12 binary\n",
+                b"secrets/key.p12",
+                true,
+                TextMode::Binary,
+                None,
+            ),
+            (
+                "a negation keeps its ! outside the quotes",
+                "\"my secrets/\"\n!\"my secrets/README.md\"\n",
+                b"my secrets/README.md",
+                false,
+                TextMode::Auto,
+                None,
+            ),
+            (
+                "a bare negation still works",
+                "secrets/\n!secrets/README.md\n",
+                b"secrets/README.md",
+                false,
+                TextMode::Auto,
+                None,
+            ),
+        ];
+
+        for (label, text, path, encrypt, mode, eol) in accepted {
+            let parsed = Config::parse(text)
+                .unwrap_or_else(|error| panic!("{label}: this must parse, and says: {error}"));
+            let decision = parsed.decide(path);
+            assert_eq!(
+                decision.encrypt,
+                *encrypt,
+                "{label}: `{}` should{} be encrypted",
+                String::from_utf8_lossy(path),
+                if *encrypt { "" } else { " not" }
+            );
+            if *encrypt {
+                assert_eq!(decision.text, *mode, "{label}: wrong text mode");
+                assert_eq!(decision.eol, *eol, "{label}: wrong end-of-line mode");
+            }
+        }
+    }
 }
