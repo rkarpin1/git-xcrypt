@@ -678,7 +678,30 @@ impl Report {
             "     That deletes the file from every commit. To keep the file and drop \
              only its history, remove it, rewrite, then add it back through the \
              filter. Either way everyone with a clone has to re-clone."
-        )
+        )?;
+        // Everything above this command is decided on bytes; the command itself
+        // is text, and there the two part company. On Linux any byte string
+        // without `/` or NUL is a file name, so a path can reach here that no
+        // string can spell — and the rendering turns the stray bytes into U+FFFD,
+        // which git-filter-repo then matches against nothing while exiting 0. The
+        // finding is still right and the name above still identifies the file to
+        // a human; it is the instruction that has quietly stopped being one.
+        if self
+            .leaked
+            .iter()
+            .any(|exposure| std::str::from_utf8(&exposure.path).is_err())
+        {
+            writeln!(
+                f,
+                "\n     One or more of these paths is not valid UTF-8, so the names \
+                 above are shown with replacement characters and the command WILL \
+                 NOT match them — it would rewrite history and remove nothing, \
+                 reporting success. Take the exact bytes from `git log --all \
+                 --name-only -z` (or `git ls-tree -z -r <commit>`) and pass them \
+                 through `--paths-from-file`."
+            )?;
+        }
+        Ok(())
     }
 
     /// Paths a negation keeps in the clear on purpose.
@@ -1498,6 +1521,64 @@ mod tests {
         // something else entirely.
         assert_eq!(shell_quoted(b"secrets/db.env"), "'secrets/db.env'");
         assert_eq!(shell_quoted(b"secrets/it's.env"), r"'secrets/it'\''s.env'");
+    }
+
+    #[test]
+    fn a_path_no_text_can_hold_is_not_handed_out_as_a_command_that_looks_right() {
+        // On Linux any byte string without `/` or NUL is a legal file name, and
+        // `secrets/bad\xff.env` is one this command can find in history, judge
+        // and report — every decision it takes is on the bytes. The one thing it
+        // cannot do is *print* them: the report is text, so the name comes out
+        // with U+FFFD in it. That is fine for the listing above, where the point
+        // is to identify a file to a human, and not fine for step 3, which is an
+        // instruction to a machine — `git filter-repo --path 'secrets/bad<?>.env'`
+        // parses, runs, matches nothing and reports success, leaving the user
+        // believing the blob is gone.
+        //
+        // Not reproducible through the filesystem here: APFS refuses the name
+        // outright, so the report is driven directly.
+        use crate::history::{Exposure, Sighting};
+
+        let zero = gix_hash::Kind::Sha1.null();
+        let report = Report {
+            leaked: vec![Exposure {
+                path: b"secrets/bad\xff.env".to_vec(),
+                sightings: vec![Sighting {
+                    blob: zero,
+                    commit: zero,
+                }],
+            }],
+            scan_ran: true,
+            ..Report::default()
+        };
+
+        let shown = report.to_string();
+        assert!(
+            shown.contains("git filter-repo"),
+            "the procedure is what this is about: {shown}"
+        );
+        assert!(
+            shown.contains("not valid UTF-8"),
+            "the report handed out a rewrite command that cannot match the path \
+             it names, and said nothing about it:\n{shown}"
+        );
+
+        // And an ordinary path must not pick up the caveat.
+        let plain = Report {
+            leaked: vec![Exposure {
+                path: b"secrets/db.env".to_vec(),
+                sightings: vec![Sighting {
+                    blob: zero,
+                    commit: zero,
+                }],
+            }],
+            scan_ran: true,
+            ..Report::default()
+        };
+        assert!(
+            !plain.to_string().contains("not valid UTF-8"),
+            "every report grew a caveat that applies to almost none of them"
+        );
     }
 
     #[test]
