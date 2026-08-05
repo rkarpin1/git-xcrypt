@@ -221,7 +221,13 @@ fn translate(pattern: &str) -> Vec<String> {
 ///   is added *inside* the brackets instead, giving `[a-zA-Z]`. A negated class
 ///   gets it too, which is right: folding `[!a]` must stop it matching `A`.
 /// * **a POSIX class**, `[[:alpha:]]`, whose members are named rather than
-///   spelled, so there is nothing to rewrite and it is copied whole.
+///   spelled, so there is nothing to rewrite and it is copied whole — except
+///   the two classes that *are* a case: `[:upper:]` and `[:lower:]` each gain
+///   their counterpart, because the selection side folds them too. Measured:
+///   `gix-glob` under `Case::Fold` lowercases the candidate first, so
+///   `[[:upper:]]dir/` selects `xdir/a.env` — and a verbatim copy answers
+///   `unspecified` for it at `core.ignorecase=false`, the narrower-than-the-
+///   filter direction that costs the file.
 /// * **anything outside ASCII**, which is copied byte for byte. That is the
 ///   documented boundary — see [`crate::config::MATCHING`].
 ///
@@ -352,10 +358,19 @@ fn fold_class(pattern: &str, start: usize) -> Option<(String, usize)> {
         }
 
         // `[:alpha:]` and friends name their members, so there is nothing to
-        // add — and a `[` that opens one is not a member either.
+        // add — and a `[` that opens one is not a member either. Two of the
+        // names *are* a case, and selection folds them: under `Case::Fold`
+        // `gix-glob` lowercases the candidate before the class test and lets
+        // `[:upper:]` accept a lowercase letter, so each of the pair matches
+        // every ASCII letter — exactly what the named counterpart adds here.
         if bytes[index] == b'[' && bytes.get(index + 1) == Some(&b':') {
             let end = index + pattern[index..].find(":]")? + 2;
             body.push_str(&pattern[index..end]);
+            match &pattern[index + 2..end - 2] {
+                "upper" => extra.push_str("[:lower:]"),
+                "lower" => extra.push_str("[:upper:]"),
+                _ => {}
+            }
             index = end;
             continue;
         }
@@ -1389,6 +1404,28 @@ mod tests {
                 "…and its neighbours still fold",
                 "[[:digit:]x]",
                 "[[:digit:]xX]",
+            ),
+            // Selection folds these two like any letter: `gix-glob` lowercases
+            // the candidate first and lets `[:upper:]` accept a lowercase
+            // letter under `Case::Fold`, so each class selects every ASCII
+            // letter. A verbatim copy was measured answering `unspecified` for
+            // `xdir/a.env` under `**/[[:upper:]]dir/**` at
+            // `core.ignorecase=false`, while the filter encrypted it — the
+            // narrower-than-the-filter direction that costs the file.
+            (
+                "the upper class gains the lower",
+                "[[:upper:]]",
+                "[[:upper:][:lower:]]",
+            ),
+            (
+                "the lower class gains the upper",
+                "[[:lower:]]",
+                "[[:lower:][:upper:]]",
+            ),
+            (
+                "…negated too, so it keeps refusing every letter",
+                "[![:upper:]]",
+                "[![:upper:][:lower:]]",
             ),
             ("an escape inside a class", "[\\a\\]]", "[\\a\\]\\A]"),
             ("an unterminated class is a literal", "[ab", "[[aA][bB]"),
