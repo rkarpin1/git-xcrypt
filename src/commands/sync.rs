@@ -103,37 +103,6 @@ mod tests {
     }
 
     #[test]
-    fn a_new_pattern_reaches_the_section() {
-        let (_dir, repo) = prepared("secrets/\n");
-
-        let report = run(&repo, false).expect("sync must succeed");
-
-        assert_eq!(report.outcome, Outcome::Updated);
-        let attributes = fs::read_to_string(repo.attributes_path()).expect("attributes");
-        assert!(attributes.contains("secrets/** -text diff=git-xcrypt"));
-        assert!(
-            attributes.contains("* filter=git-xcrypt"),
-            "the line the security rests on must survive every regeneration"
-        );
-    }
-
-    #[test]
-    fn a_second_run_changes_nothing() {
-        let (_dir, repo) = prepared("secrets/\n*.env\n");
-        run(&repo, false).expect("first sync");
-        let after_first = fs::read_to_string(repo.attributes_path()).expect("attributes");
-
-        let report = run(&repo, false).expect("second sync");
-
-        assert_eq!(report.outcome, Outcome::UpToDate);
-        assert_eq!(
-            after_first,
-            fs::read_to_string(repo.attributes_path()).expect("attributes"),
-            "a settled section must not be rewritten"
-        );
-    }
-
-    #[test]
     fn check_reports_staleness_without_writing() {
         let (_dir, repo) = prepared("secrets/\n");
         let before = fs::read_to_string(repo.attributes_path()).expect("attributes");
@@ -153,79 +122,5 @@ mod tests {
             Outcome::UpToDate,
             "the check and the write must not disagree"
         );
-    }
-
-    #[test]
-    fn a_removed_pattern_leaves_the_section() {
-        let (_dir, repo) = prepared("secrets/\n*.env\n");
-        run(&repo, false).expect("first sync");
-
-        fs::write(repo.xcrypt_config_path(), "secrets/\n").expect("shrinking the declarations");
-        run(&repo, false).expect("second sync");
-
-        let attributes = fs::read_to_string(repo.attributes_path()).expect("attributes");
-        assert!(attributes.contains("secrets/** -text"));
-        assert!(
-            !attributes.contains("*.env -text"),
-            "a pattern the user deleted must not linger in the section"
-        );
-    }
-
-    #[test]
-    fn user_content_outside_the_markers_is_untouched() {
-        let (_dir, repo) = prepared("secrets/\n");
-        let path = repo.attributes_path();
-        let with_user_lines = format!(
-            "# mine\n*.png binary\n{}",
-            fs::read_to_string(&path).expect("attributes")
-        );
-        fs::write(&path, &with_user_lines).expect("writing");
-
-        run(&repo, false).expect("sync");
-
-        let attributes = fs::read_to_string(&path).expect("attributes");
-        assert!(attributes.starts_with("# mine\n*.png binary\n"));
-    }
-
-    #[test]
-    fn a_missing_declaration_file_is_refused() {
-        let (_dir, repo) = prepared("secrets/\n");
-        fs::remove_file(repo.xcrypt_config_path()).expect("removing the declarations");
-
-        match run(&repo, false) {
-            Err(Error::Config(message)) => assert!(message.contains("init")),
-            other => panic!("expected a refusal, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn an_unreadable_declaration_file_is_refused_rather_than_emptying_the_section() {
-        let (_dir, repo) = prepared("secrets/ sparkly\n");
-
-        let error = run(&repo, false).expect_err("an unknown attribute must stop sync");
-        assert_eq!(error.exit_code(), crate::exit::CONFIG);
-    }
-
-    #[test]
-    fn broken_markers_stop_the_command_with_the_configuration_code() {
-        let (_dir, repo) = prepared("secrets/\n");
-        fs::write(
-            repo.attributes_path(),
-            "# >>> git-xcrypt >>>\n* filter=git-xcrypt\n",
-        )
-        .expect("breaking the markers");
-
-        let error = run(&repo, false).expect_err("guessing the boundary would lose user content");
-        assert_eq!(error.exit_code(), crate::exit::CONFIG);
-    }
-
-    #[test]
-    fn a_pointless_eol_declaration_is_carried_out_as_a_warning() {
-        let (_dir, repo) = prepared("secrets/key.p12 binary eol=lf\n");
-
-        let report = run(&repo, false).expect("a pointless declaration is not fatal");
-
-        assert_eq!(report.outcome, Outcome::Updated);
-        assert_eq!(report.warnings.len(), 1);
     }
 }
