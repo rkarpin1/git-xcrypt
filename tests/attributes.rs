@@ -820,3 +820,318 @@ fn a_name_that_ends_in_a_space_is_expressible_at_last() {
     repo.assert_worktree_eq("secrets /db.env", SPACED);
     repo.assert_status_clean();
 }
+
+/// 8 KiB whose bytes cover the whole range.
+///
+/// The plaintext shape is irrelevant — what git converts is the *ciphertext*,
+/// which is pseudorandom, so roughly one byte in 256 is an `LF` and this size
+/// carries about 32 of them. A draw with none at all has probability `e^-32`, and
+/// the tests below assert the premise anyway rather than trusting the arithmetic.
+/// Small enough that five repositories' worth costs nothing, unlike the 2 MB the
+/// check-in tests need to make *damage* certain.
+fn eight_kilobytes() -> Vec<u8> {
+    (0..8 * 1024u32)
+        .map(|index| u8::try_from(index % 251).expect("a byte"))
+        .collect()
+}
+
+/// `LF` bytes not preceded by `CR` — the ones git's check-out conversion expands.
+fn lone_line_feeds(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .enumerate()
+        .filter(|&(index, &byte)| byte == b'\n' && (index == 0 || bytes[index - 1] != b'\r'))
+        .count()
+}
+
+/// Git's own `crlf_to_worktree`: every lone `LF` becomes `CRLF`, `CRLF` stays.
+///
+/// Used to build a blob that already wears the fingerprint of a converted
+/// checkout, so a test can hold the fingerprint fixed and vary nothing but which
+/// direction git would convert in.
+fn expand_lone_line_feeds(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    for (index, &byte) in bytes.iter().enumerate() {
+        if byte == b'\n' && (index == 0 || bytes[index - 1] != b'\r') {
+            out.push(b'\r');
+        }
+        out.push(byte);
+    }
+    out
+}
+
+/// A repository with one 8 KiB secret committed while the attributes are right.
+///
+/// Returns the plaintext and the intact blob, so every test below can prove both
+/// that its fixture started healthy and that it stayed that way.
+fn repository_with_one_intact_secret() -> (TestRepo, Vec<u8>, Vec<u8>) {
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.xcrypt_ok(["sync"]);
+
+    let secret = eight_kilobytes();
+    repo.write_file("secrets/store.p12", &secret);
+    repo.commit_all("a secret, while the attributes are still right");
+
+    let blob = repo.blob_bytes("secrets/store.p12");
+    assert_eq!(
+        blob.len(),
+        OVERHEAD + secret.len(),
+        "the fixture did not store an intact ciphertext to begin with"
+    );
+    assert!(
+        lone_line_feeds(&blob) > 0,
+        "the fixture's ciphertext holds no lone `LF`, so git's check-out \
+         conversion would have nothing to expand and the shape under test \
+         cannot occur"
+    );
+    (repo, secret, blob)
+}
+
+/// Appends `line` to the managed `.gitattributes`, where git takes it last.
+fn append_attribute_line(repo: &TestRepo, line: &[u8]) {
+    let mut attributes = repo.worktree_bytes(".gitattributes");
+    attributes.extend_from_slice(line);
+    repo.write_file(".gitattributes", &attributes);
+}
+
+/// Deletes `path` and checks it out again, returning whatever git said.
+fn failing_checkout(repo: &TestRepo, path: &str) -> String {
+    std::fs::remove_file(repo.path().join(path)).expect("could not remove the file");
+    let checkout = repo.git(["checkout", "--", path]);
+    let complaint = String::from_utf8_lossy(&checkout.stderr).into_owned();
+    assert!(
+        !checkout.status.success(),
+        "the checkout succeeded, so the fixture no longer reproduces a failing \
+         authentication tag:\n{complaint}"
+    );
+    complaint
+}
+
+/// Commits `blob` under `path` byte for byte, with no filter in the way.
+///
+/// `git hash-object --stdin` takes no path, so no attribute and no filter apply
+/// to it: the object database ends up holding exactly these bytes. It is the only
+/// way to stage a ciphertext the clean path would refuse — which it does, since
+/// 2026-08-05, for every shape this needs.
+fn commit_blob_verbatim(repo: &TestRepo, path: &str, blob: &[u8]) {
+    let hashed = repo.git_with_stdin(["hash-object", "-w", "-t", "blob", "--stdin"], blob);
+    assert!(
+        hashed.status.success(),
+        "git hash-object failed: {}",
+        String::from_utf8_lossy(&hashed.stderr)
+    );
+    let id = String::from_utf8(hashed.stdout)
+        .expect("git prints a hash")
+        .trim()
+        .to_string();
+    repo.git_ok([
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        &format!("100644,{id},{path}"),
+    ]);
+    repo.git_ok(["commit", "-q", "-m", "a ciphertext nobody can decrypt"]);
+}
+
+#[test]
+fn a_check_out_git_converted_names_the_line_instead_of_accusing_the_file() {
+    // The other end of the refusal above, and the one nobody can act on today.
+    // Git's check-out order is blob, then git's own conversion, then smudge, so
+    // a `text` line that outranks the managed `-text` hands the authentication
+    // tag bytes that were never stored: measured on git 2.55 with a filter that
+    // copied its stdin aside, a 4118-byte blob holding 18 lone `LF` arrived as
+    // 4136 bytes holding 18 `CRLF` and no lone `LF` at all.
+    //
+    // The tag is right to refuse that, and the file is right to be missing —
+    // what was wrong was the sentence. `the file has been altered` over a blob
+    // that is intact to the byte reads as "your repository is corrupt and the
+    // data is gone", at the exact moment a user is least able to check.
+    let (repo, secret, blob) = repository_with_one_intact_secret();
+
+    append_attribute_line(&repo, b"secrets/** text\n");
+    // `core.autocrlf=true` is Git for Windows' own default, and it is what turns
+    // the `text` line into an expansion rather than a no-op.
+    repo.set_eol_config("true", "");
+    assert_eq!(
+        repo.check_attr("text", "secrets/store.p12"),
+        "set",
+        "the fixture no longer reproduces the shape it exists to catch"
+    );
+
+    let complaint = failing_checkout(&repo, "secrets/store.p12");
+
+    assert!(
+        !complaint.contains("the file has been altered"),
+        "the checkout still accuses a file that is intact:\n{complaint}"
+    );
+    assert!(
+        complaint.contains("Nothing is lost"),
+        "the message must say outright that nothing was lost, because the user \
+         has every reason to believe otherwise:\n{complaint}"
+    );
+    assert!(
+        complaint.contains(".gitattributes:") && complaint.contains("secrets/** text"),
+        "the message must name the file, the line and the assignment, the same \
+         way the check-in refusal does:\n{complaint}"
+    );
+    assert!(
+        complaint.contains("git-xcrypt sync"),
+        "the message must say what to do about it:\n{complaint}"
+    );
+
+    // The claim the message makes, checked rather than asserted in prose.
+    assert_eq!(
+        repo.blob_bytes("secrets/store.p12"),
+        blob,
+        "the blob changed under a checkout, which only reads"
+    );
+
+    // And the instruction works: with the line gone the file comes back whole.
+    let attributes = repo.worktree_bytes(".gitattributes");
+    let repaired = attributes
+        .split(|&byte| byte == b'\n')
+        .filter(|line| line != b"secrets/** text")
+        .map(<[u8]>::to_vec)
+        .collect::<Vec<_>>()
+        .join(&b'\n');
+    repo.write_file(".gitattributes", &repaired);
+    assert_eq!(
+        repo.check_attr("text", "secrets/store.p12"),
+        "unset",
+        "the repair did not put the managed `-text` back in charge"
+    );
+    // No `recheckout` here: the failed checkout left no file to delete, which is
+    // precisely the state the message has to talk a reader out of panicking over.
+    repo.git_ok(["checkout", "--", "secrets/store.p12"]);
+    repo.assert_worktree_eq("secrets/store.p12", &secret);
+}
+
+#[test]
+fn a_ciphertext_that_really_was_altered_is_still_reported_as_altered() {
+    // The half that matters more. A wrong "this is only configuration, nothing
+    // is lost" over a repository that genuinely lost something is worse than the
+    // blunt message it replaces, so every shape below has to keep saying the
+    // blunt thing.
+
+    // 1. An altered body under healthy attributes: nothing converts anything,
+    //    and the file really is not what was encrypted.
+    {
+        let (repo, _secret, blob) = repository_with_one_intact_secret();
+        let mut altered = blob.clone();
+        altered[OVERHEAD + 5] ^= 0xff;
+        commit_blob_verbatim(&repo, "secrets/store.p12", &altered);
+
+        let complaint = failing_checkout(&repo, "secrets/store.p12");
+        assert!(
+            complaint.contains("the file has been altered"),
+            "a genuinely altered ciphertext must still be called altered:\n{complaint}"
+        );
+        assert!(
+            !complaint.contains("Nothing is lost"),
+            "a genuinely altered ciphertext was reported as safe:\n{complaint}"
+        );
+    }
+
+    // 2. The same alteration, with `secrets/** text` and `core.autocrlf=true`
+    //    in force — but on a ciphertext holding no `LF` at all, so git expands
+    //    nothing and the bytes that reached the tag *are* the stored bytes. The
+    //    attribute line alone must never be enough to claim the file is safe.
+    {
+        let (repo, _secret, blob) = repository_with_one_intact_secret();
+        let unexpandable: Vec<u8> = blob
+            .iter()
+            .map(|&byte| if byte == b'\n' { 0x0b } else { byte })
+            .collect();
+        assert_eq!(
+            lone_line_feeds(&unexpandable),
+            0,
+            "the fixture still holds an `LF`, so git would expand something"
+        );
+        commit_blob_verbatim(&repo, "secrets/store.p12", &unexpandable);
+        append_attribute_line(&repo, b"secrets/** text\n");
+        repo.set_eol_config("true", "");
+
+        let complaint = failing_checkout(&repo, "secrets/store.p12");
+        assert!(
+            complaint.contains("the file has been altered"),
+            "a ciphertext git could not have expanded was blamed on git:\n{complaint}"
+        );
+        assert!(
+            !complaint.contains("Nothing is lost"),
+            "an altered ciphertext was reported as safe because a `text` line \
+             happened to be present:\n{complaint}"
+        );
+    }
+
+    // 3. The damage already in the blob, under `secrets/** text eol=lf` — a line
+    //    that converts on the way *in* and writes the stored bytes out
+    //    untouched. Measured on git 2.55 with `core.autocrlf=true`: a blob full
+    //    of lone `LF` checks out byte for byte under it.
+    //
+    //    The blob here is the expanded ciphertext itself, so it wears the exact
+    //    fingerprint an expansion leaves — no lone `LF`, plenty of `CRLF` — and
+    //    git expands nothing on top of it. Only the check-out *direction* tells
+    //    the two apart, which is what makes this the shape that guards it: a
+    //    predicate reusing the check-in verdict calls this file safe, and it is
+    //    not, because nothing about fixing that line brings its plaintext back.
+    {
+        let (repo, _secret, blob) = repository_with_one_intact_secret();
+        let already_expanded = expand_lone_line_feeds(&blob);
+        assert_eq!(
+            lone_line_feeds(&already_expanded),
+            0,
+            "the fixture does not wear the fingerprint it exists to wear"
+        );
+        commit_blob_verbatim(&repo, "secrets/store.p12", &already_expanded);
+        append_attribute_line(&repo, b"secrets/** text eol=lf\n");
+        repo.set_eol_config("true", "");
+        assert_eq!(
+            repo.check_attr("eol", "secrets/store.p12"),
+            "lf",
+            "the fixture no longer pins the check-out direction"
+        );
+        assert_eq!(
+            repo.check_attr("text", "secrets/store.p12"),
+            "set",
+            "the fixture no longer makes the check-in verdict say `convert`"
+        );
+
+        let complaint = failing_checkout(&repo, "secrets/store.p12");
+        assert!(
+            complaint.contains("the file has been altered"),
+            "an altered ciphertext was blamed on a line that does not convert \
+             at check-out:\n{complaint}"
+        );
+        assert!(
+            !complaint.contains("Nothing is lost"),
+            "the check-in verdict was reused for the check-out direction, so a \
+             file whose plaintext really is gone was reported as safe:\n{complaint}"
+        );
+    }
+
+    // 4. Another key's file, under the same converting line. Only a failed
+    //    authentication tag may be re-explained; a header that belongs to a
+    //    different key is not something a `.gitattributes` line can cause.
+    {
+        let (repo, _secret, blob) = repository_with_one_intact_secret();
+        let mut foreign = blob.clone();
+        // Byte 14 opens the frozen 8-byte `key_id`, which sits inside the
+        // authenticated header.
+        foreign[14] ^= 0xff;
+        commit_blob_verbatim(&repo, "secrets/store.p12", &foreign);
+        append_attribute_line(&repo, b"secrets/** text\n");
+        repo.set_eol_config("true", "");
+
+        let complaint = failing_checkout(&repo, "secrets/store.p12");
+        assert!(
+            complaint.contains("was encrypted with key"),
+            "a file belonging to another key must still say so:\n{complaint}"
+        );
+        assert!(
+            !complaint.contains("Nothing is lost"),
+            "a foreign key's file was reported as a configuration problem:\n{complaint}"
+        );
+    }
+}

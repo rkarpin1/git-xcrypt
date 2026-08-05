@@ -683,6 +683,24 @@ pub enum EolConversion {
     On(Culprit),
 }
 
+/// The `eol=` value git resolved, in the only two spellings that decide anything.
+///
+/// Kept beside [`EolConversion`] instead of folded into it because the two answer
+/// different questions. [`EolConversion`] is the check-**in** verdict and does not
+/// depend on configuration at all: `text` strips `CR` on the way into the object
+/// database whatever `core.autocrlf` says. The check-**out** direction does depend
+/// on it, and on this attribute — `text eol=lf` converts on the way in and writes
+/// the stored bytes out untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeclaredEol {
+    /// No `eol=`, or a value git does not recognise: the configuration decides.
+    Unspecified,
+    /// `eol=lf`.
+    Lf,
+    /// `eol=crlf`.
+    Crlf,
+}
+
 /// What git resolves for one path, on both axes the managed section sets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolution {
@@ -690,6 +708,47 @@ pub struct Resolution {
     pub filter: FilterAttribute,
     /// Whether git would convert the path's line endings itself.
     pub conversion: EolConversion,
+    /// The `eol=` the path resolved to, which only the check-out side reads.
+    pub eol: DeclaredEol,
+}
+
+impl Resolution {
+    /// The line that makes git expand `LF` to `CRLF` on the way **out** of the
+    /// object database, if any.
+    ///
+    /// Not the same question as [`Self::conversion`], and the difference is
+    /// measured rather than reasoned. On git 2.55, with `core.autocrlf=true` and
+    /// a blob full of lone `LF`:
+    ///
+    /// | line                | check-in            | check-out          |
+    /// | ------------------- | ------------------- | ------------------ |
+    /// | `p text`            | strips `CR`         | **expands**        |
+    /// | `p text eol=lf`     | strips `CR`         | untouched          |
+    /// | `p text eol=crlf`   | strips `CR`         | **expands**        |
+    /// | `p eol=crlf`        | strips `CR`         | **expands**        |
+    /// | `p -text`, `binary` | untouched           | untouched          |
+    /// | `p text=auto`       | untouched (the NUL) | untouched          |
+    ///
+    /// Reusing the check-in verdict here would claim the second row damages a
+    /// checkout, which it does not — and on that row the bytes handed to the
+    /// authentication tag really are the stored ones, so a failing tag means the
+    /// file, not the configuration.
+    #[must_use]
+    pub fn expands_on_checkout(
+        &self,
+        autocrlf: Option<&str>,
+        core_eol: Option<&str>,
+    ) -> Option<&Culprit> {
+        let EolConversion::On(culprit) = &self.conversion else {
+            return None;
+        };
+        let writes_crlf = match self.eol {
+            DeclaredEol::Crlf => true,
+            DeclaredEol::Lf => false,
+            DeclaredEol::Unspecified => crate::eol::git_writes_crlf(autocrlf, core_eol),
+        };
+        writes_crlf.then_some(culprit)
+    }
 }
 
 /// One resolved attribute: its state, and where the state came from.
@@ -931,6 +990,17 @@ impl AttributeResolver {
                 State::Unspecified => FilterAttribute::Unspecified,
             }),
             conversion: converts(text.as_ref(), eol.as_ref()),
+            eol: match eol.as_ref().map(|(state, _)| state) {
+                Some(State::Value(value)) => match value.as_ref().as_bstr() {
+                    value if value == "lf" => DeclaredEol::Lf,
+                    value if value == "crlf" => DeclaredEol::Crlf,
+                    // `eol=native` and anything else git does not recognise:
+                    // `git_path_check_eol` answers `EOL_UNSET` for them, so the
+                    // configuration decides, exactly as with no `eol=` at all.
+                    _ => DeclaredEol::Unspecified,
+                },
+                _ => DeclaredEol::Unspecified,
+            },
         }
     }
 

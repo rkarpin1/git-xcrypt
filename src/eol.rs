@@ -191,6 +191,34 @@ pub fn resolve_output(
     }
 }
 
+/// Whether **git** would write `CRLF` into the working tree for a path it
+/// converts itself.
+///
+/// Git's `text_eol_is_crlf`, which is the same table [`resolve_output`] already
+/// reproduces for our own output — `core.autocrlf` first, `core.eol` only while
+/// it is false, the platform only when neither says anything. It is asked about
+/// a different subject: not "what should we write" but "is git about to expand
+/// `LF` to `CRLF` in bytes it hands us".
+///
+/// That question only comes up on the smudge path, and only once an
+/// authentication tag has already failed. Git's check-out order is blob, then
+/// git's conversion, then smudge, so on a path some attribute line pulled out
+/// from under the managed `-text`, the tag is handed bytes that were never
+/// stored — and the file is fine while the message says it is not.
+#[must_use]
+pub fn git_writes_crlf(autocrlf: Option<&str>, core_eol: Option<&str>) -> bool {
+    writes_crlf_where(autocrlf, core_eol, cfg!(windows))
+}
+
+/// The platform-independent core, for the same reason [`apply_where`] has one.
+fn writes_crlf_where(autocrlf: Option<&str>, core_eol: Option<&str>, native_is_crlf: bool) -> bool {
+    match resolve_output(None, autocrlf, core_eol) {
+        EolMode::Crlf => true,
+        EolMode::Lf => false,
+        EolMode::Native => native_is_crlf,
+    }
+}
+
 /// Whether a configuration value is one of git's spellings of true.
 ///
 /// Shared with `status`, which has to read `filter.git-xcrypt.required` by the
@@ -260,6 +288,49 @@ mod tests {
                 resolve_output(None, Some(spelling), Some("lf")),
                 EolMode::Lf,
                 "`core.autocrlf = {spelling}` is false to git, so core.eol decides"
+            );
+        }
+    }
+
+    #[test]
+    fn gits_own_check_out_conversion_follows_the_measured_table() {
+        // Measured on git 2.55, 2026-08-05, in a throwaway repository: a blob
+        // holding lone `LF` bytes, the path declared `text` so git's binary
+        // detection is out of the way, `rm` and `git checkout --`.
+        //
+        //   autocrlf=true                  -> CRLF, the file came back expanded
+        //   autocrlf=input                 -> LF, untouched
+        //   autocrlf=false core.eol=crlf   -> CRLF, expanded
+        //   autocrlf=false core.eol=native -> LF on macOS, untouched
+        //
+        // The third row is worth the ink: `core.eol` on its own reaches nothing
+        // — with no `text` attribute in force git leaves even a plain text blob
+        // alone — but once a foreign line sets `text`, `core.eol=crlf` expands
+        // exactly as `autocrlf=true` does.
+        for (autocrlf, core_eol, expected) in [
+            (Some("true"), None, true),
+            (Some("input"), None, false),
+            (Some("input"), Some("crlf"), false),
+            (Some("false"), Some("crlf"), true),
+            (Some("false"), Some("lf"), false),
+        ] {
+            assert_eq!(
+                git_writes_crlf(autocrlf, core_eol),
+                expected,
+                "autocrlf={autocrlf:?} eol={core_eol:?} disagrees with git 2.55"
+            );
+        }
+
+        // The row whose answer is the machine's, pinned on both machines rather
+        // than left to whichever one happens to run the suite.
+        for core_eol in [None, Some("native"), Some("")] {
+            assert!(
+                writes_crlf_where(Some("false"), core_eol, true),
+                "a Windows checkout expands, so a converted ciphertext breaks there"
+            );
+            assert!(
+                !writes_crlf_where(Some("false"), core_eol, false),
+                "a Unix checkout leaves the bytes alone"
             );
         }
     }

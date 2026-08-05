@@ -178,6 +178,17 @@ impl Context {
     /// the managed `-text` is one line among many and git takes the last match,
     /// so the only thing that answers this is a full resolution.
     fn ciphertext_would_be_converted(&mut self, path: &[u8]) -> Option<gitattributes::Culprit> {
+        match self.attribute_stack()?.resolve(path).conversion {
+            gitattributes::EolConversion::On(culprit) => Some(culprit),
+            gitattributes::EolConversion::Off => None,
+        }
+    }
+
+    /// Git's attribute stack, built on first use and kept for the process.
+    ///
+    /// `None` only when there is no repository behind this process, which is the
+    /// unit-test shape; every caller then skips its check rather than guessing.
+    fn attribute_stack(&mut self) -> Option<&mut gitattributes::AttributeResolver> {
         if self.attributes.is_none() {
             let location = self.location.as_ref()?;
             let resolver = gitattributes::AttributeResolver::new(
@@ -188,11 +199,100 @@ impl Context {
             );
             self.attributes = Some(resolver);
         }
+        self.attributes.as_mut()
+    }
 
-        match self.attributes.as_mut()?.resolve(path).conversion {
-            gitattributes::EolConversion::On(culprit) => Some(culprit),
-            gitattributes::EolConversion::Off => None,
+    /// Turns "the file has been altered" into the truth when **git** altered it.
+    ///
+    /// The check-in side refuses before anything is stored; this is the other end
+    /// of the same mistake, on a repository where the line arrived after the
+    /// commit. Git's check-out order is blob, then git's own conversion, then
+    /// smudge, so a `text` line outranking the managed `-text` hands the
+    /// authentication tag bytes that were never stored. Measured on git 2.55 with
+    /// a filter that copied its stdin aside: a 4118-byte blob holding 18 lone
+    /// `LF` and no `CRLF` arrived as 4136 bytes holding 18 `CRLF` and no lone
+    /// `LF`. The tag is right to refuse that — but the blob is intact to the
+    /// byte, and `the file has been altered` reads as "your repository is corrupt
+    /// and the data is gone".
+    ///
+    /// **Asked only after the tag has already failed**, which is what makes it
+    /// free. The smudge path runs for every file of every checkout and every
+    /// clone, so a question asked before the failure would be paid for by every
+    /// healthy repository; a failed tag is rare enough that building the whole
+    /// attribute stack here costs nothing measurable.
+    ///
+    /// Three things have to agree before this claims anything, and the cheapest
+    /// is asked first so the stack is built only for content that already looks
+    /// converted:
+    ///
+    /// 1. the bytes carry the shape git's expansion leaves behind;
+    /// 2. git's attribute stack really does convert this path;
+    /// 3. git's check-out direction on **this machine** is `CRLF`.
+    ///
+    /// What it deliberately does not do is prove the stored blob would decrypt.
+    /// It cannot: the expansion is not invertible, since an output `CRLF` may
+    /// have come from a stored `CRLF` or from a stored lone `LF`. The residual
+    /// case is a ciphertext damaged by this same conversion running on the way
+    /// *in*, under a build older than 2026-08-05, in a repository that still
+    /// carries the line. Two things keep it honest: nothing this message claims
+    /// is false there either — a checkout only reads — and the state is
+    /// self-correcting, because once the line is gone the predicate stops firing
+    /// and the very next checkout says `the file has been altered` after all.
+    fn conversion_explains_a_failed_tag(
+        &mut self,
+        path: &[u8],
+        content: &[u8],
+    ) -> Option<gitattributes::Culprit> {
+        if !bears_the_mark_of_an_expansion(content) {
+            return None;
         }
+
+        let resolved = self.attribute_stack()?.resolve(path);
+        resolved
+            .expands_on_checkout(self.autocrlf.as_deref(), self.core_eol.as_deref())
+            .cloned()
+    }
+
+    /// Replaces a smudge failure's message when git's conversion explains it.
+    ///
+    /// Only [`Error::Crypto`], which on this path is the authentication tag and
+    /// nothing else: [`Error::Format`] is a header this build cannot read and
+    /// [`Error::KeyMismatch`] is another key's file, and no `.gitattributes` line
+    /// can cause either. Re-explaining those would be the same lie in the other
+    /// direction.
+    fn explain_a_failed_smudge(&mut self, path: &[u8], content: &[u8], err: Error) -> Error {
+        if !matches!(err, Error::Crypto(_)) {
+            return err;
+        }
+        match self.conversion_explains_a_failed_tag(path, content) {
+            Some(culprit) => self.report_conversion_at_checkout(&culprit),
+            None => err,
+        }
+    }
+
+    /// The message a checkout git converted gets instead of "altered".
+    ///
+    /// Three things it has to carry, in this order, because they are the three a
+    /// reader is missing: that nothing was lost, which line did it, and what to
+    /// do. The first is the load-bearing one — everything the user can see says
+    /// the opposite.
+    fn report_conversion_at_checkout(&self, culprit: &gitattributes::Culprit) -> Error {
+        Error::Config(format!(
+            "git rewrote this file's line endings on the way out of the object \
+             database, before this filter saw a byte of it, because this line \
+             outranks the managed `-text`:\n  {}\nGit's check-out order is blob, \
+             then git's own conversion, then smudge, so what reached the \
+             authentication tag is not what was stored: every lone `LF` in the \
+             ciphertext arrived here as `CRLF`. Refusing that is correct.\n\
+             Nothing is lost. A checkout only reads: the object database still \
+             holds exactly the blob that was committed, this command changed \
+             nothing on disk, and no key and no history were touched — what \
+             failed is a copy made in flight.\nDelete or narrow that line so the \
+             managed `-text` wins, run `git-xcrypt sync`, and check this file out \
+             again. If it still fails once that line is gone, the stored \
+             ciphertext itself was altered and `git-xcrypt status` will name it",
+            self.spell(culprit)
+        ))
     }
 
     /// Turns that answer into the refusal git aborts the operation with.
@@ -203,19 +303,7 @@ impl Context {
     /// message names the file, the line, the pattern and the assignment, spelled
     /// relative to the working tree where there is one.
     fn refuse_conversion(&self, culprit: &gitattributes::Culprit) -> Error {
-        let shown = match (&culprit.source, self.location.as_ref()) {
-            (Some(source), Some(location)) => gitattributes::Culprit {
-                source: Some(
-                    source
-                        .strip_prefix(&location.work_tree)
-                        .unwrap_or(source)
-                        .to_path_buf(),
-                ),
-                ..culprit.clone()
-            }
-            .to_string(),
-            _ => culprit.to_string(),
-        };
+        let shown = self.spell(culprit);
 
         Error::Config(format!(
             "git would convert this path's line endings itself, because this line \
@@ -228,6 +316,28 @@ impl Context {
              lost. Delete or narrow that line so the managed `-text` wins, run \
              `git-xcrypt sync`, and try again"
         ))
+    }
+
+    /// Names an attribute line relative to the working tree, where there is one.
+    ///
+    /// A refusal nobody can act on is only half of one, and the level that
+    /// outranks the rest — `$GIT_DIR/info/attributes` — is not versioned and
+    /// cannot be seen in a pull request at all. Both directions print it the same
+    /// way on purpose: the reader is looking for one line, not for two dialects.
+    fn spell(&self, culprit: &gitattributes::Culprit) -> String {
+        match (&culprit.source, self.location.as_ref()) {
+            (Some(source), Some(location)) => gitattributes::Culprit {
+                source: Some(
+                    source
+                        .strip_prefix(&location.work_tree)
+                        .unwrap_or(source)
+                        .to_path_buf(),
+                ),
+                ..culprit.clone()
+            }
+            .to_string(),
+            _ => culprit.to_string(),
+        }
     }
 
     /// Looks for `.git-xcrypt` again if it was absent when the process started.
@@ -254,6 +364,37 @@ impl Context {
         }
         Ok(())
     }
+}
+
+/// Whether `content` carries the shape git's check-out conversion leaves behind.
+///
+/// Git's `crlf_to_worktree` rewrites every **lone** `LF` as `CRLF` and leaves an
+/// existing `CRLF` alone, so its output has no lone `LF` left anywhere. That
+/// makes the fingerprint exact in both halves:
+///
+/// * **no lone `LF`** — bytes git expanded cannot contain one. The damage the
+///   *other* direction does is excluded by the same clause: conversion on the way
+///   in strips `CR`, so a blob it broke is full of lone `LF`, and after a
+///   round trip through this clause it is correctly called altered.
+/// * **at least one `CRLF`** — with nothing to expand, git hands the blob over
+///   untouched and a failing tag is the file's own doing, not git's.
+///
+/// Measured on git 2.55, 2026-08-05, with a filter that copied its stdin aside: a
+/// 4118-byte blob holding 18 lone `LF` and no `CRLF` arrived as 4136 bytes
+/// holding 18 `CRLF` and no lone `LF`.
+///
+/// One pass, no allocation, and only ever on a path whose tag has already failed.
+fn bears_the_mark_of_an_expansion(content: &[u8]) -> bool {
+    let mut expanded = false;
+    for (index, &byte) in content.iter().enumerate() {
+        if byte == b'\n' {
+            if index == 0 || content[index - 1] != b'\r' {
+                return false;
+            }
+            expanded = true;
+        }
+    }
+    expanded
 }
 
 /// Runs the protocol to completion on the given streams.
@@ -412,6 +553,9 @@ fn serve(context: &mut Context, request: &Request, output: &mut impl Write) -> R
         }),
         "smudge" => {
             let decision = context.config.decide(&request.pathname);
+            // The failure is where the diagnosis happens, and nowhere earlier:
+            // this path runs for every file of every checkout and every clone,
+            // so a healthy repository must not pay a byte for it.
             decide::smudge(
                 context.key.as_ref(),
                 &request.pathname,
@@ -421,6 +565,9 @@ fn serve(context: &mut Context, request: &Request, output: &mut impl Write) -> R
                 context.autocrlf.as_deref(),
                 context.core_eol.as_deref(),
             )
+            .map_err(|err| {
+                context.explain_a_failed_smudge(&request.pathname, &request.content, err)
+            })
         }
         other => Err(Error::Format(format!(
             "git asked for the unknown filter command `{other}`"
