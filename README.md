@@ -292,6 +292,20 @@ exits 0, and the first thing that would have told you was the failed checkout.
   the whole repository. The cost on a case-sensitive filesystem is the other
   way round: a file you deliberately named `secrets/.GITATTRIBUTES` stays in the
   clear.
+- **The system-wide attributes file is not consulted.** Besides the sources
+  this tool resolves, git reads `$(prefix)/etc/gitattributes` — a path baked
+  into each git build: Homebrew's git answers `/opt/homebrew/etc/gitattributes`,
+  Apple's answers `/etc/gitattributes`, and `git var GIT_ATTR_SYSTEM` prints
+  yours. That path cannot be learned without asking a `git` process, which a
+  self-contained filter must not do — measured, it does not follow from
+  `GIT_EXEC_PATH` for either macOS git — and resolving a *guessed* path that the
+  running git does not read could refuse a healthy `git add`, which
+  `required = true` turns into an outage. So the check-in refusal and `status`
+  are blind to exactly this one source: a `text` line there that reaches an
+  encrypted path converts the ciphertext with no gate firing, the same damage
+  the global-file case describes. None of the inspected installations ships the
+  file by default. If your machine has one, keep encrypted paths out of it, or
+  export `GIT_ATTR_NOSYSTEM=1` so git itself stops reading it.
 - `git archive` exports ciphertext: git does not apply filters to it.
 - Submodules have their own configuration and need their own `init`.
 - `working-tree-encoding` (character-set conversion, e.g. UTF-16) is not
