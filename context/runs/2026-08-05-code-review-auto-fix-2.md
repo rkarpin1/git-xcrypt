@@ -114,11 +114,20 @@ pozwala gitowi zjeść `CR` z ciphertextu i stracić plik przy checkoucie.
 
 1. **`status.rs:793`** — kod `5` zamiast `6` w repozytorium bez `.git-xcrypt`; sprzeczność
    między komentarzem w kodzie, `zalozenia.md` i zachowaniem. Poprawka rusza regułę werdyktu.
-2. **Leady niezweryfikowane pomiarem**, zgłoszone jako kierunki, nie wady: TOCTOU na worktree
-   dodanym w trakcie promptu `lock`; `catch_all_present` jako dowód rejestracji filtra;
-   `main_checkout` przy nieparsowalnym configu; sparse index niewidoczny dla `inspect_index`;
-   `core.attributesFile` bez rozwinięcia `~/` i bez ścieżki XDG; `config.worktree`
-   podłączonego worktree.
+2. ~~**Leady niezweryfikowane pomiarem**, zgłoszone jako kierunki, nie wady.~~
+   **Zmierzone wszystkie sześć, 2026-08-05.** Trzy okazały się realnymi wadami i są
+   naprawione, trzy obalone pomiarem:
+
+   | Lead | Wynik |
+   | --- | --- |
+   | `core.attributesFile` bez `~/` i bez XDG | **WADA** — `git add` kodem 0, 27 B `CR` zjedzone z bloba 2 MB, plik przepadł przy checkoucie, `status` mówił `no findings`. Naprawione w `gitconfig::global_attributes_file` |
+   | `config.worktree` podłączonego worktree | **WADA** — czytany był plik *głównego* checkoutu; przez `core.attributesFile` kosztowało 40 B z bloba i plik przy checkoucie. Naprawione; przy okazji wyszło, że `extensions.worktreeConfig` bez zapisanego pliku wywracało **każdą** operację gita |
+   | TOCTOU na worktree w trakcie promptu `lock` | **WADA** — `lock` kodem 0, klucz usunięty, nowy checkout jawny. Naprawione drugim wywołaniem `refuse_other_worktrees` po promptcie |
+   | `catch_all_present` jako dowód rejestracji filtra | **obalone** — sprawdzenia są niezależne; klon z linią catch-all i bez wpisów w `.git/config` kończy `2` i nazywa oba brakujące klucze |
+   | sparse index niewidoczny dla `inspect_index` | **obalone** — skan historii nie potrzebuje indeksu, a katalog zwija się wyłącznie wtedy, gdy jest identyczny z `HEAD`; wyciek w wykluczonym katalogu nadal daje `5`. Dopisany do macierzy `odd_repositories.rs` |
+   | `main_checkout` przy nieparsowalnym configu | **obalone co do skutku** — `open_full` pada wcześniej na obu zmierzonych kształtach. Ale `.ok()?` przeczyło regule z komentarza tej samej funkcji, więc doprowadzone do niej: nieczytelna konfiguracja daje „nie wiem", nie „nie ma checkoutu" |
+
+   Zestaw urósł ze 102 do 107 testów; każdy nowy strażnik sprawdzony mutacją.
 3. **`status.rs` (1524 l.) i `gitindex.rs` (998 l.)** przejrzane przez agenta rundy
    fragmentarycznie — w całości czytał je agent pomocniczy, którego wniosków agent rundy
    świadomie nie przyjął bez własnego pomiaru.
