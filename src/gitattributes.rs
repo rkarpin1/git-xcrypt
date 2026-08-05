@@ -780,9 +780,29 @@ pub fn foreign_filter_lines(path: &Path) -> Result<Vec<String>> {
 /// working tree may be arbitrarily deep and a diagnostic command must not be the
 /// thing that crashes on it. Directories that will not open are skipped, exactly
 /// as git skips a file it cannot read — see [`FilterResolver`].
+///
+/// **Each directory's file is probed by name, never matched against the
+/// listing.** Git does the same — it `open`s `<dir>/.gitattributes` and lets
+/// the filesystem resolve the name — and the two ways differ exactly where it
+/// costs a file: on APFS and NTFS a file *stored* as `.GITATTRIBUTES` **is**
+/// the attributes file to git, measured on git 2.55 (`* -text` in
+/// `secrets/.GITATTRIBUTES` answered `text: unset` for `secrets/db.env`),
+/// while a listing comparison never saw it — so a `text` line in one converted
+/// the ciphertext with no gate firing anywhere. On a case-sensitive filesystem
+/// the same probe finds nothing, which is also exactly git. The probe works in
+/// a directory whose mode allows lookup but not listing, too — git never lists
+/// either.
 fn collect_attribute_files(root: &Path, out: &mut Vec<PathBuf>) {
     let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {
+        let file = directory.join(crate::repo::ATTRIBUTES_FILE);
+        // Never followed: a symbolic link out of the working tree would walk
+        // somewhere that is not this repository, and one pointing back into
+        // it would loop.
+        if fs::symlink_metadata(&file).is_ok_and(|metadata| metadata.is_file()) {
+            out.push(file);
+        }
+
         let Ok(entries) = fs::read_dir(&directory) else {
             continue;
         };
@@ -790,18 +810,11 @@ fn collect_attribute_files(root: &Path, out: &mut Vec<PathBuf>) {
             let Ok(kind) = entry.file_type() else {
                 continue;
             };
-            // Never followed: a symbolic link out of the working tree would walk
-            // somewhere that is not this repository, and one pointing back into
-            // it would loop.
             if kind.is_symlink() {
                 continue;
             }
-            if kind.is_dir() {
-                if entry.file_name() != std::ffi::OsStr::new(".git") {
-                    pending.push(entry.path());
-                }
-            } else if entry.file_name() == std::ffi::OsStr::new(crate::repo::ATTRIBUTES_FILE) {
-                out.push(entry.path());
+            if kind.is_dir() && entry.file_name() != std::ffi::OsStr::new(".git") {
+                pending.push(entry.path());
             }
         }
     }

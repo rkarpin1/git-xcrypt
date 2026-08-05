@@ -364,6 +364,38 @@ const OTHER_SPELLINGS: &[&str] = &[
 ];
 
 #[test]
+fn a_case_spelled_attributes_file_is_read_exactly_where_git_reads_it() {
+    // On APFS and NTFS a file *stored* as `.GITATTRIBUTES` is the attributes
+    // file to git — it opens `<dir>/.gitattributes` by name and the filesystem
+    // resolves the case — measured on git 2.55. The resolver used to compare
+    // directory-listing entries against the exact name, so a `text` line in
+    // such a file converted the ciphertext with no gate firing anywhere.
+    //
+    // Asserted as *parity* rather than as either absolute, so the test runs on
+    // all three platforms: wherever git honours the file, the refusal must
+    // fire; wherever git does not (ext4), nothing converts and nothing may
+    // refuse.
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.xcrypt_ok(["sync"]);
+
+    repo.write_file("secrets/.GITATTRIBUTES", b"* text\n");
+    let honoured = repo.check_attr("text", "secrets/db.env") == "set";
+
+    repo.write_file("secrets/store.p12", &two_megabytes());
+    let add = repo.git(["add", "secrets/store.p12"]);
+    assert_eq!(
+        add.status.success(),
+        !honoured,
+        "git {} the case-spelled attributes file, and the gate read the stack \
+         differently:\n{}",
+        if honoured { "honours" } else { "ignores" },
+        String::from_utf8_lossy(&add.stderr)
+    );
+}
+
+#[test]
 fn a_pattern_reaches_every_ascii_spelling_of_a_name_and_the_rendered_line_keeps_up() {
     // Open decision 13, settled on 2026-08-05: pattern matching folds ASCII case,
     // unconditionally. The measured failure it closes: `.git-xcrypt` declares
