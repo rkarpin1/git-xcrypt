@@ -906,20 +906,38 @@ pub fn staged_fallbacks(
 
     use gix_object::Find as _;
 
-    let mut objects = None;
-    let mut buffer = Vec::new();
-    let mut found = Vec::new();
-    for entry in &entries {
-        if !entry.holds_content() {
-            continue;
-        }
-        let basename = entry
+    let basename_of = |entry: &crate::gitindex::Tracked| -> Vec<u8> {
+        entry
             .path
             .rsplit(|&byte| byte == b'/')
             .next()
-            .unwrap_or(&entry.path);
-        if !named(basename) {
-            continue;
+            .unwrap_or(&entry.path)
+            .to_vec()
+    };
+
+    let mut candidates: Vec<&crate::gitindex::Tracked> = entries
+        .iter()
+        .filter(|entry| entry.holds_content() && named(&basename_of(entry)))
+        .collect();
+    // One copy per folded path. With `core.ignorecase` the index can hold two
+    // spellings at once — a tree made on a case-sensitive filesystem, checked
+    // out here — while git's own lookup finds a single entry. The byte-exact
+    // name is the one git probes for, so it goes first and wins; reading both
+    // could hand the resolver a line in the copy git ignores, and on the
+    // filter that is a false refusal.
+    candidates.sort_by_key(|entry| basename_of(entry) != wanted);
+    let mut seen: Vec<Vec<u8>> = Vec::new();
+
+    let mut objects = None;
+    let mut buffer = Vec::new();
+    let mut found = Vec::new();
+    for entry in candidates {
+        if ignore_case {
+            let folded = entry.path.to_ascii_lowercase();
+            if seen.contains(&folded) {
+                continue;
+            }
+            seen.push(folded);
         }
 
         // The working-tree probe, by name, exactly as `collect_attribute_files`
