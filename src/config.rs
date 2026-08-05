@@ -276,6 +276,43 @@ impl Config {
             .is_some_and(|rule| rule.pattern.is_negative())
     }
 
+    /// Whether folding case would select a path that byte matching does not.
+    ///
+    /// **A question, not a change of mind.** Selection stays byte exact: what a
+    /// pattern means on a case-insensitive filesystem is an open decision in
+    /// `context/foundation/zalozenia.md`, and answering it by reading
+    /// `core.ignorecase` would put a *non-versioned* setting on the check-in
+    /// path, so the same repository would encrypt a different set of files on
+    /// macOS than on Linux. The founding document rules that out for
+    /// `core.autocrlf` in as many words, and the reason carries over unchanged.
+    ///
+    /// What is not open is whether anyone gets told. Measured on git 2.55 with
+    /// `core.ignorecase=true`, which is the default on APFS and on Git for
+    /// Windows: git folds case in `.gitignore` **and** in `.gitattributes`
+    /// matching, so a `*.pem` line in the managed section resolves
+    /// `filter=git-xcrypt`, `-text` and `diff=git-xcrypt` for `top.PEM` — while
+    /// this file leaves `top.PEM` in the clear. The rendered section therefore
+    /// reaches further than the filter, which AGENTS.md forbids in both
+    /// directions, and on such a filesystem the user cannot spell the difference
+    /// because the two names are one file.
+    ///
+    /// `status` asks this so it can say so. It reports the answer as
+    /// *undetermined*, never as an exposure: `5` tells an operator to rotate a
+    /// secret, and the remedy here is to settle a spelling and ask again.
+    ///
+    /// False whenever [`Config::decide`] already selects the path, so a caller
+    /// only ever sees the paths where the two answers differ.
+    #[must_use]
+    pub fn selected_only_when_folding_case(&self, path: &[u8]) -> bool {
+        if is_never_encrypted(path) || self.decide(path).encrypt {
+            return false;
+        }
+        self.rules
+            .iter()
+            .rfind(|rule| matches_with(&rule.pattern, path, Case::Fold))
+            .is_some_and(|rule| !rule.pattern.is_negative())
+    }
+
     /// What the patterns alone say, with the bootstrap exclusions set aside.
     ///
     /// Only one caller wants this: rendering `.gitattributes` has to know
@@ -394,12 +431,21 @@ fn parse_attributes(text: &str, line: usize) -> Result<Declared> {
 /// everything beneath it as matched. `gix-glob` answers about one path at a
 /// time, so the ancestors are offered to it explicitly.
 fn matches(pattern: &Pattern, path: &[u8]) -> bool {
-    if match_one(pattern, path, false) {
+    matches_with(pattern, path, Case::Sensitive)
+}
+
+/// The same question asked with a chosen case sensitivity.
+///
+/// Only [`Config::selected_only_when_folding_case`] ever passes anything but
+/// [`Case::Sensitive`], and it does so to *report* a difference rather than to
+/// act on one — see that method for why selection itself stays byte exact.
+fn matches_with(pattern: &Pattern, path: &[u8], case: Case) -> bool {
+    if match_one(pattern, path, false, case) {
         return true;
     }
 
     for (index, byte) in path.iter().enumerate() {
-        if *byte == b'/' && match_one(pattern, &path[..index], true) {
+        if *byte == b'/' && match_one(pattern, &path[..index], true, case) {
             return true;
         }
     }
@@ -407,14 +453,14 @@ fn matches(pattern: &Pattern, path: &[u8]) -> bool {
 }
 
 /// One `gix-glob` question.
-fn match_one(pattern: &Pattern, path: &[u8], is_dir: bool) -> bool {
+fn match_one(pattern: &Pattern, path: &[u8], is_dir: bool, case: Case) -> bool {
     let bytes: &BStr = path.as_bstr();
     let basename_start = path.rfind_byte(b'/').map(|index| index + 1);
     pattern.matches_repo_relative_path(
         bytes,
         basename_start,
         Some(is_dir),
-        Case::Sensitive,
+        case,
         wildmatch::Mode::NO_MATCH_SLASH_LITERAL,
     )
 }
@@ -649,6 +695,41 @@ mod tests {
             [false, true, false]
         );
         assert!(patterns[2].suppress_diff);
+    }
+
+    #[test]
+    fn folding_case_is_asked_about_and_never_acted_on() {
+        let config = config("secrets/\n*.pem\n!secrets/README.md\n");
+
+        // Selection itself does not move. This is the half that must not change:
+        // `core.ignorecase` is not versioned, so a folded *decision* would make
+        // the same repository encrypt a different set of files on macOS than on
+        // Linux — the argument the founding document already makes about
+        // `core.autocrlf` on the check-in path.
+        assert!(!config.decide(b"Secrets/db.txt").encrypt);
+        assert!(!config.decide(b"top.PEM").encrypt);
+
+        // The difference is reported, though, because on a case-insensitive
+        // filesystem git resolves the managed section's `-text` and
+        // `diff=git-xcrypt` for exactly these names — measured on git 2.55.
+        assert!(config.selected_only_when_folding_case(b"Secrets/db.txt"));
+        assert!(config.selected_only_when_folding_case(b"top.PEM"));
+
+        // Only where the two answers differ. A path the byte match already
+        // selects has nothing undecided about it, and neither has one no
+        // pattern reaches in either spelling.
+        assert!(!config.selected_only_when_folding_case(b"secrets/db.txt"));
+        assert!(!config.selected_only_when_folding_case(b"notes.txt"));
+
+        // A negation is a negation in either spelling, so the exception the
+        // user wrote is not reported as an accident.
+        assert!(!config.selected_only_when_folding_case(b"secrets/README.md"));
+        assert!(!config.selected_only_when_folding_case(b"Secrets/README.MD"));
+
+        // And the bootstrap files stay out of it: they are excluded by the tool
+        // whatever the spelling, so folding cannot drag them in.
+        let catch_everything = super::super::config::Config::parse("*\n").expect("parses");
+        assert!(!catch_everything.selected_only_when_folding_case(ATTRIBUTES_FILE.as_bytes()));
     }
 
     #[test]

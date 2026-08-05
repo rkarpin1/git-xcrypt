@@ -1686,3 +1686,113 @@ fn the_attribute_values_that_leave_the_ciphertext_alone_do_not_fail_the_gate() {
         );
     }
 }
+
+/// A checkout where git cannot tell two spellings apart, and the declaration
+/// picks one of them.
+///
+/// Measured on git 2.55 and APFS, which is what macOS ships and where
+/// `core.ignorecase` is `true` by default — Git for Windows sets it too:
+///
+/// ```text
+/// .git-xcrypt: *.pem          →  git check-attr filter text diff -- top.PEM
+/// on disk:     top.PEM            top.PEM: filter: git-xcrypt
+///                                 top.PEM: text:   unset
+///                                 top.PEM: diff:   git-xcrypt
+/// git cat-file blob HEAD:top.PEM → 53 32 0a       ← the plain text
+/// git-xcrypt status              → VERDICT: no findings.   exit 0
+/// ```
+///
+/// Git folds case in both files under `core.ignorecase` — measured for
+/// `.gitignore` and for `.gitattributes`, and measured *not* to fold with
+/// `core.ignorecase=false` — while `config::decide` matches bytes. So the
+/// managed section reaches further than the filter does, which AGENTS.md names
+/// as a hard rule in its own right, and on a case-insensitive filesystem the
+/// user has no way to spell the difference: the two names are one file.
+///
+/// What a pattern *means* here is open decision 13 in `zalozenia.md` and is not
+/// settled by this test — which is exactly why the verdict is `undetermined` and
+/// not `exposed`. `5` tells an operator to rotate the secret; the remedy here is
+/// to fix a spelling and ask again, which is what `6` means.
+///
+/// `core.ignorecase` is set explicitly rather than inherited, so the test asks
+/// the same question on all three platforms instead of only the two whose
+/// filesystems default to it.
+#[test]
+fn a_path_only_a_case_apart_from_a_declaration_is_reported_as_undecidable() {
+    let repo = TestRepo::init();
+    repo.git_ok(["config", "core.ignorecase", "true"]);
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n*.pem\n");
+    repo.xcrypt_ok(["sync"]);
+
+    repo.write_file("Secrets/db.txt", b"hunter2\n");
+    repo.write_file("top.PEM", b"hunter3\n");
+    repo.commit_all("two files git considers declared and the filter does not");
+
+    // The premise, not the conclusion: git really does resolve the managed
+    // section's attributes for these names, and the filter really did leave the
+    // content alone.
+    assert_eq!(repo.check_attr("filter", "top.PEM"), "git-xcrypt");
+    assert_eq!(repo.check_attr("text", "top.PEM"), "unset");
+    assert_eq!(
+        repo.blob_bytes("top.PEM"),
+        b"hunter3\n",
+        "the premise has changed: the filter now encrypts this path"
+    );
+    assert_eq!(
+        repo.blob_bytes("Secrets/db.txt"),
+        b"hunter2\n",
+        "the premise has changed: the filter now encrypts this path"
+    );
+
+    let output = repo.xcrypt(["status"]);
+    let text = report(&output);
+
+    assert_eq!(
+        output.status.code(),
+        Some(UNDETERMINED),
+        "a path git considers declared and the filter leaves in the clear was \
+         reported as nothing at all:\n{text}"
+    );
+    assert!(
+        text.contains("top.PEM"),
+        "the report does not name the file:\n{text}"
+    );
+    assert!(
+        text.contains("Secrets/db.txt"),
+        "a directory pattern reaches the same way a file pattern does:\n{text}"
+    );
+    assert!(
+        text.contains("core.ignorecase"),
+        "nothing tells the reader why the two names are one file here:\n{text}"
+    );
+}
+
+/// The same repository with a case-sensitive checkout, where nothing is unclear.
+///
+/// `Secrets/db.env` and `secrets/db.env` are two files there, the user can spell
+/// both, and `git check-attr` agrees with the filter — measured: with
+/// `core.ignorecase=false`, `*.pem` resolves `text: unspecified` for `top.PEM`.
+/// A note fired here would be a gate that goes red on every Linux checkout that
+/// happens to hold a capital letter.
+#[test]
+fn a_case_sensitive_checkout_has_nothing_undecidable_about_it() {
+    let repo = TestRepo::init();
+    repo.git_ok(["config", "core.ignorecase", "false"]);
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n*.pem\n");
+    repo.xcrypt_ok(["sync"]);
+
+    repo.write_file("Public/notes.TXT", b"nothing secret\n");
+    repo.write_file("top.PEM", b"also not a secret\n");
+    repo.commit_all("names that differ from the patterns by case");
+
+    let output = repo.xcrypt(["status"]);
+    let text = report(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a case-sensitive checkout has two distinguishable names, so there is \
+         nothing to be unsure about:\n{text}"
+    );
+}

@@ -813,13 +813,18 @@ pub fn run(repo: &Repo, fix: bool) -> Result<Report> {
     // resolution answers it. Built once for the whole run — it reads every
     // `.gitattributes` in the working tree, and doing that per path would turn a
     // diagnostic into a walk of the tree squared.
+    // Git applies this to attribute matching as well as to path lookup, and it
+    // is the whole reason the managed section can reach a path the filter does
+    // not — see `Config::selected_only_when_folding_case`.
+    let ignore_case =
+        gitconfig::get(&config, "core.ignorecase").is_some_and(|value| gitconfig::is_true(&value));
     let mut filters = gitattributes::AttributeResolver::new(
         repo.work_tree(),
         repo.git_dir(),
         gitconfig::get(&config, "core.attributesFile")
             .as_deref()
             .map(std::path::Path::new),
-        gitconfig::get(&config, "core.ignorecase").is_some_and(|value| gitconfig::is_true(&value)),
+        ignore_case,
     );
 
     inspect_index(
@@ -828,6 +833,7 @@ pub fn run(repo: &Repo, fix: bool) -> Result<Report> {
         &objects,
         hash,
         &mut filters,
+        ignore_case,
         &mut report,
     )?;
     report.notes.extend(foreign_source_note(
@@ -948,6 +954,7 @@ fn inspect_index(
     objects: &gix_odb::Handle,
     hash: gix_hash::Kind,
     filters: &mut gitattributes::AttributeResolver,
+    ignore_case: bool,
     report: &mut Report,
 ) -> Result<()> {
     let index_path = repo.git_dir().join("index");
@@ -1014,6 +1021,10 @@ fn inspect_index(
     // Declared paths whose stored bytes git converts itself, with the line that
     // decides it. Grouped the same way and for the same reason.
     let mut converted: Vec<(String, String)> = Vec::new();
+    // Paths this checkout cannot tell apart from a declared one. Grouped for the
+    // same reason as the two above: one mis-spelled directory reaches every file
+    // under it.
+    let mut only_a_case_apart: Vec<String> = Vec::new();
 
     for entry in entries {
         // A symbolic link and a submodule gitlink are not file content, so git
@@ -1036,6 +1047,17 @@ fn inspect_index(
             continue;
         }
         if !declarations.decide(&name).encrypt {
+            // Not declared as this file spells it — but on a checkout where git
+            // folds case, git resolves the managed section's `filter`, `-text`
+            // and `diff` for this very name, and the user has no way to spell
+            // the difference because the two names are one file. Measured on git
+            // 2.55 with `core.ignorecase=true`, the default on APFS and on Git
+            // for Windows: `*.pem` in `.gitattributes` answers `filter:
+            // git-xcrypt`, `text: unset` for `top.PEM`, while the filter stores
+            // the plain text and `git add` exits 0.
+            if ignore_case && declarations.selected_only_when_folding_case(&name) {
+                only_a_case_apart.push(show(&name));
+            }
             continue;
         }
 
@@ -1108,6 +1130,37 @@ fn inspect_index(
             total: converted.len(),
             culprit,
         });
+    }
+
+    if !only_a_case_apart.is_empty() {
+        only_a_case_apart.sort();
+        let shown = only_a_case_apart
+            .iter()
+            .take(MAX_LISTED)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = only_a_case_apart.len().saturating_sub(MAX_LISTED);
+        report.undetermined.push(format!(
+            "core.ignorecase is true here, so git treats a name and its other \
+             spellings as one file — and it folds case in `{}` too, which is why \
+             the managed section's `filter`, `-text` and `diff=git-xcrypt` do \
+             resolve for {} tracked path(s) that `{}` does not select as they are \
+             spelled: {shown}{}. Whether a pattern should fold is not settled, so \
+             nothing here guesses: the filter stored these paths' content \
+             unchanged and `git add` exited 0. Either rename the file to the \
+             spelling in `{}` or add a line spelling it as it is on disk, then \
+             run `git-xcrypt sync` and ask again.",
+            crate::repo::ATTRIBUTES_FILE,
+            only_a_case_apart.len(),
+            crate::repo::CONFIG_FILE,
+            if more > 0 {
+                format!(", … and {more} more")
+            } else {
+                String::new()
+            },
+            crate::repo::CONFIG_FILE,
+        ));
     }
     Ok(())
 }
