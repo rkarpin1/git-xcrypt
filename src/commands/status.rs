@@ -361,19 +361,29 @@ impl Report {
         !self.in_the_clear.is_empty() || !self.leaked.is_empty()
     }
 
-    /// Whether any setup gap means git stores declared content unfiltered.
+    /// Whether any setup gap means git stores declared content unfiltered
+    /// **on this machine**.
     ///
-    /// Two of them do not, and they are opposite failures rather than milder
+    /// Three of them do not, and they are different failures rather than milder
     /// ones. [`SetupGap::CiphertextConverted`]: git runs the filter and then
     /// damages what it produced, so what is lost is the file, not the secret.
     /// [`SetupGap::DeclarationMissing`]: the check-in path refuses outright, so
-    /// nothing is stored at all. Same exit code, three different remedies — and
-    /// only the first calls for rotating anything.
+    /// nothing is stored at all. [`SetupGap::Untracked`]: git enforces the
+    /// declarations *here* — the attributes and the declaration are read from
+    /// the working tree — and publishes nothing that enforces them anywhere
+    /// else; the exposure is a clone's, not this checkout's. Same exit code,
+    /// four different remedies — and only the first calls for rotating
+    /// anything. Telling a user whose repository filters correctly that
+    /// "committing a declared file stores it in the clear" sends them to
+    /// rotate secrets that were never exposed, which is the failure mode the
+    /// 2026-08-05 precedence change was made to remove.
     fn stores_in_the_clear(&self) -> bool {
         self.setup.iter().any(|gap| {
             !matches!(
                 gap,
-                SetupGap::CiphertextConverted { .. } | SetupGap::DeclarationMissing
+                SetupGap::CiphertextConverted { .. }
+                    | SetupGap::DeclarationMissing
+                    | SetupGap::Untracked(_)
             )
         })
     }
@@ -383,6 +393,13 @@ impl Report {
         self.setup
             .iter()
             .all(|gap| matches!(gap, SetupGap::DeclarationMissing))
+    }
+
+    /// Whether the only thing wrong is that the bootstrap files are uncommitted.
+    fn only_the_bootstrap_is_untracked(&self) -> bool {
+        self.setup
+            .iter()
+            .all(|gap| matches!(gap, SetupGap::Untracked(_)))
     }
 }
 
@@ -451,6 +468,15 @@ impl fmt::Display for Report {
                      nothing below was checked, because there is no way to tell which \
                      paths should have been."
                 )?;
+            } else if self.only_the_bootstrap_is_untracked() {
+                writeln!(
+                    f,
+                    "setup: git enforces the declarations on this machine — the files \
+                     below are read from the working tree — but they are not \
+                     committed, so no clone gets them and nothing published enforces \
+                     anything. Commits made *here* store ciphertext; commits made \
+                     from a clone would not."
+                )?;
             } else {
                 writeln!(
                     f,
@@ -474,6 +500,18 @@ impl fmt::Display for Report {
                     writeln!(f, "    git-xcrypt unlock <key-file>")?;
                     writeln!(f, "    git-xcrypt import-key <key-file>")?;
                 }
+            } else if self.only_the_bootstrap_is_untracked() {
+                // Neither `init` nor `unlock` commits anything, so offering
+                // them here would send a reader round a loop that changes
+                // nothing — the same rule the comment above states for the
+                // conversion gap. The remedy is a commit.
+                writeln!(f, "\n  Fix it by committing the files:")?;
+                writeln!(
+                    f,
+                    "    git add {} {} && git commit",
+                    crate::repo::ATTRIBUTES_FILE,
+                    crate::repo::CONFIG_FILE
+                )?;
             }
         }
 
@@ -1722,6 +1760,43 @@ mod tests {
             !text.contains("stores it in the clear"),
             "nothing is stored in the clear over a refused `git add`, and saying \
              otherwise sends a user to rotate a secret that was never exposed: {text}"
+        );
+    }
+
+    #[test]
+    fn an_uncommitted_bootstrap_is_not_reported_as_a_repository_storing_plaintext() {
+        // With the attributes and the declaration present in the working tree,
+        // git *does* enforce them here — both are read from the tree — and the
+        // exposure belongs to a clone, which gets neither. The headline used to
+        // say "committing a declared file stores it in the clear, with exit
+        // code 0 and no warning", which is false of this repository and sends
+        // its user to rotate secrets that were never exposed; the remedy block
+        // offered `init`, which does not commit anything and so changes
+        // nothing.
+        let report = Report {
+            has_key: true,
+            setup: vec![SetupGap::Untracked(crate::repo::ATTRIBUTES_FILE.into())],
+            ..Report::default()
+        };
+        assert_eq!(report.verdict(), Verdict::Misconfigured);
+        let text = report.to_string();
+        assert!(
+            !text.contains("stores it in the clear"),
+            "this repository filters correctly, and the headline says it does \
+             not: {text}"
+        );
+        assert!(
+            text.contains("no clone gets them"),
+            "the real exposure — the clone's — goes unnamed: {text}"
+        );
+        assert!(
+            text.contains("git add"),
+            "the one remedy that works, a commit, is not offered: {text}"
+        );
+        assert!(
+            !text.contains("git-xcrypt init"),
+            "`init` does not commit anything, so offering it here is a loop \
+             that changes nothing: {text}"
         );
     }
 }
