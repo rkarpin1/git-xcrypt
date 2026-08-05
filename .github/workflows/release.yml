@@ -162,10 +162,16 @@ jobs:
             dist/*.sha256
           if-no-files-found: error
 
+  # Runs on a dispatch too, and only the upload step is held back by the tag.
+  # Gating the whole job on the tag would have left the attestation step — the
+  # one part of this workflow with no other way to be exercised — unreachable
+  # from the dry run this workflow offers `workflow_dispatch` for. A dry run
+  # that skips the step it exists to rehearse is worse than none: it reports
+  # success over something nobody tried.
   publish:
     name: publish the release
     needs: [build]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: always() && needs.build.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -178,7 +184,10 @@ jobs:
       # wrong file.
       #
       # Before the upload, so a failure here stops the release rather than
-      # leaving published artefacts nobody attested.
+      # leaving published artefacts nobody attested. A dispatch run reaches
+      # here as well and leaves a real attestation behind for an archive that
+      # was never released — untidy, and the price of being able to prove this
+      # step works before a tag depends on it.
       - name: Attest the archives
         uses: actions/attest-build-provenance@v2
         with:
@@ -186,6 +195,7 @@ jobs:
             dist/*.tar.gz
             dist/*.zip
       - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
         with:
           files: |
             dist/*.tar.gz
