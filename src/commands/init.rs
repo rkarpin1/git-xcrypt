@@ -333,10 +333,22 @@ fn create_config_file(repo: &Repo) -> Result<bool> {
 /// Git hands the value to a shell, so a path containing a space or a quote would
 /// otherwise be split. Single quotes stop the shell expanding anything; a
 /// literal quote is closed, escaped and reopened.
+/// Only the **native** separator is rewritten, and that is the whole of it.
+/// Git wants forward slashes in a value it hands to a shell on Windows, but on
+/// Unix a backslash is an ordinary character in a file name — rewriting one
+/// there names a different file, exactly as `repo::git_spelling` says.
 fn current_executable() -> Result<String> {
-    let path = std::env::current_exe()?;
-    let text = path.to_string_lossy().replace('\\', "/");
-    Ok(format!("'{}'", text.replace('\'', r"'\''")))
+    Ok(shell_quoted(
+        &std::env::current_exe()?,
+        crate::repo::NATIVE_SEPARATOR,
+    ))
+}
+
+/// The platform-independent core, so both spellings are testable from either
+/// platform.
+fn shell_quoted(path: &std::path::Path, separator: char) -> String {
+    let text = crate::repo::with_separator(&path.to_string_lossy(), separator);
+    format!("'{}'", text.replace('\'', r"'\''"))
 }
 
 #[cfg(test)]
@@ -355,6 +367,47 @@ mod tests {
             .success();
         assert!(ok, "git init failed");
         dir
+    }
+
+    /// Both halves of the filter command's spelling, exercised from any platform.
+    ///
+    /// The rewrite exists for Windows, where git wants forward slashes in a
+    /// config value it hands to a shell. It used to run unconditionally, and on
+    /// Unix a backslash is an ordinary character in a file name — so a binary
+    /// under `/opt/a\b/git-xcrypt` was registered as `/opt/a/b/git-xcrypt`, a
+    /// path that does not exist. `init` still reported success, and with
+    /// `required = true` every later `git add`, `git checkout` and `git status`
+    /// in that repository aborted with no way to see why from the message.
+    ///
+    /// `repo::git_spelling` already carried this rule, with a test of its own;
+    /// this is the same core, so the two cannot drift.
+    #[test]
+    fn the_registered_command_rewrites_a_separator_and_never_a_file_name() {
+        use std::path::Path;
+
+        // Windows: the separator is a separator, and git gets slashes.
+        assert_eq!(
+            shell_quoted(Path::new(r"C:\Program Files\xc\git-xcrypt.exe"), '\\'),
+            "'C:/Program Files/xc/git-xcrypt.exe'"
+        );
+
+        // Unix: a backslash is part of the name and must survive untouched.
+        assert_eq!(
+            shell_quoted(Path::new(r"/opt/a\b/git-xcrypt"), '/'),
+            r"'/opt/a\b/git-xcrypt'",
+            "the registered command named a binary that does not exist"
+        );
+
+        // A quote is still closed, escaped and reopened, on both.
+        assert_eq!(
+            shell_quoted(Path::new("/opt/it's/git-xcrypt"), '/'),
+            r"'/opt/it'\''s/git-xcrypt'"
+        );
+
+        // And whatever this platform is, the real one round-trips: what `init`
+        // writes has to name the binary that is running.
+        let registered = current_executable().expect("the running binary has a path");
+        assert!(registered.starts_with('\'') && registered.ends_with('\''));
     }
 
     #[test]

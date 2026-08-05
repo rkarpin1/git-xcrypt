@@ -274,10 +274,13 @@ pub fn lexically_normal(path: &Path) -> PathBuf {
 /// On Unix a backslash is an ordinary character in a file name, so rewriting one
 /// there would name a *different* file — which is the same class of bug as
 /// decoding a path lossily.
+/// Shared with `init`, which has to spell the filter command git runs the same
+/// way for the same reason: two answers to "which character is a separator here"
+/// is one answer too many.
 #[cfg(windows)]
-const NATIVE_SEPARATOR: char = '\\';
+pub(crate) const NATIVE_SEPARATOR: char = '\\';
 #[cfg(not(windows))]
-const NATIVE_SEPARATOR: char = '/';
+pub(crate) const NATIVE_SEPARATOR: char = '/';
 
 /// Renders a path the way git spells one: forward slashes on every platform.
 ///
@@ -298,7 +301,7 @@ pub fn git_spelling(path: &Path) -> String {
 
 /// The platform-independent core, so both spellings are testable from either
 /// platform. A no-op when the native separator already is git's.
-fn with_separator(rendered: &str, separator: char) -> String {
+pub(crate) fn with_separator(rendered: &str, separator: char) -> String {
     if separator == '/' {
         return rendered.to_string();
     }

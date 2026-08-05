@@ -27,6 +27,62 @@ fn checkout_restores_the_content_and_leaves_status_clean() {
     repo.assert_status_clean();
 }
 
+/// A backslash in the binary's own path must not be rewritten into a separator.
+///
+/// `init` writes the filter command into `.git/config`, converting the native
+/// separator into the forward slashes git wants on Windows. The conversion used
+/// to run unconditionally — so on Unix, where a backslash is an ordinary
+/// character in a file name, a binary under `a\b/` was registered under `a/b/`,
+/// a path that does not exist. `init` still exited 0, and with
+/// `required = true` every later git operation in the repository aborted.
+///
+/// `#[cfg(unix)]` because the case cannot exist on Windows: a backslash there
+/// *is* the separator and cannot appear in a name. The Windows half of the same
+/// rewrite is covered from any platform by
+/// `init::tests::the_registered_command_rewrites_a_separator_and_never_a_file_name`.
+#[cfg(unix)]
+#[test]
+fn a_binary_whose_path_holds_a_backslash_still_registers_a_filter_git_can_run() {
+    let scratch = tempfile::TempDir::new().expect("could not create a temporary directory");
+    let awkward = scratch.path().join(r"tools\v2");
+    std::fs::create_dir_all(&awkward).expect("could not create the directory");
+
+    let binary = awkward.join("git-xcrypt");
+    std::fs::copy(env!("CARGO_BIN_EXE_git-xcrypt"), &binary).expect("could not copy the binary");
+
+    let repo = TestRepo::init();
+    let init = std::process::Command::new(&binary)
+        .arg("init")
+        .current_dir(repo.path())
+        .output()
+        .expect("could not run git-xcrypt");
+    assert!(init.status.success(), "init failed: {init:?}");
+
+    // The registered command has to name a file that is actually there.
+    let registered = String::from_utf8(repo.git_ok(["config", "filter.git-xcrypt.process"]).stdout)
+        .expect("git printed a non-UTF-8 config value");
+    let named = registered
+        .trim()
+        .trim_end_matches(" process")
+        .trim_matches('\'');
+    assert!(
+        std::path::Path::new(named).is_file(),
+        "init registered `{named}`, which is not a file — every git operation \
+         in this repository would abort"
+    );
+
+    // And the proof that matters: git can run it, so a secret is still stored
+    // as ciphertext rather than refused or passed through.
+    repo.write_xcrypt_config("*.env\n");
+    repo.write_file("secrets.env", SECRET);
+    repo.commit_all("a secret committed through the awkward path");
+    assert_ne!(
+        repo.blob_bytes("secrets.env"),
+        SECRET,
+        "the filter never ran, so the plaintext was committed"
+    );
+}
+
 #[test]
 fn a_clone_without_the_key_shows_the_stored_bytes() {
     let repo = repo_with_secret();
