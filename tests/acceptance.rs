@@ -16,7 +16,7 @@
 
 mod harness;
 
-use harness::{BareRemote, TestRepo};
+use harness::{BareRemote, MAGIC, OVERHEAD, TestRepo};
 
 /// The two files the criteria name, from the two patterns they name.
 const PASSWORD: &[u8] = b"correct horse battery staple\n";
@@ -101,6 +101,111 @@ fn the_six_step_acceptance_scenario_passes_end_to_end() {
     // the remote already holds, which is the property step 6 is a proxy for.
     clone.git_ok(["add", "-A"]);
     clone.assert_status_clean();
+}
+
+/// The whole life of one file, against a remote, from declaration to recovery.
+///
+/// The six-step scenario above proves the promise once, in one direction. This
+/// is the same repository lived in: a secret is declared, pushed, edited,
+/// pushed again, put back the way it was, deleted by accident and checked out
+/// again. Nothing here is exotic — it is a week of ordinary work — and every
+/// assertion is either "the remote never saw the plaintext" or "nothing was
+/// lost", with `git status` after each step as the standing determinism proof.
+///
+/// The interesting step is the fifth: putting the content back the way it was
+/// has to reproduce the *first* blob byte for byte. Anything non-deterministic
+/// in the encryption — a random IV, a counter, a timestamp, a key derived per
+/// run — survives every other test in this suite and dies here, because only a
+/// repository that goes back to a previous state can tell.
+#[test]
+fn the_life_of_a_secret_against_a_remote_keeps_its_content_and_its_determinism() {
+    // LF content on purpose. What a checkout writes back depends on the
+    // machine's `core.autocrlf` and `core.eol`, so a CRLF fixture would make
+    // this test's recovery step assert a different thing on Windows than on
+    // Linux — that whole matrix is `tests/line_endings.rs`, and this test is
+    // about the file's life rather than its line endings.
+    const FIRST: &[u8] = b"api_key = one\nregion = eu\n";
+    const SECOND: &[u8] = b"api_key = two\nregion = eu\n";
+
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.xcrypt_ok(["sync"]);
+
+    let remote = BareRemote::new();
+
+    // --- The file is declared and committed for the first time. -------------
+    repo.write_file("secrets/db.env", FIRST);
+    repo.write_file("README.md", b"# ordinary project\n");
+    repo.commit_all("declare a secret");
+    repo.push_to(&remote, "main");
+    repo.assert_status_clean();
+
+    let first_blob = remote.blob_bytes("main", "secrets/db.env");
+    assert!(
+        first_blob.starts_with(MAGIC),
+        "the first push put the secret in the remote in the clear"
+    );
+    assert_eq!(
+        first_blob.len(),
+        OVERHEAD + FIRST.len(),
+        "the remote's blob is not the plaintext plus the frozen header"
+    );
+    assert!(
+        !remote.object_exists_for(FIRST),
+        "the plaintext itself is an object in the remote"
+    );
+    // And the working tree still holds what the user typed, CRLF included.
+    repo.assert_worktree_eq("secrets/db.env", FIRST);
+    assert!(
+        !repo.blob_is_encrypted("README.md"),
+        "an undeclared file must stay readable"
+    );
+
+    // --- The secret is edited and pushed again. -----------------------------
+    repo.write_file("secrets/db.env", SECOND);
+    repo.commit_all("rotate the key");
+    repo.push_to(&remote, "main");
+    repo.assert_status_clean();
+
+    let second_blob = remote.blob_bytes("main", "secrets/db.env");
+    assert!(second_blob.starts_with(MAGIC));
+    assert_ne!(
+        second_blob, first_blob,
+        "an edited secret stored the same bytes, so the remote holds the old one"
+    );
+    assert!(
+        !remote.object_exists_for(SECOND),
+        "the edited plaintext is an object in the remote"
+    );
+
+    // --- The edit is undone. The bytes must come back exactly. --------------
+    repo.write_file("secrets/db.env", FIRST);
+    repo.commit_all("put it back");
+    repo.push_to(&remote, "main");
+    repo.assert_status_clean();
+
+    assert_eq!(
+        remote.blob_bytes("main", "secrets/db.env"),
+        first_blob,
+        "the same content encrypted to different bytes the second time round: \
+         encryption is not deterministic, so git would report every unchanged \
+         secret as modified"
+    );
+
+    // --- The file is deleted by accident and checked out again. -------------
+    repo.recheckout("secrets/db.env");
+    repo.assert_worktree_eq("secrets/db.env", FIRST);
+    repo.assert_status_clean();
+
+    // --- And a clone of the remote still holds only ciphertext. -------------
+    let clone = remote.clone_to();
+    let seen = clone.worktree_bytes("secrets/db.env");
+    assert!(seen.starts_with(MAGIC));
+    assert!(
+        !seen.windows(FIRST.len()).any(|window| window == FIRST),
+        "a clone without the key shows the secret"
+    );
 }
 
 #[test]
