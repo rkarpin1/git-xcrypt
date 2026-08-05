@@ -500,6 +500,21 @@ fn tips(
     let mut tips = Vec::new();
     collect_tips(&store, objects, scan, &mut tips);
 
+    // The main checkout, when this scan runs in a linked one. `worktrees/`
+    // below only ever holds *linked* registrations, so nothing else visits the
+    // main checkout's `HEAD` — and its worktree-private references live
+    // directly in the common directory, which is the store this arm opens.
+    // Measured on git 2.55, 2026-08-05: with the main checkout detached at a
+    // commit holding a plain-text secret no branch names, `status` from a
+    // linked worktree said `VERDICT: no findings` and exited 0, while the same
+    // command from the main checkout exited 5. The shared references are
+    // collected twice on this path; the sort at the bottom deduplicates them,
+    // exactly as it does for the registrations underneath.
+    if git_dir != common_dir {
+        let main = gix_ref::file::Store::at(common_dir.to_path_buf(), options());
+        collect_tips(&main, objects, scan, &mut tips);
+    }
+
     // The other checkouts. Their shared references are already in `tips`, so
     // what this adds is each one's own `HEAD` and its worktree-private
     // categories — `refs/bisect/*` above all, which is where a bisect in
@@ -870,6 +885,54 @@ mod tests {
         fixture.git(&["branch", "-D", "side"]);
 
         let scan = fixture.scan("secrets/\n");
+
+        assert_eq!(paths(&scan), ["secrets/parked.env"]);
+    }
+
+    #[test]
+    fn a_secret_named_only_by_the_main_checkouts_head_is_found_from_a_linked_worktree() {
+        // The mirror of the test above, and the direction it did not cover.
+        // `worktrees/` only registers *linked* checkouts, so a scan run from
+        // one of them never visited the main checkout's `HEAD`. Measured on
+        // git 2.55: this exact shape answered `VERDICT: no findings`, exit 0,
+        // from the linked worktree, and exit 5 from the main checkout.
+        let fixture = Fixture::new();
+        fixture.write("README.md", b"start\n");
+        fixture.commit("start");
+        fixture.git(&["checkout", "-q", "-b", "side"]);
+        fixture.write("secrets/parked.env", b"hunter2\n");
+        fixture.commit("on the side");
+
+        // The main checkout detaches at the secret, the branch goes, and a
+        // linked worktree parks at the clean commit — so the main `HEAD` is
+        // the only thing left naming the plaintext.
+        fixture.git(&["checkout", "-q", "--detach", "side"]);
+        fixture.git(&["branch", "-D", "side"]);
+        let elsewhere = tempfile::TempDir::new().expect("temporary directory");
+        let checkout = elsewhere.path().join("wt");
+        fixture.git(&[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            checkout.to_str().expect("a path"),
+            "main",
+        ]);
+
+        let common = fixture.dir.path().join(".git");
+        let linked = common.join("worktrees").join("wt");
+        let config = Config::parse("secrets/\n").expect("the declarations must parse");
+        let objects =
+            super::objects(&common, gix_hash::Kind::Sha1).expect("the object database must open");
+        let scan = super::scan(
+            &objects,
+            &linked,
+            &common,
+            gix_hash::Kind::Sha1,
+            &config,
+            false,
+        )
+        .expect("the scan must succeed");
 
         assert_eq!(paths(&scan), ["secrets/parked.env"]);
     }
