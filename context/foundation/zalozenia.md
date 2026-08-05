@@ -26,6 +26,7 @@ Tworzony jest nowy projekt ze względów edukacyjnych oraz dlatego, że projekty
   - Wzorce mają semantykę `.gitignore`. Dopasowaniem pojedynczego wzorca zajmuje się `gix-glob` (gitoxide) — ten sam wildmatch, którego używa git — natomiast **semantykę samego pliku** (pływanie wzorca bez ukośnika, wygrywa ostatnie dopasowanie, negacje) odtwarza `src/config.rs`. Zapisane wcześniej „`gix-ignore`" jest nieprawdziwe: tego crate'a nie ma w `Cargo.toml`. Rozróżnienie nie jest kosmetyczne — to stąd bierze się cała klasa błędu „rendering `.gitattributes` nie sięga tak daleko jak filtr", opisana niżej. Wzorzec katalogowy `sekrety/` obejmuje katalog i wszystko pod nim; wiodący `/` kotwiczy do korzenia repozytorium; ostatnie dopasowanie wygrywa.
   - Negacje (`!plik`) są **obsługiwane**, na zasadzie ostatniego dopasowania. Odrzucanie ich zmuszałoby do przebudowy wzorców tam, gdzie wyjątek jest naturalny (`sekrety/` plus jawny `README.md`). W zamian `status` wypisuje ścieżki wyłączone negacją w osobnej sekcji, żeby wyjątek nigdy nie był niewidoczny.
   - Po wzorcu mogą stać atrybuty końców linii — składnia i semantyka w „Końce linii (LF/CRLF)" → „Składnia `.git-xcrypt`".
+  - Nazwa zawierająca spację domyka się **cudzysłowem**, tak jak w `.gitattributes` (`"moje sekrety/"`, negacja `!"moje sekrety/README.md"`). Backslash nie jest już ucieczką białego znaku — od 2026-08-05 znaczy wyłącznie to, co znaczy w globie. Powód, migracja i siatka na stare pliki: „Końce linii (LF/CRLF)" → „Spacja w nazwie".
 - Pozostałe komendy `git-xcrypt` mają odpowiadać projektom źródłowym co do nazwy i zachowania, ale każda wymaga oddzielnej dyskusji i potwierdzenia przed implementacją.
 
 # Zakres MVP / poza zakresem
@@ -371,8 +372,13 @@ sekrety/deploy.ps1   text eol=crlf
 sekrety/klucz.p12    binary
 /deploy/id_rsa       -text
 
+# nazwa ze spacją — domknięta cudzysłowem, jak w .gitattributes
+"moje sekrety/"
+"moje sekrety/*.sh"  text eol=lf
+
 # wyjątek — jawny mimo dopasowania wyżej
 !sekrety/README.md
+!"moje sekrety/README.md"
 ```
 
 Atrybuty po wzorcu, oddzielone białymi znakami. Znaczenie odtwarza `.gitattributes` co do słowa:
@@ -406,6 +412,33 @@ Sloty są dwa i niezależne: `text` / `-text` / `binary` / `text=auto` to jeden,
 - **`eol=` celowo nie trafia do nagłówka.** Gdyby trafiło, zmiana deklaracji z `eol=lf` na `eol=crlf` nie zadziałałaby na istniejące pliki aż do ich ponownego dodania. Trzymamy w nagłówku wyłącznie fakt „normalizowano", bo tylko on jest niebezpieczny przy rozjeździe. Wybór końca linii przy smudge jest samonaprawialny: gdy padnie źle, następny clean i tak normalizuje z powrotem do LF, ciphertext wychodzi ten sam, a `git status` zostaje czysty. Pliki binarne mają bit `0` i są zapisywane verbatim, więc nie dotyczy ich to w ogóle.
 - **Nieznany atrybut to błąd**, nie ostrzeżenie — fail closed, ta sama zasada co przy nieznanym `suite` i nieznanym bicie `flags`.
 - **Poza zakresem:** `working-tree-encoding` (konwersja kodowania znaków, np. UTF-16). Git to potrafi, my nie — zapisane w `README.md` §Known limitations.
+
+### Spacja w nazwie: cudzysłów, nie backslash — rozstrzygnięte 2026-08-05
+
+Wzorzec kończy się na pierwszym białym znaku, bo po nim stoją atrybuty. Nazwa zawierająca spację potrzebuje więc sposobu, żeby powiedzieć „ta spacja należy do nazwy". Do 2026-08-05 był nim backslash (`moje\ sekrety/`); od tej daty jest nim **cudzysłów, dokładnie taki, jaki zna `.gitattributes`**:
+
+```
+<wzorzec> [białe znaki <atrybuty>]
+
+wzorzec niecytowany:  ciąg bez białych znaków, nie zaczynający się od "
+wzorzec cytowany:     "…" z cytowaniem w stylu C, tym samym, które rozpakowuje git
+                      \" → "   \\ → \   \a \b \f \n \r \t \v oraz ósemkowe \nnn
+negacja:              ! stoi PRZED cudzysłowem:  !"moje sekrety/README.md"
+```
+
+Powody, oba wiążące:
+
+- **Backslash niósł dwa znaczenia naraz.** Na poziomie linii był ucieczką białego znaku, a wewnątrz wzorca jest ucieczką metaznaku globa (`\*` to dosłowna gwiazdka) — o tym, które z nich obowiązuje, decydował następny znak. Po zmianie backslash znaczy wyłącznie to drugie, a wzorzec po rozpakowaniu cudzysłowu idzie do `gix_glob::Pattern` w postaci dosłownej.
+- **Backslash nie domykał drugiego trudnego kształtu — spacji na końcu nazwy.** `moje sekrety\ ` musiałoby stać na końcu linii, a każdy edytor obcinający końcowe białe znaki kasuje tę spację bez słowa i zostaje wzorzec o innym znaczeniu. Cudzysłów zamyka oba kształty jednym mechanizmem: `"moje sekrety/"` i `"sekrety /"`.
+
+**Migracja jest fail-closed i nazwana po imieniu.** Stary zapis rozkłada się dziś na wzorzec `moje\` i nieznany atrybut `sekrety/`, więc plik i tak zostaje odrzucony — ale komunikat „nieznany atrybut" niczego nie tłumaczy w pliku napisanym raz i od tamtej pory nieotwieranym. Rozpoznawane są więc dwa kształty, oba z gotową linią zastępczą w treści błędu:
+
+- **wzorzec kończący się backslashem** — pozostałość po `\ `; komunikat odtwarza linię starą regułą i pokazuje jej cytowany odpowiednik;
+- **wzorzec cytowany, którego końcowe słowa są atrybutami** (`"sekrety/*.sh text eol=lf"`) — czyli stara linia zacytowana w całości. To jedyny kształt, który bez tej siatki zmieniłby znaczenie **po cichu**: wzorzec nie pasowałby do niczego, a plik przestałby być szyfrowany bez ostrzeżenia. Liczy się wyłącznie **końcowy** ciąg słów-atrybutów, więc katalog `moje pliki tekstowe/` przechodzi bez zaczepienia; nazwa kończąca się dosłownie słowem `text` zapisuje się `"… tex[t]"` (ten sam zbiór ścieżek, wildmatch po obu stronach).
+
+**Rendering do `.gitattributes` cytuje z powrotem.** Wzorzec z białym znakiem, z wiodącym `"` albo z wiodącym `#` jest w wygenerowanej linii cytowany (`"**/moje sekrety/**" -text diff=git-xcrypt`); backslash przechodzi bez zmian, bo wildmatch jest po obu stronach ten sam, a cytowanie podwaja go tylko na potrzeby własnej warstwy. Wiodący `#` bez cudzysłowu byłby dla gita komentarzem, czyli linią, której po prostu nie ma — a to jest brak `-text` na ścieżce szyfrowanej.
+
+**Świadomie przyjęte ograniczenie:** ósemkowe ucieczki, które nie składają się na poprawny UTF-8, są odrzucane — plik `.git-xcrypt` jest czytany jako tekst. Nazwa pliku spoza UTF-8 pozostaje więc niedeklarowalna, tak samo jak przed zmianą.
 
 **Konfigurację czytamy biblioteką, nie procesem potomnym.** `gix-config` (gitoxide) daje precedencję system/global/repo/worktree wraz z `include`, kompiluje się do środka binarki i nie łamie wymogu samowystarczalności z „Założeń technicznych". Wywoływanie `git config` odpada z powodu samowystarczalności — argument o N spawnach był prawdziwy dla prototypu z procesem na plik i przy filtrze długożyjącym już nie obowiązuje, ale wniosek zostaje. Pozostaje jedna binarka `git-xcrypt` w dwóch trybach rejestrowanych przez `init` (`process` i `diff`; reszta komend wywoływana przez użytkownika); żadnego osobnego programu pomocniczego ani demona.
 

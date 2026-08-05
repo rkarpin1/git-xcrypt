@@ -54,11 +54,18 @@ const CONFIG_TEMPLATE: &str = "\
 # are handled. Patterns use .gitignore syntax; attributes use .gitattributes
 # vocabulary. Without an attribute a path is treated as `text=auto`.
 #
+# Whitespace ends the pattern, so a name that contains a space is closed with
+# quotes, exactly as .gitattributes closes one. A backslash is only what a glob
+# says it is, and a negation keeps its `!` outside the quotes.
+#
 # secrets/
 # *.env
-# secrets/deploy.ps1   text eol=crlf
-# secrets/key.p12      binary
+# secrets/deploy.ps1     text eol=crlf
+# secrets/key.p12        binary
+# \"my secrets/\"
+# \"my secrets/*.sh\"      text eol=lf
 # !secrets/README.md
+# !\"my secrets/README.md\"
 ";
 
 /// Runs `init` in `repo`.

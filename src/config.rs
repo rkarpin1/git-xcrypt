@@ -2,9 +2,12 @@
 //! handled.
 //!
 //! Patterns use `.gitignore` syntax and are matched by `gix-glob`, so the
-//! semantics are git's own rather than an imitation of them. Attributes use the
-//! `.gitattributes` vocabulary. The two resolve on **independent axes**, exactly
-//! as git splits them across two files:
+//! semantics are git's own rather than an imitation of them. A pattern that
+//! contains a space is closed with quotes, exactly as `.gitattributes` closes
+//! one — see [`split_line`] for why the backslash that used to do that job was
+//! taken away from it. Attributes use the `.gitattributes` vocabulary. The two
+//! resolve on **independent axes**, exactly as git splits them across two
+//! files:
 //!
 //! * selection — last matching line wins, `!` turns a path off;
 //! * attributes — a later line overrides only the attributes it names, a line
@@ -128,45 +131,51 @@ impl Config {
         let mut config = Self::default();
 
         for (number, line) in text.lines().enumerate() {
-            // Deliberately not trimmed: `split_pattern` is the only thing that
-            // understands the `\ ` escape, so trimming first would eat the
-            // escaped trailing space and make a pattern like
-            // `!secrets/README.md\ ` unwritable — the exact complement of the
-            // pathnames the filter now matches correctly.
+            // Deliberately not trimmed: a pattern's own leading whitespace is
+            // significant in `.gitignore`, so `split_line` is left to refuse an
+            // indented line rather than to silently accept a different pattern
+            // than the one written.
+            let number = number + 1;
             if line.trim().is_empty() || line.trim_start().starts_with('#') {
                 continue;
             }
 
-            let (pattern_text, attribute_text) = split_pattern(line);
-            let declared = parse_attributes(attribute_text, number + 1)?;
+            let split = split_line(line, number)?;
+            let declared = parse_attributes(split.attributes, number)?;
 
-            let negated = pattern_text.starts_with('!');
-            if negated && declared != Declared::default() {
-                return Err(Error::Config(format!(
-                    "{CONFIG_FILE}:{}: a negated pattern cannot carry attributes — \
-                     the path is not encrypted, so there is nothing to convert",
-                    number + 1
-                )));
+            let pattern = if split.negation_syntax {
+                Pattern::from_bytes(split.glob.as_bytes())
+            } else {
+                // A quoted pattern is taken entirely literally, so a `!` that
+                // survived the unquoting is part of a file name and must not be
+                // read as the negation marker — that marker stands *outside*
+                // the quotes.
+                Pattern::from_bytes_without_negation(split.glob.as_bytes())
             }
-
-            let pattern = Pattern::from_bytes(pattern_text.as_bytes()).ok_or_else(|| {
+            .ok_or_else(|| {
                 Error::Config(format!(
-                    "{CONFIG_FILE}:{}: `{pattern_text}` is not a usable pattern",
-                    number + 1
+                    "{CONFIG_FILE}:{number}: `{}` is not a usable pattern",
+                    split.source
                 ))
             })?;
 
+            if pattern.is_negative() && declared != Declared::default() {
+                return Err(Error::Config(format!(
+                    "{CONFIG_FILE}:{number}: a negated pattern cannot carry attributes — \
+                     the path is not encrypted, so there is nothing to convert"
+                )));
+            }
+
             if declared.eol.is_some() && declared.text == Some(TextMode::Binary) {
                 config.pointless_eol.push(format!(
-                    "{CONFIG_FILE}:{}: `eol=` has no effect on a path that is never \
-                     converted; git lets -text win over eol too",
-                    number + 1
+                    "{CONFIG_FILE}:{number}: `eol=` has no effect on a path that is never \
+                     converted; git lets -text win over eol too"
                 ));
             }
 
             config.rules.push(Rule {
                 pattern,
-                source: pattern_text.to_string(),
+                source: split.source,
                 declared,
             });
         }
@@ -228,10 +237,10 @@ impl Config {
         self.rules
             .iter()
             .map(|rule| PatternView {
-                source: rule
-                    .source
-                    .strip_prefix('!')
-                    .unwrap_or(rule.source.as_str()),
+                // The `!` is already off: it is a marker on the line, not a
+                // character of the pattern, and stripping it here as well would
+                // eat a leading `!` that a quoted pattern means literally.
+                source: rule.source.as_str(),
                 negated: rule.pattern.is_negative(),
                 suppress_diff: rule.declared.suppress_diff,
             })
@@ -376,24 +385,293 @@ pub fn is_never_encrypted(path: &[u8]) -> bool {
             .is_some_and(|rest| rest.starts_with(b"/"))
 }
 
+/// One line, split into the two things it declares.
+struct Split<'a> {
+    /// The pattern as `gix-glob` must read it, negation marker included.
+    glob: String,
+    /// Whether `gix-glob` may read a leading `!` or `\!` in `glob` as syntax.
+    ///
+    /// False for a quoted pattern, whose every character is part of a name.
+    negation_syntax: bool,
+    /// The pattern as a renderer must reproduce it: unquoted, and without the
+    /// `!` that never belonged to the name in the first place.
+    source: String,
+    /// Everything after the pattern.
+    attributes: &'a str,
+}
+
 /// Splits a line into its pattern and its attributes.
 ///
-/// Whitespace separates the two, so a pattern containing a space must escape it
-/// as `\ ` — the same escape `.gitignore` already uses for a trailing space.
-fn split_pattern(line: &str) -> (&str, &str) {
-    let bytes = line.as_bytes();
+/// Whitespace separates the two, so a pattern that contains whitespace is closed
+/// with **quotes**, and inside them C-style escapes are read exactly as git reads
+/// them in `.gitattributes` — `\"`, `\\`, `\t`, `\n`, `\r` and octal. A negation
+/// keeps its `!` outside the quotes: `!"my secrets/README.md"`.
+///
+/// **Quotes replaced the `\ ` escape on 2026-08-05**, and the reason is not
+/// taste. The backslash carried two meanings at once — an escape for whitespace
+/// at the level of the line, and wildmatch's own escape for a glob metacharacter
+/// inside the pattern — so `\*` and `\ ` had to be told apart by what followed
+/// them. It also never really closed the second shape it was supposed to: a
+/// trailing space had to be written `secrets\ ` at the end of a line, and an
+/// editor that strips trailing whitespace deletes it without a word, leaving a
+/// pattern that means something else. Quotes close both shapes with one
+/// mechanism, and the backslash goes back to being only what a glob says it is.
+fn split_line(line: &str, number: usize) -> Result<Split<'_>> {
+    let (negated, rest) = match line.strip_prefix('!') {
+        Some(rest) => (true, rest),
+        None => (false, line),
+    };
+
+    if let Some(body) = rest.strip_prefix('"') {
+        let (source, after) = unquote(body, number)?;
+        if !after.is_empty() && !after.starts_with(|c: char| c.is_whitespace()) {
+            return Err(Error::Config(format!(
+                "{CONFIG_FILE}:{number}: `{after}` follows the closing quote; the quotes close \
+                 the pattern, and any attributes come after a space"
+            )));
+        }
+        refuse_quoted_attributes(&source, negated, number)?;
+        return Ok(Split {
+            glob: if negated {
+                format!("!{source}")
+            } else {
+                source.clone()
+            },
+            negation_syntax: negated,
+            source,
+            attributes: after.trim_start(),
+        });
+    }
+
+    let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+    let (source, attributes) = rest.split_at(end);
+
+    if source.is_empty() {
+        return Err(Error::Config(format!(
+            "{CONFIG_FILE}:{number}: there is no pattern here — a line starts with the pattern it \
+             declares, and a name that begins with whitespace is written in quotes"
+        )));
+    }
+    if source.ends_with('\\') {
+        return Err(legacy_escape_error(line, number));
+    }
+
+    Ok(Split {
+        // The token exactly as written, `!` included: an unquoted pattern is
+        // handed to `gix-glob` unaltered, so `\!` and `\#` keep meaning what
+        // `.gitignore` says they mean.
+        glob: if negated {
+            format!("!{source}")
+        } else {
+            source.to_string()
+        },
+        negation_syntax: true,
+        source: source.to_string(),
+        attributes: attributes.trim_start(),
+    })
+}
+
+/// Unwraps a C-quoted pattern, returning it and the rest of the line.
+///
+/// The escapes are git's own set from `unquote_c_style`, including the octal
+/// form, so a name spells the same here as it does in `.gitattributes` and in
+/// git's own output. An escape git does not know is refused rather than passed
+/// through: a pattern nobody agrees on is a pattern that selects the wrong set of
+/// files, and on the check-in path the wrong set means a secret in the clear.
+fn unquote(body: &str, number: usize) -> Result<(String, &str)> {
+    let unterminated = || {
+        Error::Config(format!(
+            "{CONFIG_FILE}:{number}: this pattern opens with `\"` and never closes it"
+        ))
+    };
+
+    let bytes = body.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut index = 0;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => {
+                let text = String::from_utf8(out).map_err(|_| {
+                    Error::Config(format!(
+                        "{CONFIG_FILE}:{number}: the escapes in this pattern do not spell UTF-8 \
+                         text, and this file is read as text"
+                    ))
+                })?;
+                return Ok((text, &body[index + 1..]));
+            }
+            b'\\' => {
+                // The character rather than the byte, so a backslash in front of
+                // a multi-byte character neither slices mid-character nor
+                // reports half of one.
+                let Some(next) = body[index + 1..].chars().next() else {
+                    return Err(unterminated());
+                };
+                let escaped = bytes[index + 1];
+                index += 1 + next.len_utf8();
+                match escaped {
+                    b'a' => out.push(0x07),
+                    b'b' => out.push(0x08),
+                    b'f' => out.push(0x0c),
+                    b'n' => out.push(b'\n'),
+                    b'r' => out.push(b'\r'),
+                    b't' => out.push(b'\t'),
+                    b'v' => out.push(0x0b),
+                    b'\\' | b'"' => out.push(escaped),
+                    b'0'..=b'7' => {
+                        let mut value = u32::from(escaped - b'0');
+                        for _ in 0..2 {
+                            match bytes.get(index) {
+                                Some(digit @ b'0'..=b'7') => {
+                                    value = value * 8 + u32::from(digit - b'0');
+                                    index += 1;
+                                }
+                                _ => break,
+                            }
+                        }
+                        let byte = u8::try_from(value).map_err(|_| {
+                            Error::Config(format!(
+                                "{CONFIG_FILE}:{number}: `\\{value:o}` is not a byte; an octal \
+                                 escape names one byte, from \\0 to \\377"
+                            ))
+                        })?;
+                        out.push(byte);
+                    }
+                    _ => {
+                        return Err(Error::Config(format!(
+                            "{CONFIG_FILE}:{number}: `\\{next}` is not an escape git knows inside \
+                             a quoted pattern; a literal backslash is written `\\\\`"
+                        )));
+                    }
+                }
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+
+    Err(unterminated())
+}
+
+/// Whether `token` is one of the words the attribute vocabulary defines.
+///
+/// The same list [`parse_attributes`] matches on, spelled twice because the two
+/// ask different questions: one parses a line, one recognises a line written for
+/// the syntax that ended on 2026-08-05. Nothing makes the compiler keep them in
+/// step, so a new attribute belongs in both — a word missing from this one only
+/// narrows the net, never widens it.
+fn is_attribute_word(token: &str) -> bool {
+    matches!(
+        token,
+        "text" | "-text" | "binary" | "text=auto" | "eol=lf" | "eol=crlf" | "eol=native"
+    )
+}
+
+/// Refuses a quoted pattern whose tail is the attribute list of an older file.
+///
+/// The net under the migration, and it catches the one shape that would
+/// otherwise change meaning in silence: a line from before 2026-08-05 wrapped in
+/// quotes whole, so `"secrets/*.sh" text` becomes a pattern that matches nothing
+/// and a path that stops being encrypted without a word. Only a *trailing* run of
+/// attribute words counts, so an ordinary directory called `my text files/` is
+/// left alone.
+fn refuse_quoted_attributes(pattern: &str, negated: bool, number: usize) -> Result<()> {
+    let mut head = pattern.trim_end();
+    let mut found = 0usize;
+    while let Some((before, last)) = head.rsplit_once(|c: char| c.is_whitespace()) {
+        if !is_attribute_word(last) {
+            break;
+        }
+        head = before.trim_end();
+        found += 1;
+    }
+    if found == 0 || head.is_empty() {
+        return Ok(());
+    }
+
+    let attributes = pattern[head.len()..].trim();
+    let marker = if negated { "!" } else { "" };
+    Err(Error::Config(format!(
+        "{CONFIG_FILE}:{number}: this quoted pattern ends with the attribute `{attributes}`, and \
+         quotes close the pattern only — attributes stand outside them. The line reads like the \
+         syntax that changed on 2026-08-05. Write it as:\n    \
+         {marker}\"{head}\" {attributes}\n\
+         If the path really does end in that word, spell it so it cannot be read as an \
+         attribute — `[t]ext` matches the same names."
+    )))
+}
+
+/// The refusal for a line still written with the `\ ` escape.
+///
+/// Recognising the shape is the whole point. Split by the rule in force today,
+/// `my\ secrets/` falls apart into the pattern `my\` and the unknown attribute
+/// `secrets/`, so the file is refused either way and no secret is stored in the
+/// clear — but "unknown attribute `secrets/`" tells a reader nothing about what
+/// changed, and the change is in a file they wrote once and have not looked at
+/// since. The suggestion is reconstructed with the old rule, so it is the line
+/// they meant rather than a template.
+fn legacy_escape_error(line: &str, number: usize) -> Error {
+    let (intended, attributes) = legacy_split(line);
+    let (marker, intended) = match intended.strip_prefix('!') {
+        Some(rest) => ("!", rest.to_string()),
+        None => ("", intended),
+    };
+
+    let mut quoted = String::with_capacity(intended.len() + 2);
+    for character in intended.chars() {
+        if character == '"' || character == '\\' {
+            quoted.push('\\');
+        }
+        quoted.push(character);
+    }
+
+    let suggestion = if attributes.is_empty() {
+        format!("{marker}\"{quoted}\"")
+    } else {
+        format!("{marker}\"{quoted}\" {attributes}")
+    };
+
+    Error::Config(format!(
+        "{CONFIG_FILE}:{number}: this pattern ends with a backslash, which is how a space in a \
+         path was written until 2026-08-05. A space is now closed with quotes instead, and a \
+         backslash means only what it means in a glob. Write the line as:\n    \
+         {suggestion}\n\
+         A negation keeps its `!` outside the quotes: !\"my secrets/README.md\"."
+    ))
+}
+
+/// Splits a line the way this file did before 2026-08-05.
+///
+/// Kept for one purpose: reconstructing what the author of an old line meant, so
+/// the refusal can quote the replacement instead of describing it.
+fn legacy_split(line: &str) -> (String, &str) {
+    let bytes = line.as_bytes();
+    let mut pattern = String::new();
+    let mut index = 0;
+
     while index < bytes.len() {
         if bytes[index] == b'\\' {
-            index += 2;
+            if let Some(escaped) = line[index + 1..].chars().next() {
+                if !escaped.is_whitespace() {
+                    pattern.push('\\');
+                }
+                pattern.push(escaped);
+                index += 1 + escaped.len_utf8();
+                continue;
+            }
+            index += 1;
             continue;
         }
         if bytes[index].is_ascii_whitespace() {
-            return (&line[..index], line[index..].trim_start());
+            return (pattern, line[index..].trim());
         }
-        index += 1;
+        let character = line[index..].chars().next().unwrap_or('\\');
+        pattern.push(character);
+        index += character.len_utf8();
     }
-    (line, "")
+    (pattern, "")
 }
 
 /// Parses the attribute tokens following a pattern.

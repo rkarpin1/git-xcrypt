@@ -22,6 +22,7 @@
 mod harness;
 
 use harness::{MAGIC, OVERHEAD, TestRepo};
+use tempfile::TempDir;
 
 /// The exit code the frozen table gives to "an exposure was found".
 const EXPOSED: i32 = 5;
@@ -419,4 +420,221 @@ fn a_foreign_text_line_below_the_managed_section_is_caught_before_the_file_is_lo
         text.contains("-text"),
         "the report must name the attribute that prevents it:\n{text}"
     );
+}
+
+/// The exit code the frozen table gives to a configuration error.
+const CONFIG_ERROR: i32 = 2;
+
+/// A secret under a directory whose name carries a space.
+const SPACED: &[u8] = b"DATABASE_URL=postgres://user:hunter2@localhost/app\n";
+
+/// The base64 line of an exported key file.
+fn key_material(path: &std::path::Path) -> String {
+    let text = std::fs::read_to_string(path).expect("the export must be readable text");
+    text.lines()
+        .nth(1)
+        .expect("an export has a header and a key")
+        .to_string()
+}
+
+#[test]
+fn a_name_with_a_space_is_declared_in_quotes_and_lives_the_whole_cycle() {
+    // Whitespace separates a pattern from its attributes, so a name that
+    // contains a space needs a way of saying "this space is part of the name".
+    // Until 2026-08-05 that was a backslash — which meant the character carried
+    // two jobs at once, its own and wildmatch's — and since then it is quotes,
+    // the way `.gitattributes` has always spelled it.
+    //
+    // Every stage of the tool has to agree about which paths that pattern names,
+    // and the two that can disagree in silence are the ones this exercises: the
+    // filter, which reads `.git-xcrypt`, and the rendered `.gitattributes` line,
+    // which has to be quoted again on the way out and is graded here by real
+    // `git check-attr`. A pattern that reaches the filter but not the rendered
+    // line leaves ciphertext without `-text`, and that was measured destroying a
+    // 2 MB file at checkout.
+    let repo = TestRepo::init();
+    repo.set_eol_config("false", "lf");
+    repo.init_xcrypt();
+
+    // --- The line as it used to be written: refused, and told why. ----------
+    //
+    // Split by today's rule it falls apart into the pattern `my\` and the
+    // unknown attribute `secrets/`, so the file is refused either way — but a
+    // reader of "unknown attribute" has no way to learn what changed under a
+    // file they wrote once and have not opened since.
+    repo.write_xcrypt_config("my\\ secrets/\n");
+    let refused = repo.xcrypt(["sync"]);
+    let complaint = String::from_utf8_lossy(&refused.stderr).into_owned();
+
+    assert_eq!(
+        refused.status.code(),
+        Some(CONFIG_ERROR),
+        "the old spelling was accepted, so a declared path silently stopped \
+         being encrypted:\n{complaint}"
+    );
+    assert!(
+        complaint.contains("2026-08-05") && complaint.contains("\"my secrets/\""),
+        "the refusal must say that the syntax changed and how the line reads \
+         now, or it is indistinguishable from a typo:\n{complaint}"
+    );
+
+    // Nor does anything reach the object database while the file is unreadable:
+    // a refusal that let `git add` through would be the failure mode this
+    // whole product exists to prevent.
+    repo.write_file("my secrets/db.env", SPACED);
+    let added = repo.git(["add", "-A"]);
+    assert!(
+        !added.status.success(),
+        "`git add` went through on an unparsable declaration:\n{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    assert!(
+        !repo.object_exists_for(SPACED),
+        "the plaintext of a declared secret reached the object database while \
+         the declaration could not be read"
+    );
+
+    // Quoting the whole old line instead — pattern and attributes together — is
+    // the other way to reach for the new syntax and get it wrong, and it is the
+    // dangerous one: the pattern would simply match nothing.
+    repo.write_xcrypt_config("\"my secrets/*.sh   text eol=lf\"\n");
+    let wrapped = repo.xcrypt(["sync"]);
+    let complaint = String::from_utf8_lossy(&wrapped.stderr).into_owned();
+    assert_eq!(
+        wrapped.status.code(),
+        Some(CONFIG_ERROR),
+        "an old line quoted whole was accepted as a pattern, so it matches \
+         nothing and the path it named is stored in the clear:\n{complaint}"
+    );
+    assert!(
+        complaint.contains("\"my secrets/*.sh\" text eol=lf"),
+        "the refusal must show where the quotes belong:\n{complaint}"
+    );
+
+    // --- Written the way it is written now. ---------------------------------
+    repo.write_xcrypt_config(
+        "\"my secrets/\"\n\
+         \"my secrets/*.sh\"   text eol=lf\n\
+         !\"my secrets/README.md\"\n",
+    );
+    repo.xcrypt_ok(["sync"]);
+
+    repo.write_file("my secrets/deploy.sh", CRLF);
+    repo.write_file("app/my secrets/nested.env", SPACED);
+    repo.write_file("my secrets/README.md", b"nothing secret here\n");
+    repo.commit_all("a secret under a name with a space");
+    repo.assert_status_clean();
+
+    for path in ["my secrets/db.env", "app/my secrets/nested.env"] {
+        assert!(
+            repo.blob_is_encrypted(path),
+            "{path}: a declared path was stored in the clear"
+        );
+        assert_eq!(
+            repo.check_attr("filter", path),
+            "git-xcrypt",
+            "{path}: git would not run the filter for a declared path"
+        );
+        assert_eq!(
+            repo.check_attr("text", path),
+            "unset",
+            "{path}: the rendered line does not reach a path the filter \
+             encrypts, so git may convert its ciphertext and destroy it"
+        );
+    }
+
+    // The attribute half of the split, on a quoted pattern: `text eol=lf` has
+    // to survive being separated from a pattern that itself contains spaces.
+    assert!(repo.blob_records_normalisation("my secrets/deploy.sh"));
+    assert_eq!(
+        repo.blob_bytes("my secrets/deploy.sh").len(),
+        OVERHEAD + LF.len(),
+        "the CRLF was not normalised, so the attributes were lost behind the \
+         quotes"
+    );
+
+    // And the negation, whose `!` stands outside the quotes.
+    assert!(
+        !repo.blob_is_encrypted("my secrets/README.md"),
+        "a negated path was encrypted anyway"
+    );
+    assert_eq!(
+        repo.check_attr("text", "my secrets/README.md"),
+        "unspecified"
+    );
+
+    // --- Closed and opened again, byte for byte. ----------------------------
+    let vault = TempDir::new().expect("could not create a temporary directory");
+    let key_file = vault.path().join("repo.key");
+    repo.xcrypt_ok(["export-key", &key_file.to_string_lossy()]);
+    let secret = key_material(&key_file);
+
+    let locked = repo.xcrypt_ok(["lock", "--yes"]);
+    assert!(
+        !String::from_utf8_lossy(&locked.stderr).contains(&secret),
+        "the key itself appeared in `lock`'s own warning"
+    );
+    assert!(
+        repo.worktree_bytes("my secrets/db.env").starts_with(MAGIC),
+        "a path with a space in it was left in the clear behind a command that \
+         deleted the key"
+    );
+
+    repo.xcrypt_ok(["import-key", &key_file.to_string_lossy()]);
+    repo.xcrypt_ok(["unlock"]);
+    repo.assert_worktree_eq("my secrets/db.env", SPACED);
+    repo.assert_worktree_eq("my secrets/deploy.sh", LF);
+    repo.assert_worktree_eq("app/my secrets/nested.env", SPACED);
+    repo.assert_status_clean();
+}
+
+/// A name that ends in a space, which is the shape a backslash never closed.
+///
+/// **Unix only, and not for want of trying.** Win32 strips a trailing space from
+/// every path it is handed, so the directory cannot be created there and there is
+/// nothing to declare — the same reason `AGENTS.md` gives for the other
+/// `#[cfg(unix)]` guards. What the quoting itself does is covered on all three
+/// platforms by the space in the middle of `my secrets/` above; what only this
+/// can show is the shape the old escape could not express at all, because the
+/// line had to end `my secrets\ ` and every editor that strips trailing
+/// whitespace deleted it without a word.
+#[test]
+#[cfg(unix)]
+fn a_name_that_ends_in_a_space_is_expressible_at_last() {
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("\"secrets /\"\n");
+    repo.xcrypt_ok(["sync"]);
+
+    repo.write_file("secrets /db.env", SPACED);
+    // The name next door, one byte shorter, which must stay in the clear: a
+    // pattern that quietly loses its trailing space matches this instead.
+    repo.write_file("secrets/db.env", b"nothing secret here\n");
+    repo.commit_all("a secret under a name that ends in a space");
+    repo.assert_status_clean();
+
+    assert!(
+        repo.blob_is_encrypted("secrets /db.env"),
+        "the trailing space was lost, so the declared path is stored in the clear"
+    );
+    assert!(
+        !repo.blob_is_encrypted("secrets/db.env"),
+        "the pattern reached past the name it declares"
+    );
+    assert_eq!(
+        repo.check_attr("text", "secrets /db.env"),
+        "unset",
+        "the rendered line does not reach the path the filter encrypts, so git \
+         may convert its ciphertext and destroy it"
+    );
+    assert_eq!(
+        repo.check_attr("text", "secrets/db.env"),
+        "unspecified",
+        "the rendered line reaches past what the filter encrypts, so a file \
+         stored in the clear is carrying `-text`"
+    );
+
+    repo.recheckout("secrets /db.env");
+    repo.assert_worktree_eq("secrets /db.env", SPACED);
+    repo.assert_status_clean();
 }

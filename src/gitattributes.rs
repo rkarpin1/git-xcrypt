@@ -157,7 +157,9 @@ fn bootstrap_exclusions(config: &Config) -> Vec<String> {
 ///   not encrypted.
 ///
 /// Whitespace ends a pattern in `.gitattributes` unless the whole pattern is
-/// C-quoted; the `\ ` escape `.gitignore` uses is not understood there.
+/// C-quoted — which is also how `.git-xcrypt` has spelled such a pattern since
+/// 2026-08-05, so the two files now close a space the same way and [`spell`]
+/// only has to put the quotes back around what the parser took them off.
 ///
 /// A line opening with `[attr]` is a macro definition to git, never a pattern.
 /// Quoting does not help — measured on git 2.55, the macro check runs before the
@@ -210,36 +212,29 @@ fn guard(spelling: String, anchored: bool) -> String {
 }
 
 /// One pattern, escaped and quoted the way git's attribute parser reads it.
+///
+/// The pattern arrives literal: `.git-xcrypt` has already unwrapped its own
+/// quoting, so every backslash still standing here is wildmatch's — and
+/// wildmatch is the same engine on both sides, so it is passed through
+/// untouched, doubled only where the C-quoting layer would otherwise eat it.
 fn spell(pattern: &str) -> String {
-    // Undo only the escape that the two syntaxes disagree about. Every other
-    // backslash is wildmatch's, and wildmatch is the same engine on both sides.
-    let mut plain = String::with_capacity(pattern.len());
-    let mut characters = pattern.chars();
-    while let Some(character) = characters.next() {
-        if character != '\\' {
-            plain.push(character);
-            continue;
-        }
-        match characters.next() {
-            Some(escaped) if escaped.is_whitespace() => plain.push(escaped),
-            Some(escaped) => {
-                plain.push('\\');
-                plain.push(escaped);
-            }
-            None => plain.push('\\'),
-        }
+    // Three shapes have to be quoted, and each one is a silent failure
+    // otherwise: whitespace ends the pattern and turns the rest into
+    // attributes; a leading quote sends git into its C-quoting parser
+    // mid-pattern; a leading `#` makes git read the whole line as a comment, so
+    // the `-text` for that path would simply not be there. A leading `[attr]`
+    // is handled by `guard` rather than here, because git checks for a macro
+    // definition before it unquotes and quoting would not have helped.
+    if !pattern.contains(char::is_whitespace)
+        && !pattern.starts_with('"')
+        && !pattern.starts_with('#')
+    {
+        return pattern.to_string();
     }
 
-    // A leading quote would send git into its C-quoting parser mid-pattern. A
-    // leading `[attr]` is handled by `guard`, not here: git checks for a macro
-    // definition before it unquotes, so quoting would not have helped.
-    if !plain.contains(char::is_whitespace) && !plain.starts_with('"') {
-        return plain;
-    }
-
-    let mut quoted = String::with_capacity(plain.len() + 2);
+    let mut quoted = String::with_capacity(pattern.len() + 2);
     quoted.push('"');
-    for character in plain.chars() {
+    for character in pattern.chars() {
         match character {
             '"' | '\\' => {
                 quoted.push('\\');
@@ -247,6 +242,7 @@ fn spell(pattern: &str) -> String {
             }
             '\t' => quoted.push_str("\\t"),
             '\r' => quoted.push_str("\\r"),
+            '\n' => quoted.push_str("\\n"),
             other => quoted.push(other),
         }
     }
