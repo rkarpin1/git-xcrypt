@@ -369,6 +369,47 @@ mod tests {
         dir
     }
 
+    /// Both halves of the filter command's spelling, exercised from any platform.
+    ///
+    /// The rewrite exists for Windows, where git wants forward slashes in a
+    /// config value it hands to a shell. It used to run unconditionally, and on
+    /// Unix a backslash is an ordinary character in a file name — so a binary
+    /// under `/opt/a\b/git-xcrypt` was registered as `/opt/a/b/git-xcrypt`, a
+    /// path that does not exist. `init` still reported success, and with
+    /// `required = true` every later `git add`, `git checkout` and `git status`
+    /// in that repository aborted with no way to see why from the message.
+    ///
+    /// `repo::git_spelling` already carried this rule, with a test of its own;
+    /// this is the same core, so the two cannot drift.
+    #[test]
+    fn the_registered_command_rewrites_a_separator_and_never_a_file_name() {
+        use std::path::Path;
+
+        // Windows: the separator is a separator, and git gets slashes.
+        assert_eq!(
+            shell_quoted(Path::new(r"C:\Program Files\xc\git-xcrypt.exe"), '\\'),
+            "'C:/Program Files/xc/git-xcrypt.exe'"
+        );
+
+        // Unix: a backslash is part of the name and must survive untouched.
+        assert_eq!(
+            shell_quoted(Path::new(r"/opt/a\b/git-xcrypt"), '/'),
+            r"'/opt/a\b/git-xcrypt'",
+            "the registered command named a binary that does not exist"
+        );
+
+        // A quote is still closed, escaped and reopened, on both.
+        assert_eq!(
+            shell_quoted(Path::new("/opt/it's/git-xcrypt"), '/'),
+            r"'/opt/it'\''s/git-xcrypt'"
+        );
+
+        // And whatever this platform is, the real one round-trips: what `init`
+        // writes has to name the binary that is running.
+        let registered = current_executable().expect("the running binary has a path");
+        assert!(registered.starts_with('\'') && registered.ends_with('\''));
+    }
+
     #[test]
     fn the_textconv_cache_is_switched_off_rather_than_merely_left_out() {
         // With `cachetextconv` on, git keeps every decrypted file in a notes ref
