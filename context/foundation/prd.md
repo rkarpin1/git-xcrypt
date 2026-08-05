@@ -67,9 +67,12 @@ Pełny przepływ przechodzi od początku do końca:
 
 # TODO: historyjki użytkownika dla FR-002, FR-007, FR-009, FR-010 — see Open Questions
 #
-# Stan na 2026-08-04: nadal nienapisane jako Given/When/Then, ale ich kryteria
-# akceptacji istnieją de facto jako testy — `tests/key_transfer.rs`,
-# `tests/lock_command.rs`, `tests/status_command.rs`, `tests/sync_command.rs`.
+# Stan na 2026-08-05: nadal nienapisane jako Given/When/Then, ale ich kryteria
+# akceptacji istnieją de facto jako scenariusze realnego użycia — FR-002
+# w `tests/attributes.rs`, FR-007 w `tests/key_safety.rs`, FR-009
+# w `tests/lock_unlock.rs`, FR-010 w `tests/exposure.rs`
+# i `tests/odd_repositories.rs`. Wcześniejszy zapis wskazywał `key_transfer.rs`
+# i `sync_command.rs`, które zniknęły przy redukcji zestawu z 466 do 89 testów.
 
 ## Functional Requirements
 
