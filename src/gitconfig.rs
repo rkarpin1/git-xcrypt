@@ -5,13 +5,88 @@
 //! on exactly the platform where it hurts most. Writing only ever touches the
 //! repository-local file, which is the only one this tool has business changing.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use bstr::ByteSlice as _;
 use gix_config::File;
 use gix_config::file::Metadata;
 
 use crate::{Error, Result};
+
+/// The global attributes file, resolved the way git resolves it.
+///
+/// Reading `core.attributesFile` verbatim is not enough, and the gap is not
+/// cosmetic: it is a source in git's attribute stack, so a line in it can put
+/// `text` back on a path this tool encrypts — and git then converts the
+/// ciphertext. Measured on git 2.55, 2 MB, the line living in
+/// `~/.config/git/attributes` while the same line in the tree is refused: `git
+/// add` exited **0**, 27 `CR` bytes were eaten out of the blob, the commit
+/// succeeded and the checkout left **no file at all**. The refusal in
+/// [`crate::filter`] and the gate in `status` both resolve the stack correctly;
+/// they simply were not being handed this file, so both reported a healthy
+/// repository over a destroyed one.
+///
+/// Git's rule, measured on 2.55 rather than read from the documentation — the
+/// five shapes are a table test in this module:
+///
+/// | `core.attributesFile` | what git reads |
+/// | --- | --- |
+/// | unset | `$XDG_CONFIG_HOME/git/attributes`, else `$HOME/.config/git/attributes` |
+/// | `~/name`, `~user/name` | expanded, exactly as `core.excludesFile` is |
+/// | an absolute path | that path |
+/// | empty | **nothing** — and no XDG fallback either |
+///
+/// Returns the path whether or not it exists; a missing file is an empty source
+/// to the resolver, which is what git does with one too.
+#[must_use]
+pub fn global_attributes_file(config: &File) -> Option<PathBuf> {
+    global_attributes_file_for(
+        config,
+        // `HOME` first, then the platform's own answer — git's order, and the
+        // reason a Windows user can keep a linux-style home somewhere else.
+        gix_path::env::home_dir().as_deref(),
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+    )
+}
+
+/// [`global_attributes_file`], with the two environment variables as arguments.
+///
+/// Split out so the table below can be a test rather than a hope. `HOME` and
+/// `XDG_CONFIG_HOME` belong to the *process*, so setting them to exercise a row
+/// would need `unsafe` — which `unsafe_code = "forbid"` refuses, and that
+/// refusal is worth more than the convenience. Passing the difference in as an
+/// argument is the same shape `eol::apply_where` and `repo::with_separator`
+/// already use for a platform the test is not running on.
+#[must_use]
+fn global_attributes_file_for(
+    config: &File,
+    home: Option<&Path>,
+    xdg_config_home: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    let Ok(value) = config.raw_value("core.attributesFile") else {
+        // Git treats an empty `XDG_CONFIG_HOME` as unset, so `is_empty` is part
+        // of the rule and not a defensive extra.
+        if let Some(xdg) = xdg_config_home
+            && !xdg.is_empty()
+        {
+            return Some(PathBuf::from(xdg).join("git").join("attributes"));
+        }
+        return Some(home?.join(".config").join("git").join("attributes"));
+    };
+    // Set but empty turns the file off; it does **not** fall back to XDG.
+    if value.is_empty() {
+        return None;
+    }
+    // `~/`, `~user/` and `%(prefix)/`, through the same crate that parsed the
+    // value. Hand-rolling the expansion would be a second spelling of a rule
+    // git already has one of.
+    gix_config::Path::from(value)
+        .interpolate(gix_config::path::interpolate::Context {
+            home_dir: home,
+            ..Default::default()
+        })
+        .ok()
+}
 
 /// The repository-local configuration, loaded for editing.
 ///
@@ -145,6 +220,56 @@ pub fn is_true(value: &str) -> bool {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// The five shapes of `core.attributesFile`, as measured on git 2.55.
+    ///
+    /// The scenario in `tests/attributes.rs` proves the two that cost a file;
+    /// this proves the whole table, including the two that must resolve to
+    /// **nothing**. Over-eager resolution is its own failure mode: with
+    /// `required = true`, a global file we invent and the user does not have
+    /// would refuse operations in every repository on the machine.
+    #[test]
+    fn the_global_attributes_file_resolves_where_git_resolves_it() {
+        let home = Path::new("/home/user");
+        let resolve = |contents: &str, xdg: Option<&str>| {
+            let file = File::try_from(contents).expect("the fixture is valid configuration");
+            global_attributes_file_for(&file, Some(home), xdg.map(std::ffi::OsStr::new))
+        };
+
+        assert_eq!(
+            resolve("[core]\n", None),
+            Some(home.join(".config").join("git").join("attributes")),
+            "unset must fall back to the XDG default, which is where git looks"
+        );
+        assert_eq!(
+            resolve("[core]\n", Some("/xdg")),
+            Some(Path::new("/xdg").join("git").join("attributes")),
+            "XDG_CONFIG_HOME must win over the $HOME/.config default"
+        );
+        assert_eq!(
+            resolve("[core]\n", Some("")),
+            Some(home.join(".config").join("git").join("attributes")),
+            "git treats an empty XDG_CONFIG_HOME as unset, so this must too"
+        );
+        assert_eq!(
+            resolve("[core]\n\tattributesFile = ~/attrs\n", None),
+            Some(home.join("attrs")),
+            "`~/` must be expanded, exactly as git expands `core.excludesFile`"
+        );
+        assert_eq!(
+            resolve(
+                "[core]\n\tattributesFile = /elsewhere/attrs\n",
+                Some("/xdg")
+            ),
+            Some(PathBuf::from("/elsewhere/attrs")),
+            "an absolute path must be taken as written, XDG or no XDG"
+        );
+        assert_eq!(
+            resolve("[core]\n\tattributesFile = \n", Some("/xdg")),
+            None,
+            "an empty value turns the file off — and does **not** fall back to XDG"
+        );
+    }
 
     #[test]
     fn an_empty_value_is_false_to_git_and_must_be_false_here() {

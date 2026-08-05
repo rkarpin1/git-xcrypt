@@ -483,6 +483,7 @@ dependencies = [
  "gix-hash",
  "gix-object",
  "gix-odb",
+ "gix-path",
  "gix-ref",
  "hkdf",
  "proptest",

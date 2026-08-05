@@ -21,6 +21,8 @@
 
 mod harness;
 
+use std::fs;
+
 use harness::{MAGIC, OVERHEAD, TestRepo};
 use tempfile::TempDir;
 
@@ -650,6 +652,173 @@ fn a_foreign_text_line_below_the_managed_section_is_refused_before_the_file_is_l
             "the report must name the attribute that prevents it:\n{text}"
         );
     }
+}
+
+/// Where a global attributes file can live, and how git is told about it.
+///
+/// Both are resolved by git and neither is a path we can read verbatim: the
+/// first is a default nothing in the configuration mentions, the second needs
+/// `~` expanded. Measured on git 2.55 — the third row, an absolute path, always
+/// worked and is here so a regression in the other two cannot hide behind it.
+const GLOBAL_SOURCES: [&str; 3] = ["xdg-default", "tilde", "absolute"];
+
+#[test]
+fn a_text_line_in_the_users_global_attributes_file_is_refused_like_any_other() {
+    // The same rule as the test above, from the one source that used to be
+    // invisible. `core.attributesFile` was read verbatim, so `~/attrs` looked
+    // for a directory literally named `~`, and with the key unset the XDG
+    // default was not consulted at all — while git reads both.
+    //
+    // Measured on git 2.55, 2026-08-05, 2 MB, the line in
+    // `~/.config/git/attributes` while the identical line in the tree was
+    // already refused: `git add` exited **0**, 27 `CR` bytes were eaten out of
+    // the blob, `git commit` exited 0, and the checkout left **no file at all**.
+    // `status` said `VERDICT: no findings.` over it. Both halves of the tool
+    // that exist to catch this resolve the stack correctly; neither was being
+    // handed this file.
+    //
+    // The declaration is deliberately one `sync` behind, because that is the
+    // only state where a global line can win: it sits *below* the tree in git's
+    // precedence, so a current managed section's `-text` covers the path and
+    // nothing outside can reach it. Forgetting `sync` is what opens the door —
+    // and a global `*.sh text eol=lf` is an ordinary thing to have.
+    for source in GLOBAL_SOURCES {
+        let home = TempDir::new().expect("could not create a home directory");
+        let secret = two_megabytes();
+
+        let repo = TestRepo::init().with_home(home.path());
+        repo.init_xcrypt();
+        repo.write_xcrypt_config("secrets/\n");
+        repo.xcrypt_ok(["sync"]);
+
+        // Declared after the last `sync`, so the managed section says nothing
+        // about this subtree and the global file is free to.
+        repo.write_xcrypt_config("secrets/\nvault/\n");
+        repo.write_file("vault/deploy.sh", &secret);
+        repo.commit_all("a secret, while nothing yet converts it");
+        assert_eq!(
+            repo.blob_bytes("vault/deploy.sh").len(),
+            OVERHEAD + secret.len(),
+            "the fixture did not store an intact ciphertext to begin with"
+        );
+
+        let line = b"vault/** text\n";
+        // Kept, because the refusal has to name *this* file: a message that
+        // merely says one exists leaves the user with nothing to act on.
+        let global = match source {
+            "xdg-default" => {
+                let dir = home.path().join(".config").join("git");
+                fs::create_dir_all(&dir).expect("could not create the XDG directory");
+                dir.join("attributes")
+            }
+            "tilde" => {
+                repo.git_ok(["config", "--global", "core.attributesFile", "~/attrs"]);
+                home.path().join("attrs")
+            }
+            _ => {
+                let path = home.path().join("attrs");
+                repo.git_ok([
+                    "config",
+                    "--global",
+                    "core.attributesFile",
+                    &path.to_string_lossy(),
+                ]);
+                path
+            }
+        };
+        fs::write(&global, line).expect("could not write the global attributes file");
+
+        // The premise is the failure mode itself: if git does not resolve `text`
+        // to `set` here, this loop is proving nothing about anything.
+        assert_eq!(
+            repo.check_attr("text", "vault/deploy.sh"),
+            "set",
+            "[{source}] the fixture no longer reproduces the shape it exists to catch"
+        );
+
+        // Git's cached `stat` skips a file it considers unchanged, so only a
+        // path that is cleaned again can reach the filter at all.
+        let mut modified = secret.clone();
+        modified.extend_from_slice(b"one more line\r\n");
+        repo.write_file("vault/deploy.sh", &modified);
+
+        let add = repo.git(["add", "-A"]);
+        assert!(
+            !add.status.success(),
+            "[{source}] `git add` stored a ciphertext git is about to convert, \
+             and exited {:?}:\n{}",
+            add.status.code(),
+            String::from_utf8_lossy(&add.stderr)
+        );
+
+        // Naming the winning line is the whole remedy: no command of this tool
+        // edits a file the user wrote, so the report has to say which one.
+        let complaint = String::from_utf8_lossy(&add.stderr).into_owned();
+        let named = global.file_name().expect("the global file has a name");
+        assert!(
+            complaint.contains(&named.to_string_lossy().into_owned()),
+            "[{source}] the refusal does not name the file that caused it \
+             ({}):\n{complaint}",
+            global.display()
+        );
+        assert!(
+            complaint.contains("vault/** text"),
+            "[{source}] the refusal does not quote the winning line:\n{complaint}"
+        );
+
+        // And the gate agrees, over a path the index already knows.
+        let status = repo.xcrypt(["status"]);
+        let text = String::from_utf8_lossy(&status.stdout).into_owned();
+        assert_eq!(
+            status.status.code(),
+            Some(CONFIG_ERROR),
+            "[{source}] the gate passed a repository whose ciphertext git \
+             converts:\n{text}"
+        );
+        assert!(
+            text.contains("vault/deploy.sh"),
+            "[{source}] the report must name the path git converts:\n{text}"
+        );
+    }
+}
+
+#[test]
+fn a_global_attributes_file_that_is_harmless_never_provokes_a_refusal() {
+    // The other half, and it carries more weight here than usual. A global
+    // attributes file is shared by every repository on the machine, so a
+    // predicate one shape too wide does not break one project — it breaks all
+    // of them at once, and with `required = true` it breaks *every* git
+    // operation in each. `* text=auto` is what people actually have in that
+    // file.
+    let home = TempDir::new().expect("could not create a home directory");
+    let dir = home.path().join(".config").join("git");
+    fs::create_dir_all(&dir).expect("could not create the XDG directory");
+    fs::write(dir.join("attributes"), b"* text=auto\n*.md text\n")
+        .expect("could not write attributes");
+
+    let repo = TestRepo::init().with_home(home.path());
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\nvault/\n");
+
+    let secret = two_megabytes();
+    repo.write_file("vault/deploy.sh", &secret);
+    repo.commit_all("an ordinary machine with an ordinary global file");
+
+    assert_eq!(
+        repo.blob_bytes("vault/deploy.sh").len(),
+        OVERHEAD + secret.len(),
+        "a harmless global attributes file changed the stored ciphertext"
+    );
+    repo.recheckout("vault/deploy.sh");
+    repo.assert_worktree_eq("vault/deploy.sh", &secret);
+
+    let status = repo.xcrypt(["status"]);
+    assert_eq!(
+        status.status.code(),
+        Some(0),
+        "a harmless global attributes file failed the gate:\n{}",
+        String::from_utf8_lossy(&status.stdout)
+    );
 }
 
 #[test]

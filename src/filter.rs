@@ -120,8 +120,11 @@ impl Context {
                 hash: crate::gitindex::object_hash(
                     crate::gitconfig::get(&git_config, "extensions.objectformat").as_deref(),
                 ),
-                attributes_file: crate::gitconfig::get(&git_config, "core.attributesFile")
-                    .map(std::path::PathBuf::from),
+                // Resolved, not read verbatim — see
+                // [`crate::gitconfig::global_attributes_file`]. A `text` line in
+                // the global file reached the ciphertext with `git add` exiting
+                // 0 and the file gone at checkout.
+                attributes_file: crate::gitconfig::global_attributes_file(&git_config),
                 ignore_case: crate::gitconfig::get(&git_config, "core.ignorecase")
                     .is_some_and(|value| crate::gitconfig::is_true(&value)),
             }),

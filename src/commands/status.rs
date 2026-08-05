@@ -942,9 +942,9 @@ pub fn run(repo: &Repo, fix: bool) -> Result<Report> {
         // The common directory: `info/` is shared by every checkout, so a linked
         // worktree resolves the *main* `info/attributes` — see the resolver.
         repo.common_dir(),
-        gitconfig::get(&config, "core.attributesFile")
-            .as_deref()
-            .map(std::path::Path::new),
+        // Resolved, not read verbatim: `~/` and the XDG default are sources git
+        // honours, and a `text` line in one of them converts the ciphertext.
+        gitconfig::global_attributes_file(&config).as_deref(),
         ignore_case,
     );
 

@@ -46,6 +46,7 @@ gix-hash = { version = "0.26", features = ["sha1", "sha256"] }
 # would be the wrong kind of silence.
 gix-object = { version = "0.63.0", features = ["sha1", "sha256"] }
 gix-odb = { version = "0.83.0", features = ["sha1", "sha256"] }
+gix-path = "0.12.4"
 gix-ref = { version = "0.66.0", features = ["sha1", "sha256"] }
 hkdf = "0.13.0"
 sha2 = "0.11.0"

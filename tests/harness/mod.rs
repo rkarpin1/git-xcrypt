@@ -9,7 +9,7 @@
 // used by only one of them would otherwise trip `-D warnings`.
 #![allow(dead_code)]
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -25,6 +25,18 @@ pub struct TestRepo {
     // Held for its Drop: removing the directory tree when the test ends.
     _dir: TempDir,
     path: PathBuf,
+    /// Environment applied to every `git` and `git-xcrypt` this repository runs.
+    ///
+    /// Empty by default, because the rest of the configuration is inherited from
+    /// the machine on purpose. A scenario about a source git resolves *outside*
+    /// the repository cannot inherit it: `~/.config/git/attributes` belongs to
+    /// whoever is running the suite, so a test that read theirs would pass or
+    /// fail for reasons unrelated to the code — and would edit a developer's
+    /// home directory to set itself up. See [`TestRepo::with_home`].
+    ///
+    /// `None` as a value removes the variable rather than setting it, which is
+    /// the only way to say "this machine has no `XDG_CONFIG_HOME`".
+    env: Vec<(OsString, Option<OsString>)>,
 }
 
 impl TestRepo {
@@ -52,7 +64,11 @@ impl TestRepo {
 
         let dir = TempDir::new().expect("could not create a temporary directory");
         let path = dir.path().to_path_buf();
-        let repo = Self { _dir: dir, path };
+        let repo = Self {
+            _dir: dir,
+            path,
+            env: Vec::new(),
+        };
 
         let mut args = vec!["init", "-q", "-b", "main"];
         args.extend_from_slice(extra);
@@ -67,15 +83,49 @@ impl TestRepo {
         &self.path
     }
 
+    /// Gives this repository its own home directory.
+    ///
+    /// Both `git` and `git-xcrypt` then resolve `~`, the global configuration
+    /// and `$HOME/.config/git/attributes` inside `home`, so a scenario can own
+    /// a source that lives outside the repository. `XDG_CONFIG_HOME` is removed
+    /// rather than pointed somewhere, because leaving the caller's value in
+    /// place would send git to a third directory the test never wrote.
+    ///
+    /// `HOMEDRIVE` and `HOMEPATH` go too: on Windows git assembles a home from
+    /// that pair, so setting `HOME` alone would leave the two disagreeing about
+    /// where `~` is — and the assertion would then be about the runner, not the
+    /// code.
+    #[must_use]
+    pub fn with_home(mut self, home: &Path) -> Self {
+        fs::create_dir_all(home).expect("could not create the home directory");
+        self.env
+            .push(("HOME".into(), Some(home.as_os_str().to_owned())));
+        self.env
+            .push(("USERPROFILE".into(), Some(home.as_os_str().to_owned())));
+        self.env.push(("XDG_CONFIG_HOME".into(), None));
+        self.env.push(("HOMEDRIVE".into(), None));
+        self.env.push(("HOMEPATH".into(), None));
+        self
+    }
+
+    /// Applies [`Self::env`] to a command about to run.
+    fn with_environment<'c>(&self, command: &'c mut Command) -> &'c mut Command {
+        for (name, value) in &self.env {
+            match value {
+                Some(value) => command.env(name, value),
+                None => command.env_remove(name),
+            };
+        }
+        command
+    }
+
     /// Runs `git-xcrypt` in this repository and returns the full output.
     pub fn xcrypt<I, S>(&self, args: I) -> Output
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        Command::new(BIN)
-            .current_dir(&self.path)
-            .args(args)
+        self.with_environment(Command::new(BIN).current_dir(&self.path).args(args))
             .output()
             .expect("could not run git-xcrypt")
     }
@@ -90,9 +140,8 @@ impl TestRepo {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let mut child = Command::new(BIN)
-            .current_dir(&self.path)
-            .args(args)
+        let mut child = self
+            .with_environment(Command::new(BIN).current_dir(&self.path).args(args))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -253,7 +302,11 @@ impl TestRepo {
             String::from_utf8_lossy(&output.stderr)
         );
 
-        let clone = Self { _dir: dir, path };
+        let clone = Self {
+            _dir: dir,
+            path,
+            env: self.env.clone(),
+        };
         clone.git_ok(["config", "user.name", "git-xcrypt tests"]);
         clone.git_ok(["config", "user.email", "tests@git-xcrypt.invalid"]);
         clone
@@ -283,7 +336,11 @@ impl TestRepo {
             String::from_utf8_lossy(&output.stderr)
         );
 
-        let clone = Self { _dir: dir, path };
+        let clone = Self {
+            _dir: dir,
+            path,
+            env: self.env.clone(),
+        };
         clone.git_ok(["config", "user.name", "git-xcrypt tests"]);
         clone.git_ok(["config", "user.email", "tests@git-xcrypt.invalid"]);
         clone
@@ -299,7 +356,11 @@ impl TestRepo {
 
         self.git_ok(["worktree", "add", "-q", "-b", name, &path.to_string_lossy()]);
 
-        Self { _dir: dir, path }
+        Self {
+            _dir: dir,
+            path,
+            env: self.env.clone(),
+        }
     }
 
     /// Runs git in this repository and returns the full output, failure included.
@@ -308,9 +369,7 @@ impl TestRepo {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        Command::new("git")
-            .current_dir(&self.path)
-            .args(args)
+        self.with_environment(Command::new("git").current_dir(&self.path).args(args))
             .output()
             .expect("could not run git")
     }
@@ -321,9 +380,8 @@ impl TestRepo {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let mut child = Command::new("git")
-            .current_dir(&self.path)
-            .args(args)
+        let mut child = self
+            .with_environment(Command::new("git").current_dir(&self.path).args(args))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -663,7 +721,11 @@ impl BareRemote {
             String::from_utf8_lossy(&output.stderr)
         );
 
-        let clone = TestRepo { _dir: dir, path };
+        let clone = TestRepo {
+            _dir: dir,
+            path,
+            env: Vec::new(),
+        };
         clone.git_ok(["config", "user.name", "git-xcrypt tests"]);
         clone.git_ok(["config", "user.email", "tests@git-xcrypt.invalid"]);
         clone
