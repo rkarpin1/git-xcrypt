@@ -121,6 +121,22 @@ pub fn render_lines(config: &Config) -> Vec<String> {
 /// the exclusion would put `-text` and a decrypting diff driver on a file that is
 /// stored in the clear; a line broader than it would take them off one that is
 /// not. Both halves have to move together.
+///
+/// **The probes are representatives, not an enumeration, and the gap is known
+/// and measured (2026-08-05).** `sub/.gitattributes` stands in for "a nested
+/// attributes file", so a pattern that reaches one only under its own directory
+/// — `secrets/` reaching `secrets/.gitattributes` — emits no exclusion, and
+/// that file carries `-text diff=git-xcrypt` while stored in the clear.
+/// Measured on git 2.55 with `core.autocrlf=true`: the file round-trips byte
+/// for byte, `git status` stays clean, `git diff` renders normally (the
+/// textconv driver passes plain text through), and git itself strips the `CR`
+/// of a CRLF-spelled attributes line when parsing, so even the un-managed line
+/// endings change nothing the file *does*. The only observable effect is that
+/// git stops normalising that one clear file's line endings. Enumerating
+/// faithfully would need the working tree at render time — the section is a
+/// pure function of the configuration on purpose — and emitting the exclusion
+/// unconditionally would rewrite every generated file to cover a state with no
+/// measured cost.
 fn bootstrap_exclusions(config: &Config) -> Vec<String> {
     let mut lines = Vec::new();
 
