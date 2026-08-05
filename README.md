@@ -7,6 +7,8 @@ system `gpg`, no helper scripts, no external processes on the filter path.
 **Status: v0.1 in development, not yet released.** Every command listed below
 works and is covered by tests that drive a real git. There is no published
 release or package yet, so today the only way in is `cargo install --path .`.
+[`CHANGELOG.md`](CHANGELOG.md) lists what the first release contains, what is
+frozen with it, and what it deliberately leaves out.
 
 ## Quick start
 
