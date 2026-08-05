@@ -519,21 +519,48 @@ fn tips(
     // what this adds is each one's own `HEAD` and its worktree-private
     // categories — `refs/bisect/*` above all, which is where a bisect in
     // progress parks the commits it is testing.
-    for entry in std::fs::read_dir(common_dir.join("worktrees"))
-        .into_iter()
-        .flatten()
-        .flatten()
-    {
-        let registration = entry.path();
-        if registration == git_dir || !registration.join("HEAD").is_file() {
-            continue;
+    //
+    // A registration directory that cannot be listed is a store that cannot be
+    // enumerated, not an empty one: every other checkout's `HEAD` would go
+    // unvisited, and this scan's silence would read as a clean bill of health.
+    // Measured on git 2.55, 2026-08-05: `chmod 000 .git/worktrees` over a
+    // repository whose only path to a plain-text secret was a linked worktree's
+    // detached `HEAD` turned exit 5 into `VERDICT: no findings`, exit 0. The
+    // same rule `packed-refs` already follows, one directory over. Only the
+    // directory being absent means there are no linked worktrees.
+    match std::fs::read_dir(common_dir.join("worktrees")) {
+        Ok(entries) => {
+            for entry in entries {
+                let registration = match entry {
+                    Ok(entry) => entry.path(),
+                    Err(err) => {
+                        scan.refs_unavailable = true;
+                        scan.warnings.push(format!(
+                            "a worktree registration could not be read ({err}), so that \
+                             checkout's references were not scanned"
+                        ));
+                        continue;
+                    }
+                };
+                if registration == git_dir || !registration.join("HEAD").is_file() {
+                    continue;
+                }
+                let other = gix_ref::file::Store::for_linked_worktree(
+                    registration,
+                    common_dir.to_path_buf(),
+                    options(),
+                );
+                collect_tips(&other, objects, scan, &mut tips);
+            }
         }
-        let other = gix_ref::file::Store::for_linked_worktree(
-            registration,
-            common_dir.to_path_buf(),
-            options(),
-        );
-        collect_tips(&other, objects, scan, &mut tips);
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            scan.refs_unavailable = true;
+            scan.warnings.push(format!(
+                "the worktree registrations could not be listed ({err}), so no other \
+                 checkout's references were scanned"
+            ));
+        }
     }
 
     tips.sort();
@@ -935,6 +962,31 @@ mod tests {
         .expect("the scan must succeed");
 
         assert_eq!(paths(&scan), ["secrets/parked.env"]);
+    }
+
+    #[test]
+    fn an_unlistable_worktree_registration_directory_is_not_an_empty_one() {
+        // The listing is what covers every other checkout's `HEAD`, so a
+        // failure to take it must land in `undetermined` rather than read as
+        // "no other checkouts". Provoked with a *file* where the directory
+        // belongs rather than a permission bit, so the branch runs on all
+        // three platforms — the same trick `tests/lock_unlock.rs` uses, and
+        // for the same reason: what is checked is the branch, not the errno.
+        let fixture = Fixture::new();
+        fixture.write("README.md", b"start\n");
+        fixture.commit("start");
+        fs::write(
+            fixture.dir.path().join(".git/worktrees"),
+            b"not a directory\n",
+        )
+        .expect("writing over the registrations");
+
+        let scan = fixture.scan("secrets/\n");
+
+        assert!(
+            scan.refs_unavailable,
+            "an unlistable worktrees directory was read as an empty one"
+        );
     }
 
     #[test]
