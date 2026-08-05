@@ -17,8 +17,13 @@ mod harness;
 
 use harness::TestRepo;
 
-/// The exit code the frozen table gives to "an exposure was found".
-const EXPOSED: i32 = 5;
+/// The exit code the frozen table gives to a configuration or state conflict.
+///
+/// Both states below are setup gaps, and since 2026-08-05 a setup gap is `2`
+/// rather than `5`: there is no secret to rotate in a repository whose only
+/// problem is that git was never told to run the filter, and `5` sent the
+/// operator after one.
+const CONFIG: i32 = 2;
 
 #[test]
 fn dropping_the_required_flag_is_caught() {
@@ -31,7 +36,7 @@ fn dropping_the_required_flag_is_caught() {
 
     let output = repo.xcrypt(["status"]);
 
-    assert_eq!(output.status.code(), Some(EXPOSED));
+    assert_eq!(output.status.code(), Some(CONFIG));
     assert!(
         String::from_utf8_lossy(&output.stdout).contains("filter.git-xcrypt.required"),
         "{}",
@@ -48,7 +53,7 @@ fn removing_the_catch_all_line_is_caught() {
 
     let output = repo.xcrypt(["status"]);
 
-    assert_eq!(output.status.code(), Some(EXPOSED));
+    assert_eq!(output.status.code(), Some(CONFIG));
     assert!(
         String::from_utf8_lossy(&output.stdout).contains("* filter=git-xcrypt"),
         "{}",

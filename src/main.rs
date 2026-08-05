@@ -462,6 +462,12 @@ fn status_and_describe(fix: bool) -> Result<ExitCode> {
         // while "I found something" asks them to rotate a secret.
         Verdict::Undetermined => ExitCode::from(exit::UNDETERMINED),
         Verdict::Exposed => ExitCode::from(exit::EXPOSED),
+        // And a third question since 2026-08-05, which outranks both: "fix the
+        // configuration". No new code — this is the frozen table's `2`, used
+        // exactly as `init` and `lock` already use it, for a repository whose
+        // state conflicts with what it is being asked to do. The report is
+        // printed in full first, so nothing this code outranks goes unsaid.
+        Verdict::Misconfigured => ExitCode::from(exit::CONFIG),
     })
 }
 

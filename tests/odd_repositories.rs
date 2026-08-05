@@ -28,7 +28,13 @@ use harness::{BareRemote, SharedKey, TestRepo};
 
 /// The frozen exit codes this file is about.
 const CLEAN: i32 = 0;
-/// Configuration or a state conflict — a bare repository has no working tree.
+/// Configuration or a state conflict.
+///
+/// Two things at once since 2026-08-05: a bare repository, which has no working
+/// tree to answer about, and — new — **any setup gap**. Configuration comes
+/// before data, because without a configuration that enforces anything the data
+/// in the repository is worth nothing, and `5` on an unconfigured checkout sent
+/// operators looking for a secret to rotate where none had been exposed.
 const CONFIG: i32 = 2;
 const EXPOSED: i32 = 5;
 const UNDETERMINED: i32 = 6;
@@ -191,6 +197,112 @@ fn every_unusual_repository_gets_an_answer_and_the_right_one() {
         UNDETERMINED,
     );
 
+    // --- Configuration before data: the precedence added 2026-08-05. --------
+    //
+    // A setup gap outranks a finding *and* a question, which reverses the old
+    // rule in exactly one place. The reason is that `5` used to be handed to a
+    // repository that had never run `init` — "an exposure was found, rotate the
+    // secret" over a checkout with nothing in it to rotate — while the one
+    // thing actually wrong, that git is not running the filter, read as a
+    // detail. `2` says what to do: fix the configuration, then ask again.
+    //
+    // Nothing is hidden by it. Each case below checks that the sections the
+    // other verdicts would have printed are still printed, because a code that
+    // silences the report would be worse than the code it replaced.
+    let untouched = TestRepo::init();
+    untouched.write_file("README.md", b"# a project that never heard of this tool\n");
+    untouched.commit_all("an ordinary repository");
+    expect(
+        "a repository that never ran `git-xcrypt init`",
+        &untouched.xcrypt(["status"]),
+        CONFIG,
+    );
+
+    // A configured repository whose declaration was deleted. Nothing is stored
+    // in the clear over this — the check-in path refuses without it — but
+    // nothing can be checked either, and the report has to say the scan did not
+    // run rather than print a reassuring zero.
+    let undeclared = TestRepo::init();
+    undeclared.init_xcrypt();
+    declared(&undeclared);
+    std::fs::remove_file(undeclared.path().join(".git-xcrypt")).expect("removing the declaration");
+    let output = undeclared.xcrypt(["status"]);
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    expect(
+        "a configured repository whose .git-xcrypt was deleted",
+        &output,
+        CONFIG,
+    );
+    assert!(
+        text.contains("history was NOT scanned"),
+        "a configured repository whose .git-xcrypt was deleted: the run stopped \
+         before the scan, and silence about that reads as `nothing found`:\n{text}"
+    );
+
+    // A leak in history **and** a setup gap. This is the assertion the whole
+    // change turns on: the verdict moves to `2`, and the leak is still named,
+    // still counted, and still carries its rotate-first procedure. An operator
+    // fixes the configuration, runs again, and gets `5` — the information does
+    // not go anywhere, only the order of the work does.
+    let both_kinds = TestRepo::init();
+    both_kinds.init_xcrypt();
+    both_kinds.write_xcrypt_config("# nothing declared yet\n");
+    both_kinds.write_file("secrets/db.env", SECRET);
+    both_kinds.commit_all("the leak");
+    both_kinds.write_xcrypt_config("secrets/\n");
+    both_kinds.xcrypt_ok(["sync"]);
+    both_kinds.git_ok(["config", "filter.git-xcrypt.required", "false"]);
+
+    let output = both_kinds.xcrypt(["status"]);
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    expect(
+        "a repository that both leaked a secret and is misconfigured",
+        &output,
+        CONFIG,
+    );
+    assert!(
+        text.contains("leaked in history"),
+        "a repository that both leaked a secret and is misconfigured: the leak \
+         must survive the configuration verdict, or `2` buys its clarity by \
+         hiding the finding:\n{text}"
+    );
+    assert!(
+        text.contains("secrets/db.env"),
+        "a repository that both leaked a secret and is misconfigured: the leaked \
+         path must still be named:\n{text}"
+    );
+    assert!(
+        text.contains("ROTATE THE SECRET"),
+        "a repository that both leaked a secret and is misconfigured: the \
+         rotate-first procedure must still be printed:\n{text}"
+    );
+    // And the second half of the promise: once the configuration is settled,
+    // the very same repository answers `5`. Nothing was lost, it was ordered.
+    both_kinds.git_ok(["config", "filter.git-xcrypt.required", "true"]);
+    expect(
+        "the same repository once its configuration is fixed",
+        &both_kinds.xcrypt(["status"]),
+        EXPOSED,
+    );
+
+    // A setup gap over a checkout that also could not be scanned: a shallow
+    // clone nobody unlocked, which is what a CI job does before it runs
+    // anything. `2` again — the missing registration is the thing to fix, and
+    // the shallow history is still reported underneath it.
+    let never_unlocked = source.clone_shallow();
+    let output = never_unlocked.xcrypt(["status"]);
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    expect(
+        "a shallow clone nobody unlocked, so both answers apply at once",
+        &output,
+        CONFIG,
+    );
+    assert!(
+        text.contains("shallow clone"),
+        "a shallow clone nobody unlocked: what could not be checked must still \
+         be reported under the configuration verdict:\n{text}"
+    );
+
     // --- A linked worktree. -------------------------------------------------
     //
     // The one configuration where "the git directory" and "the directory git
@@ -219,10 +331,14 @@ fn every_unusual_repository_gets_an_answer_and_the_right_one() {
         b"secrets/** -filter\n",
     )
     .expect("writing info/attributes");
+    // A setup gap, so `2` since 2026-08-05: the remedy is the attribute line in
+    // the shared `info/attributes`, not a rotated secret — nothing has been
+    // committed in the clear here yet, and the point of the gate is to say so
+    // before something is.
     expect(
         "a linked worktree whose shared info/attributes turns the filter off",
         &linked.xcrypt(["status"]),
-        EXPOSED,
+        CONFIG,
     );
     std::fs::remove_file(main.path().join(".git/info/attributes")).expect("removing it again");
 

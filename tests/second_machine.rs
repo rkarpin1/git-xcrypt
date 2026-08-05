@@ -16,8 +16,13 @@ mod harness;
 use harness::{BareRemote, MAGIC, OVERHEAD, TestRepo};
 use tempfile::TempDir;
 
-/// The exit code the frozen table gives to "an exposure was found".
-const EXPOSED: i32 = 5;
+/// The exit code the frozen table gives to a configuration or state conflict.
+///
+/// A clone nobody has unlocked is exactly that, and since 2026-08-05 it is `2`
+/// rather than `5`. Nothing here has leaked yet — the blobs are ciphertext and
+/// the working tree holds no plain text at all — so the operator's next move is
+/// `unlock`, not rotating a credential.
+const CONFIG: i32 = 2;
 
 const FIRST: &[u8] = b"DATABASE_URL=postgres://user:hunter2@localhost/app\n";
 const FROM_THE_OTHER_MACHINE: &[u8] = b"DATABASE_URL=postgres://user:swordfish@db/app\n";
@@ -58,12 +63,21 @@ fn a_clone_becomes_a_working_second_machine_and_its_edits_come_home() {
     let text = String::from_utf8_lossy(&unfiltered.stdout).into_owned();
     assert_eq!(
         unfiltered.status.code(),
-        Some(EXPOSED),
+        Some(CONFIG),
         "a clone that cannot filter must not pass the gate:\n{text}"
     );
     assert!(
         text.contains("filter.git-xcrypt.process"),
         "the report must name the registration that is missing:\n{text}"
+    );
+    // The code says "fix the configuration"; the report still has to say what
+    // happens if nobody does. This is the one setup gap a user meets by simply
+    // cloning, and committing a secret from here stores the plain text with
+    // exit code 0 — a message that only talked about configuration would let a
+    // reader think this checkout is merely incomplete rather than unsafe.
+    assert!(
+        text.contains("stores it in the clear"),
+        "the report must say what committing from an unconfigured clone does:\n{text}"
     );
 
     // --- The key is carried across, by hand, as the PRD says it is. ---------

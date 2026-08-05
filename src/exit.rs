@@ -13,6 +13,15 @@ pub const USAGE: u8 = 1;
 
 /// Configuration or a state conflict: not a git repository, a clash during
 /// `init`, or a dirty working tree during `lock`.
+///
+/// Since 2026-08-05 it is also what `status` answers when git is not set up to
+/// enforce the declarations — an unregistered filter, a missing catch-all line,
+/// a missing `.git-xcrypt` — and it outranks both [`EXPOSED`] and
+/// [`UNDETERMINED`]. **Configuration comes before data:** without a
+/// configuration that enforces anything the data in the repository is worth
+/// nothing, and `5` was telling repositories that had never run `init` to go and
+/// rotate a secret they had never exposed. No new code was minted for it; this
+/// is the existing meaning, applied.
 pub const CONFIG: u8 = 2;
 
 /// The repository key is missing.
@@ -32,8 +41,10 @@ pub const EXPOSED: u8 = 5;
 /// `status` could not answer the question it was asked.
 ///
 /// A shallow or partial clone, an index that will not parse, a reference store
-/// that will not enumerate, a missing `.git-xcrypt`. Nothing was found and
-/// nothing is ruled out.
+/// that will not enumerate. Nothing was found and nothing is ruled out. (A
+/// missing `.git-xcrypt` was in this list until 2026-08-05 and is now [`CONFIG`]
+/// — it is a configuration that enforces nothing, and it still puts everything
+/// the run then skipped in `undetermined`.)
 ///
 /// **Added 2026-08-04, and it widens a table this project had frozen.** The
 /// reason is measured: `5` used to carry both answers, so a perfectly healthy

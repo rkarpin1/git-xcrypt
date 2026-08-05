@@ -36,9 +36,19 @@
 //! as a CI gate and so "the repository has a problem" is distinguishable from
 //! "the tool broke". Since 2026-08-04 there is a third answer, `6`, for the runs
 //! that could not tell — a shallow or partial clone, an index that will not
-//! parse, a missing declaration. Collapsing that into `5` failed the gate on a
-//! healthy `git clone --depth 1`, which is what `actions/checkout` produces
-//! unless it is given `fetch-depth: 0`. See [`Verdict`].
+//! parse. Collapsing that into `5` failed the gate on a healthy `git clone
+//! --depth 1`, which is what `actions/checkout` produces unless it is given
+//! `fetch-depth: 0`.
+//!
+//! Since 2026-08-05 there is a fourth, and it outranks the other two: `2`, the
+//! frozen table's "configuration or a state conflict", for a repository where
+//! git is not set up to enforce anything — an unregistered filter, a missing
+//! catch-all line, a missing declaration. **Configuration comes before data**,
+//! because without a configuration that enforces anything the data here is worth
+//! nothing, and `5` used to tell a repository that had never run `init` that an
+//! exposure had been found. It hides nothing: every section is printed under
+//! every verdict, so a misconfigured repository that also leaked still names the
+//! leak and still prints the rotate-first procedure. See [`Verdict`].
 
 use std::fmt;
 
@@ -110,6 +120,16 @@ pub enum SetupGap {
         /// The attribute line that decides it, with the file and line it sits in.
         culprit: String,
     },
+    /// `.git-xcrypt` is not there, so nothing declares what to encrypt.
+    ///
+    /// Filed as a gap rather than only as a question since 2026-08-05. It is not
+    /// an exposure — the check-in path refuses on this state, so no `git add`
+    /// stores anything in the clear over it — but it is precisely a
+    /// configuration that enforces nothing, and the remedy is a file, not a
+    /// rotated secret. It still puts the rest of the run in `undetermined`,
+    /// because without the declaration neither the index nor history can be
+    /// judged at all.
+    DeclarationMissing,
     /// A file the whole mechanism bootstraps from is not tracked.
     ///
     /// `.gitattributes` is what makes git call the filter and `.git-xcrypt` is
@@ -183,6 +203,15 @@ impl fmt::Display for SetupGap {
                 }
                 Ok(())
             }
+            Self::DeclarationMissing => write!(
+                f,
+                "{config} is missing, so nothing here declares what to encrypt. \
+                 Nothing is stored in the clear over this — every `git add` in \
+                 this repository refuses until it is back — and nothing is \
+                 enforced either. `git-xcrypt init` creates one; a clone gets it \
+                 from the commit that carries it",
+                config = crate::repo::CONFIG_FILE
+            ),
             Self::Untracked(path) => write!(
                 f,
                 "{path} is not committed, so no clone of this repository gets it \
@@ -259,11 +288,15 @@ pub struct Scanned {
 
 /// What a run concluded, as the exit code reports it.
 ///
-/// Three values rather than two, and the third one is the whole point. "I found
-/// a secret in the clear" and "I could not look" are different answers that ask
-/// different things of whoever reads them, and until 2026-08-04 both came out
-/// as `5` — so a healthy `git clone --depth 1` failed the gate exactly as a
-/// leaking repository did. See [`crate::exit::UNDETERMINED`].
+/// Four values, and each one asks the operator for something different: fix the
+/// configuration, rotate a secret, fix the checkout, or nothing at all. That is
+/// the only reason they are separate — a gate is read as a number, and a number
+/// that carries two questions gets the wrong answer to one of them. Both splits
+/// were made after measuring a case where the shared code sent a reader the
+/// wrong way: `6` because a healthy `git clone --depth 1` failed the gate like a
+/// leaking repository, and `2` because a repository that had never run `init`
+/// was told an exposure had been found. See [`crate::exit::UNDETERMINED`] and
+/// [`crate::exit::CONFIG`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
     /// Everything was checked and nothing was found.
@@ -272,17 +305,42 @@ pub enum Verdict {
     Undetermined,
     /// Something was found.
     Exposed,
+    /// Git is not set up to enforce the declarations here.
+    ///
+    /// The highest of the four since 2026-08-05, and the only one that reversed
+    /// a precedence — see [`Report::verdict`].
+    Misconfigured,
 }
 
 impl Report {
     /// What this run concluded.
     ///
-    /// A finding outranks an unanswered question, always: a run that both hit an
-    /// unreadable index and found a leak has found a leak, and the weaker code
-    /// must never mask the stronger one.
+    /// **Configuration, then a finding, then a question.** The owner's reason for
+    /// putting configuration first, 2026-08-05: *without a working configuration
+    /// the data in the repository is worth nothing* — a checkout where git is not
+    /// running the filter cannot be judged clean, cannot be trusted about what it
+    /// stores next, and above all cannot be repaired by acting on anything this
+    /// report says about its data. So the operator is sent to the one repair that
+    /// makes the rest meaningful, and asks again afterwards.
+    ///
+    /// It is a reversal in exactly one place. Until 2026-08-05 a setup gap was
+    /// [`Verdict::Exposed`], which handed `5` — "an exposure was found, rotate
+    /// the secret" — to a repository that had never run `init` and had nothing in
+    /// it to rotate, while the one thing genuinely wrong with it read as a
+    /// detail. `2` is the frozen table's "configuration or a state conflict",
+    /// used here exactly as `init` and `lock` already use it.
+    ///
+    /// Everything else stands: a finding still outranks an unanswered question,
+    /// so a run that hit an unreadable index *and* found a leak has found a leak.
+    /// And no verdict withholds a section — a misconfigured repository that also
+    /// leaked prints the leak, the paths and the rotate-first procedure exactly
+    /// as it did before, because the code changes the order of the work and not
+    /// what the reader is told.
     #[must_use]
     pub fn verdict(&self) -> Verdict {
-        if !self.setup.is_empty() || !self.in_the_clear.is_empty() || !self.leaked.is_empty() {
+        if !self.setup.is_empty() {
+            Verdict::Misconfigured
+        } else if !self.in_the_clear.is_empty() || !self.leaked.is_empty() {
             Verdict::Exposed
         } else if self.undetermined.is_empty() {
             Verdict::Clean
@@ -291,21 +349,40 @@ impl Report {
         }
     }
 
-    /// Whether this run found an exposure.
+    /// Whether this run found plain text where ciphertext was expected.
+    ///
+    /// Read off the findings rather than off [`Report::verdict`], and that is
+    /// deliberate: since 2026-08-05 a setup gap outranks a finding, so a
+    /// repository that both leaked and is misconfigured answers
+    /// [`Verdict::Misconfigured`] while its leak is every bit as real. Deriving
+    /// this from the verdict would make it say no.
     #[must_use]
     pub fn exposed(&self) -> bool {
-        self.verdict() == Verdict::Exposed
+        !self.in_the_clear.is_empty() || !self.leaked.is_empty()
     }
 
     /// Whether any setup gap means git stores declared content unfiltered.
     ///
-    /// [`SetupGap::CiphertextConverted`] is the one that does not: git runs the
-    /// filter, and then damages what it produced. Same exit code, opposite
-    /// remedy — and the opposite advice about rotating the secret.
+    /// Two of them do not, and they are opposite failures rather than milder
+    /// ones. [`SetupGap::CiphertextConverted`]: git runs the filter and then
+    /// damages what it produced, so what is lost is the file, not the secret.
+    /// [`SetupGap::DeclarationMissing`]: the check-in path refuses outright, so
+    /// nothing is stored at all. Same exit code, three different remedies — and
+    /// only the first calls for rotating anything.
     fn stores_in_the_clear(&self) -> bool {
+        self.setup.iter().any(|gap| {
+            !matches!(
+                gap,
+                SetupGap::CiphertextConverted { .. } | SetupGap::DeclarationMissing
+            )
+        })
+    }
+
+    /// Whether the only thing wrong is that nothing declares what to encrypt.
+    fn only_the_declaration_is_missing(&self) -> bool {
         self.setup
             .iter()
-            .any(|gap| !matches!(gap, SetupGap::CiphertextConverted { .. }))
+            .all(|gap| matches!(gap, SetupGap::DeclarationMissing))
     }
 }
 
@@ -350,18 +427,29 @@ impl fmt::Display for Report {
                 "setup: git is configured to run the filter in this repository."
             )?;
         } else {
-            // Two different sentences, because the gaps have two different
-            // outcomes and one wording cannot be true of both. A registration
-            // gap stores the plain text; a conversion gap destroys the
-            // ciphertext instead — and telling a user their secrets are in the
-            // clear when they are not sends them to rotate credentials that were
-            // never exposed, while telling them to run `init` fixes nothing.
+            // Three different sentences, because the gaps have three different
+            // outcomes and one wording cannot be true of all of them. A
+            // registration gap stores the plain text; a conversion gap destroys
+            // the ciphertext instead; a missing declaration stores nothing at
+            // all because the check-in path refuses. Telling a user their
+            // secrets are in the clear when they are not sends them to rotate
+            // credentials that were never exposed, while telling them to run
+            // `init` fixes nothing.
             if self.stores_in_the_clear() {
                 writeln!(
                     f,
                     "setup: git is NOT filtering this repository. Until this is fixed, \
                      committing a declared file stores it in the clear, with exit code 0 \
                      and no warning."
+                )?;
+            } else if self.only_the_declaration_is_missing() {
+                writeln!(
+                    f,
+                    "setup: git calls the filter here, but the filter has nothing to \
+                     read. Nothing is stored in the clear over this — every `git add` \
+                     in this repository refuses until the declaration is back — and \
+                     nothing below was checked, because there is no way to tell which \
+                     paths should have been."
                 )?;
             } else {
                 writeln!(
@@ -445,7 +533,7 @@ impl Report {
                     self.undetermined.len()
                 );
             }
-            Verdict::Exposed => {}
+            Verdict::Exposed | Verdict::Misconfigured => {}
         }
 
         let mut parts: Vec<String> = Vec::new();
@@ -458,12 +546,34 @@ impl Report {
                 self.in_the_clear.len()
             ));
         }
-        if !self.setup.is_empty() {
-            parts.push(format!("{} setup gap(s)", self.setup.len()));
-        }
         if !self.undetermined.is_empty() {
             parts.push(format!("{} thing(s) undetermined", self.undetermined.len()));
         }
+
+        // The configuration verdict leads with the repair that makes every other
+        // line here mean something, and then says what else is on the page. It
+        // must never read as "and nothing else was found": a leak reported under
+        // code `2` is the same leak it would be under `5`, and an operator who
+        // stops reading at the first line has to know there is more below.
+        if self.verdict() == Verdict::Misconfigured {
+            write!(
+                f,
+                "VERDICT: {} setup gap(s) — git is not enforcing the declarations \
+                 in this repository. Fix the setup first and ask again; until then \
+                 nothing here can be called clean.",
+                self.setup.len()
+            )?;
+            if parts.is_empty() {
+                return writeln!(f, "\n");
+            }
+            return writeln!(
+                f,
+                " Also found, and NOT cancelled by the above — see the sections \
+                 below: {}.\n",
+                parts.join(", ")
+            );
+        }
+
         writeln!(f, "VERDICT: {}.\n", parts.join(", "))
     }
 
@@ -791,13 +901,19 @@ pub fn run(repo: &Repo, fix: bool) -> Result<Report> {
 
     let declarations = Config::load(&repo.xcrypt_config_path())?;
     if declarations.missing {
-        // Without the declaration nothing below can be answered at all, and the
-        // check-in path refuses on the same state — so this repository is not
-        // leaking, it is simply unusable until the file comes back.
+        // Both, and they are two different statements. The gap is the state:
+        // nothing here declares what to encrypt, so the configuration enforces
+        // nothing — a `2`, not a `5`, because the check-in path refuses on this
+        // state and no secret has been stored in the clear over it. The
+        // undetermined entry is the consequence: the run stops here, so every
+        // section below is empty for want of a question rather than for want of
+        // a finding, and saying so is the difference between "I checked" and "I
+        // could not". Silence there would be worse than either code.
+        report.setup.push(SetupGap::DeclarationMissing);
         report.undetermined.push(format!(
-            "{} is missing, so nothing here declares what to encrypt. Every \
-             `git add` in this repository refuses until it is restored; \
-             `git-xcrypt init` creates one.",
+            "nothing below was checked: without {} there is no way to tell which \
+             paths should be encrypted, so neither the index nor the history was \
+             scanned. This says nothing about what is in this repository.",
             crate::repo::CONFIG_FILE
         ));
         return Ok(report);
@@ -1492,6 +1608,14 @@ fn diff_driver_note(repo: &Repo, config: &gix_config::File) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// One leak, spelled the way the history scan spells one.
+    fn a_leak() -> crate::history::Exposure {
+        crate::history::Exposure {
+            path: b"secrets/db.env".to_vec(),
+            sightings: Vec::new(),
+        }
+    }
+
     #[test]
     fn a_question_left_unanswered_is_its_own_verdict_and_never_masks_a_finding() {
         // The two codes are the whole point of the split: `6` says fix the
@@ -1521,6 +1645,99 @@ mod tests {
         assert!(
             !both.to_string().contains("NOTHING WAS FOUND"),
             "an exposure must not be softened by what could not be checked: {both}"
+        );
+    }
+
+    #[test]
+    fn configuration_outranks_both_other_answers_and_conceals_neither() {
+        // The precedence added 2026-08-05, in the four combinations that decide
+        // it. A setup gap wins over a finding and over a question alike, because
+        // a repository git is not filtering cannot be repaired by acting on what
+        // this report says about its data — the configuration is what makes the
+        // rest mean anything.
+        let gap = || {
+            vec![SetupGap::MissingKey(
+                "filter.git-xcrypt.process".to_string(),
+            )]
+        };
+
+        let misconfigured = Report {
+            setup: gap(),
+            ..Report::default()
+        };
+        assert_eq!(misconfigured.verdict(), Verdict::Misconfigured);
+
+        let over_a_question = Report {
+            setup: gap(),
+            undetermined: vec!["a shallow clone".into()],
+            ..Report::default()
+        };
+        assert_eq!(over_a_question.verdict(), Verdict::Misconfigured);
+
+        // The one that matters most. A leak reported under code `2` is the same
+        // leak it would be under `5`, so the verdict may reorder the work and
+        // must not take a section off the page — an operator who fixes the setup
+        // and never learns there was a leak has been failed by the gate that
+        // told them the truth about their configuration.
+        let over_a_finding = Report {
+            setup: gap(),
+            leaked: vec![a_leak()],
+            in_the_clear: vec![b"secrets/late.env".to_vec()],
+            ..Report::default()
+        };
+        assert_eq!(over_a_finding.verdict(), Verdict::Misconfigured);
+        let text = over_a_finding.to_string();
+        for expected in [
+            "leaked in history",
+            "secrets/db.env",
+            "ROTATE THE SECRET",
+            "in the clear:",
+            "secrets/late.env",
+            // And the verdict line itself has to point at them, or the first
+            // line of the report contradicts the rest of it.
+            "Also found",
+        ] {
+            assert!(
+                text.contains(expected),
+                "the configuration verdict swallowed `{expected}`:\n{text}"
+            );
+        }
+        assert!(
+            over_a_finding.exposed(),
+            "a leak under a configuration verdict is still a leak:\n{text}"
+        );
+
+        // And with the configuration settled, the very same findings answer `5`.
+        let settled = Report {
+            leaked: vec![a_leak()],
+            in_the_clear: vec![b"secrets/late.env".to_vec()],
+            ..Report::default()
+        };
+        assert_eq!(settled.verdict(), Verdict::Exposed);
+    }
+
+    #[test]
+    fn a_missing_declaration_is_a_configuration_gap_that_still_admits_it_checked_nothing() {
+        // It is not an exposure — the check-in path refuses on this state, so
+        // nothing was ever stored in the clear over it — and it is not merely an
+        // unanswered question either: a repository that declares nothing
+        // enforces nothing. Both halves have to reach the reader, and the second
+        // is the one silence would cost most.
+        let report = Report {
+            setup: vec![SetupGap::DeclarationMissing],
+            undetermined: vec!["nothing below was checked".into()],
+            ..Report::default()
+        };
+        assert_eq!(report.verdict(), Verdict::Misconfigured);
+        let text = report.to_string();
+        assert!(
+            text.contains("history was NOT scanned"),
+            "a run that stopped before the scan must say so: {text}"
+        );
+        assert!(
+            !text.contains("stores it in the clear"),
+            "nothing is stored in the clear over a refused `git add`, and saying \
+             otherwise sends a user to rotate a secret that was never exposed: {text}"
         );
     }
 }

@@ -205,10 +205,14 @@ fn a_declared_path_git_stopped_filtering_is_still_reviewed_as_plaintext() {
     let output = repo.xcrypt(["status"]);
     let report = String::from_utf8_lossy(&output.stdout).into_owned();
 
+    // Code `2` since 2026-08-05: a declared path git does not filter is a
+    // configuration gap, and configuration outranks everything else this
+    // command answers — without it nothing else here is worth acting on.
     assert_eq!(
         output.status.code(),
-        Some(5),
-        "a repository git does not filter must fail the gate:\n{report}"
+        Some(2),
+        "a repository git does not filter must fail the gate as a configuration \
+         problem:\n{report}"
     );
     assert!(
         report.contains("setup: git is NOT filtering"),

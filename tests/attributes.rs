@@ -24,9 +24,6 @@ mod harness;
 use harness::{MAGIC, OVERHEAD, TestRepo};
 use tempfile::TempDir;
 
-/// The exit code the frozen table gives to "an exposure was found".
-const EXPOSED: i32 = 5;
-
 /// Text content with CRLF throughout, so normalisation is observable.
 const CRLF: &[u8] = b"line one\r\nline two\r\n";
 
@@ -403,10 +400,15 @@ fn a_foreign_text_line_below_the_managed_section_is_caught_before_the_file_is_lo
     let output = repo.xcrypt(["status"]);
     let text = String::from_utf8_lossy(&output.stdout).into_owned();
 
+    // Code `2`, not `5`: since 2026-08-05 a setup gap is a configuration
+    // finding, and the remedy here is an attribute line, not a rotated secret.
+    // Nothing was stored in the clear over this — what it costs is the
+    // ciphertext — so the exit code and the wording have to agree on that.
     assert_eq!(
         output.status.code(),
-        Some(EXPOSED),
-        "a repository whose ciphertext git converts must fail the gate:\n{text}"
+        Some(CONFIG_ERROR),
+        "a repository whose ciphertext git converts must fail the gate as a \
+         configuration problem:\n{text}"
     );
     assert!(
         text.contains("secrets/store.p12"),
