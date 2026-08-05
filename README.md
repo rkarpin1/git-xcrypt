@@ -109,7 +109,7 @@ Those are speed bumps in front of the cliff. They are not a backup.
 | --- | --- |
 | `init` | Generate the repository key, register the filter and the diff driver, create `.git-xcrypt`, write the managed `.gitattributes` section. |
 | `sync` | Regenerate the per-pattern `.gitattributes` lines. `--check` reports staleness through exit code 1 instead of writing. |
-| `status` | Report whether your declarations are actually enforced, scanning the whole reachable history. `--fix` re-stages declared files the index holds in the clear. Exits `5` on a finding, `6` when it could not tell. |
+| `status` | Report whether your declarations are actually enforced, scanning the whole reachable history. `--fix` re-stages declared files the index holds in the clear. Exits `2` when the setup does not enforce anything, `5` on a finding, `6` when it could not tell. |
 | `export-key` | Write the repository key to a file outside the working tree. This is also how you make the backup nothing else makes — see above. |
 | `import-key` | Put a key carried from another machine into this repository. |
 | `unlock` | Decrypt the working tree and register the filter, importing a key file first if one is given. |
@@ -117,7 +117,8 @@ Those are speed bumps in front of the cliff. They are not a backup.
 | `diff`, `process` | Registered by `init` for git to call. Not meant to be run by hand. |
 
 Exit codes: `0` success, `1` usage or unclassified failure, `2` configuration or
-state conflict, `3` no key, `4` bad format, `5` `status` found an exposure, `6`
+state conflict — including a `status` run that found the setup does not enforce
+anything, `3` no key, `4` bad format, `5` `status` found an exposure, `6`
 `status` could not tell.
 
 ### Using `status` as a CI gate
@@ -134,9 +135,23 @@ What the exit code means to the job:
 | Code | Meaning | What to do |
 | --- | --- | --- |
 | `0` | Everything was checked and nothing was found. | Nothing. |
-| `5` | Something was found: a setup gap, a declared file staged in the clear, a plaintext version in history, a declared path git does not resolve `filter=git-xcrypt` for, or one whose ciphertext git converts because some attribute line outranks the managed `-text`. | Read the report. If a secret leaked, **rotate it first**. |
-| `6` | The run could not answer. A shallow or partial clone, an index that will not parse, a reference store that will not enumerate, a missing `.git-xcrypt`. | Fix the checkout and run it again. Nothing was found, and nothing is ruled out. |
+| `2` | **Fix the configuration.** Git is not set up to enforce your declarations here: the filter is not registered, `required` is not true, the catch-all line is gone, `.git-xcrypt` is missing, a declared path resolves to some other `filter`, or an attribute line outranks the managed `-text` and lets git convert the ciphertext. | Fix the setup, then run it again. Read the rest of the report too — a `2` does **not** mean nothing else was found. |
+| `5` | Something was found in the data: a declared file staged in the clear, or a plaintext version in reachable history. | Read the report. If a secret leaked, **rotate it first**. |
+| `6` | The run could not answer. A shallow or partial clone, an index that will not parse, a reference store that will not enumerate. | Fix the checkout and run it again. Nothing was found, and nothing is ruled out. |
 | `1`–`4` | The tool itself failed — bad arguments, not a repository, no key, bad format. | Fix the invocation or the environment. |
+
+**Treat `2`, `5` and `6` alike as a failed gate.** They ask for three different
+repairs — fix the setup, rotate a secret, fix the checkout — and only `0` means
+the question was answered and the answer was clean.
+
+**Configuration comes before data, so `2` outranks both other answers.** A
+repository whose setup enforces nothing cannot be called clean whatever its
+blobs look like, and telling a checkout that never ran `init` that "an exposure
+was found" sent people hunting a secret that had never been exposed. The code
+never hides anything: a repository that is both misconfigured *and* leaking
+exits `2` while printing the leak, the paths and the rotate-first procedure
+exactly as it would under `5`, and says so on the verdict line. Fix the setup,
+ask again, and the leak comes back as `5`.
 
 **`fetch-depth: 0` is not optional for a full answer.** `actions/checkout` clones
 with `--depth 1` by default, and history that was never fetched cannot be
@@ -144,7 +159,8 @@ scanned — so the default setup exits `6`, honestly, rather than passing on a
 history it never saw. The same applies to `--filter=blob:none` partial clones.
 
 A finding always outranks an unanswered question: a run that both hit an
-unreadable index and found a leak exits `5`.
+unreadable index and found a leak exits `5`. A setup gap outranks both, so the
+full order is `2`, then `5`, then `6`, then `0`.
 
 ## What it does and does not protect
 
@@ -165,8 +181,10 @@ the clear on disk.
 A secret committed **before** its pattern reached `.git-xcrypt` stays in history
 in the clear, forever, and pushing sends it to the host. `git-xcrypt status`
 scans the whole reachable history for exactly this and exits `5` when it finds
-something — and `6` when it could not look at all, which is not the same answer.
-If it exits `5`: **rotate the secret first.** Rewriting history cleans the
+something — `6` when it could not look at all, and `2` when the setup is broken
+enough that fixing it comes first; none of those are the same answer, and the
+report names the leak under every one of them. If a leak is reported: **rotate
+the secret first.** Rewriting history cleans the
 repository but does not undo the leak — the secret is already in forks, caches,
 CI logs and every clone that exists.
 
@@ -192,8 +210,8 @@ differently:
   why `sync` belongs in your workflow rather than being cosmetic.
 
 `git-xcrypt status` resolves both attributes for every declared path the index
-holds, using git's own precedence rules, macros included, and fails with exit `5`
-either way — the report names the winning line and the file and line number it
+holds, using git's own precedence rules, macros included, and fails with exit `2`
+either way — both are setup gaps, and the remedy is the attribute line — the report names the winning line and the file and line number it
 sits in. It resolves rather than guesses, so none of these trigger it: an
 ordinary `*.psd filter=lfs`, `text=auto`, `binary`, `-text` with any `eol=`, or
 `core.autocrlf` at any value. Our magic starts with a NUL byte, so every code
@@ -221,9 +239,10 @@ note, not a finding.
 - **A clone that has not been unlocked is not safe to write to.** `.git/config`
   is not versioned, so a fresh clone carries the catch-all `.gitattributes` line
   with no driver behind it, and git treats an undefined filter as no filter.
-  `git-xcrypt status` detects this and exits `5`. A shallow clone of the same
-  repository exits `6` instead once it is unlocked: nothing is wrong with it,
-  but the history it never fetched cannot be vouched for.
+  `git-xcrypt status` detects this and exits `2`: fix the setup with
+  `git-xcrypt unlock <key-file>`, then ask again. A shallow clone of the same
+  repository exits `6` once it is unlocked: nothing is wrong with it, but the
+  history it never fetched cannot be vouched for.
 - **Real git only.** The filter is registered under the long-running protocol
   (`filter.<driver>.process`). Clients that reimplement git rather than calling
   it — JGit, and tools built on libgit2 — may not speak it and may treat the
