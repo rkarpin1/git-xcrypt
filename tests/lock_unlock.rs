@@ -418,6 +418,60 @@ fn lock_refuses_over_every_checkout_and_every_file_it_cannot_account_for() {
     );
 }
 
+/// The sweep deletes exactly the residue it can prove is ours, and nothing else.
+///
+/// Two files share the temporary-name shape; only one may go. The untracked one
+/// beside a declared target is residue of an interrupted run and may hold that
+/// file's decrypted secret, so it is deleted and the deletion announced. The
+/// *tracked* one belongs to the user, however unlikely its name — deleting it
+/// would destroy their file and leave `git status` reporting a deletion nobody
+/// asked for (measured, per `sweepable`'s own record). The 2026-08-05 test
+/// reduction left this rule with no integration guard at all: mutating the
+/// tracked-file check away turned no suite red.
+#[test]
+fn the_sweep_takes_residue_and_leaves_the_users_tracked_file_alone() {
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.xcrypt_ok(["sync"]);
+    repo.write_file("secrets/db.env", DOTENV);
+    // Tracked, and temp-shaped only by its unlucky name.
+    repo.write_file("secrets/build.git-xcrypt-deadbeefcafef00d.tmp", PASSWORD);
+    repo.commit_all("a secret, and a user file with an unlucky name");
+
+    // Residue: untracked, beside a declared target, holding a decrypted copy.
+    repo.write_file(
+        "secrets/db.env.git-xcrypt-0123456789abcdef.tmp",
+        b"leftover plaintext of an interrupted run\n",
+    );
+
+    let output = repo.xcrypt_ok(["lock", "--yes"]);
+    let said = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    assert!(
+        !repo
+            .path()
+            .join("secrets/db.env.git-xcrypt-0123456789abcdef.tmp")
+            .exists(),
+        "the residue of an interrupted run was left holding a decrypted secret"
+    );
+    assert!(
+        said.contains("removed secrets/db.env.git-xcrypt-0123456789abcdef.tmp"),
+        "deleting an untracked file must be announced, not silent:\n{said}"
+    );
+    assert!(
+        repo.worktree_bytes("secrets/build.git-xcrypt-deadbeefcafef00d.tmp")
+            .starts_with(MAGIC),
+        "the user's tracked file must survive the sweep, encrypted like any \
+         other declared file"
+    );
+    assert!(
+        said.contains("tracked, so it was left alone"),
+        "leaving the tracked look-alike alone must be said out loud:\n{said}"
+    );
+    repo.assert_status_clean();
+}
+
 /// Reads `stream` until `marker` shows up, and returns everything read.
 ///
 /// The prompt carries no newline, so a line-oriented read would block on it
