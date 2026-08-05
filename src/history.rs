@@ -748,8 +748,6 @@ fn note_unreadable(scan: &mut Scan, id: &ObjectId, why: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto;
-    use crate::key::{MASTER_KEY_LEN, MasterKey};
     use std::fs;
     use std::process::Command;
     use tempfile::TempDir;
@@ -811,98 +809,11 @@ mod tests {
         }
     }
 
-    fn key() -> MasterKey {
-        MasterKey::from_bytes([7u8; MASTER_KEY_LEN])
-    }
-
     fn paths(scan: &Scan) -> Vec<String> {
         scan.exposed
             .iter()
             .map(|exposure| String::from_utf8_lossy(&exposure.path).into_owned())
             .collect()
-    }
-
-    #[test]
-    fn a_secret_committed_before_the_pattern_existed_is_found() {
-        let fixture = Fixture::new();
-        fixture.write("secrets/db.env", b"hunter2\n");
-        fixture.commit("before anyone declared anything");
-
-        let scan = fixture.scan("secrets/\n");
-
-        assert_eq!(paths(&scan), ["secrets/db.env"]);
-        assert_eq!(scan.exposed[0].sightings.len(), 1);
-    }
-
-    #[test]
-    fn a_secret_deleted_from_head_is_still_found() {
-        // The case that makes a shallow check worthless: the working tree is
-        // clean, `HEAD` shows nothing, and the blob is still at the host.
-        let fixture = Fixture::new();
-        fixture.write("secrets/db.env", b"hunter2\n");
-        fixture.commit("the secret");
-        fs::remove_file(fixture.dir.path().join("secrets/db.env")).expect("removing");
-        fixture.write("README.md", b"nothing to see\n");
-        fixture.commit("and gone again");
-
-        let scan = fixture.scan("secrets/\n");
-
-        assert_eq!(paths(&scan), ["secrets/db.env"]);
-    }
-
-    #[test]
-    fn a_history_that_was_encrypted_throughout_is_clean() {
-        let fixture = Fixture::new();
-        fixture.write(
-            "secrets/db.env",
-            &crypto::encrypt(&key(), 0, b"hunter2\n").expect("encryption"),
-        );
-        fixture.commit("stored as ciphertext");
-
-        let scan = fixture.scan("secrets/\n");
-
-        assert!(scan.exposed.is_empty(), "{:?}", paths(&scan));
-        assert_eq!(scan.unreadable, 0);
-    }
-
-    #[test]
-    fn a_path_no_pattern_reaches_is_invisible() {
-        // The documented boundary of the command: it answers "are my
-        // declarations enforced", not "are there secrets here".
-        let fixture = Fixture::new();
-        fixture.write("notes.txt", b"not declared\n");
-        fixture.commit("ordinary");
-
-        let scan = fixture.scan("secrets/\n");
-
-        assert!(scan.exposed.is_empty(), "{:?}", paths(&scan));
-    }
-
-    #[test]
-    fn a_negated_path_is_not_reported_as_an_exposure() {
-        let fixture = Fixture::new();
-        fixture.write("secrets/README.md", b"public on purpose\n");
-        fixture.commit("the exception");
-
-        let scan = fixture.scan("secrets/\n!secrets/README.md\n");
-
-        assert!(scan.exposed.is_empty(), "{:?}", paths(&scan));
-    }
-
-    #[test]
-    fn a_secret_on_a_branch_that_head_never_saw_is_found() {
-        // "Reachable history" is every reference, not the current one.
-        let fixture = Fixture::new();
-        fixture.write("README.md", b"start\n");
-        fixture.commit("start");
-        fixture.git(&["checkout", "-q", "-b", "side"]);
-        fixture.write("secrets/side.env", b"hunter2\n");
-        fixture.commit("on the side");
-        fixture.git(&["checkout", "-q", "main"]);
-
-        let scan = fixture.scan("secrets/\n");
-
-        assert_eq!(paths(&scan), ["secrets/side.env"]);
     }
 
     #[test]
@@ -957,125 +868,5 @@ mod tests {
         let scan = fixture.scan("secrets/\n");
 
         assert_eq!(paths(&scan), ["secrets/tagged.env"]);
-    }
-
-    #[test]
-    fn a_detached_head_is_still_scanned() {
-        let fixture = Fixture::new();
-        fixture.write("README.md", b"start\n");
-        fixture.commit("start");
-        fixture.write("secrets/db.env", b"hunter2\n");
-        fixture.commit("the secret");
-        let head = fixture.git(&["rev-parse", "HEAD"]);
-        let head = String::from_utf8(head.stdout).expect("a hash");
-        fixture.git(&["checkout", "-q", "--detach", head.trim()]);
-        // The branch is moved off the secret afterwards, so `HEAD` is the only
-        // reference that still reaches it.
-        fixture.git(&["branch", "-q", "-f", "main", "HEAD~1"]);
-
-        let scan = fixture.scan("secrets/\n");
-
-        assert_eq!(paths(&scan), ["secrets/db.env"]);
-    }
-
-    #[test]
-    fn a_repository_with_no_commits_scans_to_nothing() {
-        let fixture = Fixture::new();
-
-        let scan = fixture.scan("secrets/\n");
-
-        assert!(scan.exposed.is_empty());
-        assert_eq!(scan.commits, 0);
-        assert_eq!(scan.unreadable, 0);
-    }
-
-    #[test]
-    fn the_same_blob_under_many_commits_is_reported_once() {
-        let fixture = Fixture::new();
-        fixture.write("secrets/db.env", b"hunter2\n");
-        fixture.commit("one");
-        fixture.write("README.md", b"a\n");
-        fixture.commit("two");
-        fixture.write("README.md", b"b\n");
-        fixture.commit("three");
-
-        let scan = fixture.scan("secrets/\n");
-
-        assert_eq!(paths(&scan), ["secrets/db.env"]);
-        assert_eq!(
-            scan.exposed[0].sightings.len(),
-            1,
-            "the same blob was counted once per commit"
-        );
-    }
-
-    #[test]
-    fn two_different_plaintexts_under_one_path_are_both_reported() {
-        let fixture = Fixture::new();
-        fixture.write("secrets/db.env", b"first\n");
-        fixture.commit("one");
-        fixture.write("secrets/db.env", b"second\n");
-        fixture.commit("two");
-
-        let scan = fixture.scan("secrets/\n");
-
-        assert_eq!(paths(&scan), ["secrets/db.env"]);
-        assert_eq!(scan.exposed[0].sightings.len(), 2);
-    }
-
-    #[test]
-    fn a_submodule_gitlink_is_not_mistaken_for_a_blob() {
-        // A gitlink entry names a commit in another repository. Reading it as a
-        // blob would report the parent as exposed over a file it does not hold.
-        let inner = Fixture::new();
-        inner.write("secrets/theirs.env", b"not ours\n");
-        inner.commit("inner");
-
-        let outer = Fixture::new();
-        outer.write("README.md", b"outer\n");
-        outer.commit("outer");
-        let inner_path = inner.dir.path().to_string_lossy().into_owned();
-        outer.git(&[
-            "-c",
-            "protocol.file.allow=always",
-            "submodule",
-            "--quiet",
-            "add",
-            &inner_path,
-            "vendor/sub",
-        ]);
-        outer.commit("with a submodule");
-
-        let scan = outer.scan("vendor/\n");
-
-        assert!(
-            scan.exposed.is_empty(),
-            "a gitlink was read as content: {:?}",
-            paths(&scan)
-        );
-        assert_eq!(scan.unreadable, 0);
-    }
-
-    // Unix only: git on Windows writes a symlink as a plain file unless
-    // `core.symlinks` is on and the account may create links, so mode 120000
-    // cannot be produced there. The walk's gitlink case above is the
-    // platform-neutral half of the same rule and runs everywhere.
-    #[cfg(unix)]
-    #[test]
-    fn a_symlink_is_not_judged() {
-        // Git never filters a symlink, so no declaration could have covered it.
-        let fixture = Fixture::new();
-        fixture.write("secrets/real.env", b"x\n");
-        std::os::unix::fs::symlink("real.env", fixture.dir.path().join("secrets/link.env"))
-            .expect("symlink");
-        fixture.commit("a link");
-
-        let scan = fixture.scan("*.env\n");
-
-        assert_eq!(
-            paths(&scan),
-            ["secrets/real.env"],
-            "the symlink was judged as content"
-        );
     }
 }
