@@ -1513,7 +1513,7 @@ mod tests {
         };
         let converts = action(&text)
             .or_else(|| action(&crlf))
-            .unwrap_or_else(|| matches!(eol.as_str(), "lf" | "crlf"));
+            .unwrap_or(matches!(eol.as_str(), "lf" | "crlf"));
         assert_eq!(
             matches!(ours.conversion, EolConversion::On(_)),
             converts,
