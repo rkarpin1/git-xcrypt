@@ -43,7 +43,7 @@
 use std::fmt;
 
 use crate::config::Config;
-use crate::repo::{DRIVER, Repo};
+use crate::repo::{DRIVER, Repo, git_spelling};
 use gix_object::Write as _;
 
 use crate::{Result, gitattributes, gitconfig, gitindex, history};
@@ -1130,12 +1130,7 @@ fn foreign_source_note(
         if lines.is_empty() {
             continue;
         }
-        let shown = repo
-            .relative(source)
-            .unwrap_or(source)
-            .display()
-            .to_string()
-            .replace('\\', "/");
+        let shown = git_spelling(repo.relative(source).unwrap_or(source));
         let verdict = if reached_a_declared_path {
             "and git takes the LAST match. Some of them reach a declared path — \
              see the setup gap above, which is the finding."

@@ -44,7 +44,7 @@ use zeroize::Zeroizing;
 use crate::config::Config;
 use crate::format::KEY_ID_LEN;
 use crate::key::MasterKey;
-use crate::repo::Repo;
+use crate::repo::{Repo, git_spelling};
 use crate::{Error, Result, atomic, decide, gitconfig, gitindex};
 
 /// What `lock` did.
@@ -155,7 +155,7 @@ impl fmt::Display for Warning {
                  They are untracked, so deleting them cannot be undone:"
             )?;
             for path in &self.sweeping {
-                writeln!(f, "  {}", path.display())?;
+                writeln!(f, "  {}", git_spelling(path))?;
             }
         }
         Ok(())
@@ -698,7 +698,7 @@ fn collect(repo: &Repo, config: &Config, walk: &mut Walk) -> Result<Found> {
                 if path.join(".git").exists() {
                     walk.warnings.push(format!(
                         "{}: a repository of its own, left to its own `git-xcrypt lock`",
-                        relative_to(repo, &path).display()
+                        git_spelling(&relative_to(repo, &path))
                     ));
                 } else {
                     pending.push(path);
@@ -730,7 +730,7 @@ fn collect(repo: &Repo, config: &Config, walk: &mut Walk) -> Result<Found> {
                     walk.warnings.push(format!(
                         "{}: shaped like a temporary file of ours, but nothing \
                          declares its target, so it was left alone",
-                        relative.display()
+                        git_spelling(&relative)
                     ));
                 }
             }
@@ -904,7 +904,7 @@ fn blob_id(hash: gix_hash::Kind, content: &[u8], relative: &Path) -> Result<Vec<
         Error::Config(format!(
             "{}: its object id could not be computed, so lock cannot tell whether it \
              is stored. Nothing has been changed.",
-            relative.display()
+            git_spelling(relative)
         ))
     })
 }
@@ -950,7 +950,7 @@ fn refusal(unstored: &[(&Path, Unstored)]) -> Error {
         }
         message.push_str(&format!("\n  {explanation}:\n"));
         for path in paths {
-            message.push_str(&format!("    {}\n", path.display()));
+            message.push_str(&format!("    {}\n", git_spelling(path)));
         }
     }
 
@@ -1000,7 +1000,7 @@ fn encrypt_in_place(
             return Err(Error::Config(format!(
                 "{}: it changed while lock was running, so what is in it now is not \
                  what lock proved this repository stores. The key has been kept.",
-                file.relative.display()
+                git_spelling(&file.relative)
             )));
         }
 
@@ -1042,7 +1042,7 @@ fn sweepable<'a>(
             walk.warnings.push(format!(
                 "{}: shaped like a temporary file of ours, but it is tracked, so it \
                  was left alone",
-                file.relative.display()
+                git_spelling(&file.relative)
             ));
             continue;
         }
@@ -1093,7 +1093,7 @@ fn sweep(residue: &[&Candidate], report: &mut Report) {
             Err(err) => report.warnings.push(format!(
                 "{}: a temporary file left by an interrupted run could not be removed \
                  ({err}); it may hold a decrypted secret",
-                file.relative.display()
+                git_spelling(&file.relative)
             )),
         }
     }
@@ -1130,7 +1130,7 @@ fn interrupted(report: &Report, err: Error) -> Error {
 fn named_io(relative: &Path, action: &str, err: &std::io::Error) -> Error {
     Error::Io(std::io::Error::other(format!(
         "{}: could not {action} it ({err})",
-        relative.display()
+        git_spelling(relative)
     )))
 }
 
@@ -1164,7 +1164,7 @@ fn remove_key(repo: &Repo, report: &mut Report) -> Result<()> {
 /// names no file. `NoKey` is passed through untouched, because it is about the
 /// repository rather than about any one path.
 fn named(relative: &Path, err: Error) -> Error {
-    let at = relative.display();
+    let at = git_spelling(relative);
     match err {
         Error::Format(message) => Error::Format(format!("{at}: {message}")),
         Error::Crypto(message) => Error::Crypto(format!("{at}: {message}")),
@@ -1357,6 +1357,14 @@ mod tests {
         assert!(
             error.to_string().contains("secrets/db.env"),
             "the message must name the file: {error}"
+        );
+        // The remedy in that message is `git add`, and git spells this path with
+        // a forward slash on every platform — including Windows, where the walk
+        // builds it out of components and `Path` renders a backslash. A name the
+        // adjacent `git status` never prints is a name the user cannot match up.
+        assert!(
+            !error.to_string().contains('\\'),
+            "the message must spell paths the way git does: {error}"
         );
         assert!(repo.has_key(), "a refused lock removed the key anyway");
         assert_eq!(

@@ -45,7 +45,7 @@ use zeroize::Zeroizing;
 
 use crate::config::Config;
 use crate::format::{self, Header, KEY_ID_LEN, OVERHEAD};
-use crate::repo::Repo;
+use crate::repo::{Repo, git_spelling};
 use crate::{Error, Result, decide, gitconfig, keyfile};
 
 /// What `unlock` did.
@@ -196,7 +196,7 @@ pub fn run(repo: &Repo, key_source: Option<&Path>) -> Result<Report> {
         ) {
             Ok(outcome) => outcome,
             Err(err) => {
-                stopped = Some(Error::Format(format!("{}: {err}", relative.display())));
+                stopped = Some(Error::Format(format!("{}: {err}", git_spelling(&relative))));
                 break;
             }
         };
@@ -273,7 +273,7 @@ pub fn run(repo: &Repo, key_source: Option<&Path>) -> Result<Report> {
 fn named_io(relative: &Path, action: &str, err: &std::io::Error) -> Error {
     Error::Io(std::io::Error::other(format!(
         "{}: could not {action} it ({err})",
-        relative.display()
+        git_spelling(relative)
     )))
 }
 
@@ -379,7 +379,7 @@ fn collect_encrypted(repo: &Repo, walk: &mut Walk) -> Result<Vec<Encrypted>> {
                 if path.join(".git").exists() {
                     walk.warnings.push(format!(
                         "{}: a repository of its own, left to its own `git-xcrypt unlock`",
-                        relative_to(repo, &path).display()
+                        git_spelling(&relative_to(repo, &path))
                     ));
                 } else {
                     pending.push(path);
@@ -481,7 +481,7 @@ fn refuse_foreign_keys(
         return Err(Error::Format(format!(
             "{} was encrypted with key {}, but the key offered here is {}.\n\
              Nothing has been changed. Unlock this repository with the key whose id is {}.",
-            relative.display(),
+            git_spelling(&relative),
             crate::format_key_id(&file.header.key_id),
             crate::format_key_id(key_id),
             crate::format_key_id(&file.header.key_id)

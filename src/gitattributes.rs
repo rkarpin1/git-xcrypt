@@ -24,7 +24,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
-use crate::repo::{ATTRIBUTES_FILE, CONFIG_FILE, DRIVER, KEY_ENVELOPE_DIR};
+use crate::repo::{ATTRIBUTES_FILE, CONFIG_FILE, DRIVER, KEY_ENVELOPE_DIR, git_spelling};
 use crate::{Error, Result};
 
 /// Opens the section this tool owns.
@@ -589,7 +589,7 @@ impl std::fmt::Display for Culprit {
             Some(source) => write!(
                 f,
                 "{}:{}: {} {}",
-                source.display().to_string().replace('\\', "/"),
+                git_spelling(source),
                 self.line,
                 self.pattern,
                 self.assignment

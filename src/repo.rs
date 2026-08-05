@@ -268,6 +268,43 @@ pub fn lexically_normal(path: &Path) -> PathBuf {
     out
 }
 
+/// The separator this platform's [`Path`] renders, and the only character it is
+/// safe to rewrite into git's spelling.
+///
+/// On Unix a backslash is an ordinary character in a file name, so rewriting one
+/// there would name a *different* file — which is the same class of bug as
+/// decoding a path lossily.
+#[cfg(windows)]
+const NATIVE_SEPARATOR: char = '\\';
+#[cfg(not(windows))]
+const NATIVE_SEPARATOR: char = '/';
+
+/// Renders a path the way git spells one: forward slashes on every platform.
+///
+/// Git prints forward slashes on Windows too — `git status`, `git ls-files`,
+/// `git diff --name-only`, all of them — and so do the index, the pattern
+/// matcher and `.gitattributes` in this crate. A message that tells the user to
+/// `git add` a file has to spell it the way the `git status` next to it will, or
+/// the two do not look like the same file.
+///
+/// For a path *inside* the repository, and for an attribute source a reader is
+/// meant to paste back into git. An absolute filesystem path the user is to hand
+/// to their shell — a key file, a git directory, a destination for `export-key` —
+/// keeps its native separators and must not come through here.
+#[must_use]
+pub fn git_spelling(path: &Path) -> String {
+    with_separator(&path.display().to_string(), NATIVE_SEPARATOR)
+}
+
+/// The platform-independent core, so both spellings are testable from either
+/// platform. A no-op when the native separator already is git's.
+fn with_separator(rendered: &str, separator: char) -> String {
+    if separator == '/' {
+        return rendered.to_string();
+    }
+    rendered.replace(separator, "/")
+}
+
 /// Makes a path absolute without touching the filesystem when it already is.
 ///
 /// `canonicalize` would resolve symlinks, which changes what the user sees in
@@ -329,6 +366,45 @@ mod tests {
             Err(other) => panic!("expected NoKey, got {other:?}"),
             Ok(_) => panic!("a fresh repository must not hand out a key"),
         }
+    }
+
+    /// The Windows half of [`git_spelling`], exercised from any platform.
+    ///
+    /// The developing machine is not Windows, so the branch that matters most
+    /// would otherwise be covered by CI alone — and it was CI that found the
+    /// message this helper exists to fix.
+    #[test]
+    fn a_path_built_from_components_is_spelled_the_way_git_spells_it() {
+        let joined = Path::new("secrets").join("db.env");
+
+        // What Windows renders, put through the same core the Windows build uses.
+        assert_eq!(
+            with_separator("secrets\\db.env", '\\'),
+            "secrets/db.env",
+            "a message must not show a spelling `git status` never prints"
+        );
+        assert_eq!(with_separator("a\\b\\c.env", '\\'), "a/b/c.env");
+
+        // And on a platform whose separator already is git's, nothing moves.
+        assert_eq!(with_separator("secrets/db.env", '/'), "secrets/db.env");
+
+        // Whichever platform this runs on, the public entry point agrees.
+        assert_eq!(git_spelling(&joined), "secrets/db.env");
+    }
+
+    /// On Unix a backslash is a legal character in a file name, so rewriting it
+    /// would rename the file the message is about.
+    #[cfg(unix)]
+    #[test]
+    fn a_backslash_in_a_unix_file_name_survives_untouched() {
+        assert_eq!(
+            git_spelling(Path::new("secrets/od\\d.env")),
+            "secrets/od\\d.env"
+        );
+        assert_eq!(
+            with_separator("secrets/od\\d.env", '/'),
+            "secrets/od\\d.env"
+        );
     }
 
     #[test]

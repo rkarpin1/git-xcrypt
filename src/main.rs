@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 
 use git_xcrypt::commands::status::Verdict;
 use git_xcrypt::commands::sync::Outcome;
-use git_xcrypt::repo::Repo;
+use git_xcrypt::repo::{Repo, git_spelling};
 use git_xcrypt::{Result, commands, exit};
 
 /// Transparent encryption of selected files in a git repository.
@@ -301,7 +301,7 @@ fn run_unlock(key: Option<&std::path::Path>) -> Result<()> {
     }
 
     for path in &report.decrypted {
-        eprintln!("git-xcrypt: decrypted {}", path.display());
+        eprintln!("git-xcrypt: decrypted {}", git_spelling(path));
     }
 
     // The closing line has to distinguish "everything" from "everything I could
@@ -392,11 +392,11 @@ fn lock_and_describe(assume_yes: bool) -> Result<ExitCode> {
     for path in &report.swept {
         eprintln!(
             "git-xcrypt: removed {}, left behind by an interrupted run",
-            path.display()
+            git_spelling(path)
         );
     }
     for path in &report.encrypted {
-        eprintln!("git-xcrypt: encrypted {}", path.display());
+        eprintln!("git-xcrypt: encrypted {}", git_spelling(path));
     }
 
     // "0 encrypted" has two meanings and only one of them is a repository that
