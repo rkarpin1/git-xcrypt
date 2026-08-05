@@ -1464,8 +1464,31 @@ fn expand_lone_line_feeds(bytes: &[u8]) -> Vec<u8> {
 ///
 /// Returns the plaintext and the intact blob, so every test below can prove both
 /// that its fixture started healthy and that it stayed that way.
+///
+/// **The key is fixed, and that closes a real flake, not a nicety.** Two of the
+/// altered-ciphertext cases below mutate the *whole* blob — `0x0a` → `0x0b`,
+/// and the lone-`LF` expansion — header included. With a key generated freshly
+/// per run, the 8 random `key_id` bytes contain `0x0a` in about 3% of runs;
+/// the mutation then changes the key id and smudge answers "encrypted with
+/// another key" instead of "the file has been altered", which is a *correct*
+/// verdict over a different fixture than the test meant to build. Reproduced:
+/// twice during the 2026-08-05 review run, and once in this round's 20-run
+/// loop, always in this file, at no particular thread count. A fixed key makes
+/// every byte of the blob — IV included, SIV is deterministic — identical in
+/// every run, so the premise assertions in the cases below settle the shape
+/// once and for all runs. The seed's derived key id, `8f72bb7e5c3ab4dd`,
+/// carries no `0x0a` and no `0x0d`.
 fn repository_with_one_intact_secret() -> (TestRepo, Vec<u8>, Vec<u8>) {
     let repo = TestRepo::init();
+    let vault = TempDir::new().expect("could not create a temporary directory");
+    let key_file = vault.path().join("fixed.key");
+    fs::write(
+        &key_file,
+        "git-xcrypt-key-v1 8f72bb7e5c3ab4dd\n\
+         ERERERERERERERERERERERERERERERERERERERERERE=\n",
+    )
+    .expect("could not write the fixed key");
+    repo.xcrypt_ok(["import-key", &key_file.to_string_lossy()]);
     repo.init_xcrypt();
     repo.write_xcrypt_config("secrets/\n");
     repo.xcrypt_ok(["sync"]);
