@@ -269,6 +269,60 @@ fn check_is_a_gate_that_writes_nothing() {
 }
 
 #[test]
+fn a_checkout_under_core_autocrlf_does_not_make_the_gate_fire() {
+    // `core.autocrlf=true` is what Git for Windows installs by default, and
+    // nothing in the managed section declares `.gitattributes` itself, so git
+    // checks that file out with CRLF. Measured on git 2.55, on a repository
+    // whose section is byte-for-byte current: `git check-attr filter text diff`
+    // answers exactly as it does for the LF spelling — `filter: git-xcrypt`,
+    // `text: unset`, `diff: git-xcrypt` — so nothing about the guarantee has
+    // changed. `sync --check` nevertheless exited 1 and `status` printed a note
+    // claiming the `-text` lines were missing and the ciphertext was at risk.
+    //
+    // Both were false, and a gate that fails on the platform default
+    // configuration is a gate that gets switched off — the same argument that
+    // gave `status` its own exit code `6`.
+    let repo = synced("secrets/\n*.env\n");
+    repo.write_file("secrets/db.env", b"hunter2\n");
+    repo.commit_all("a secret and a settled section");
+
+    // Exactly what a clone on Windows produces: git rewrites the file on its
+    // way to the working tree.
+    repo.git_ok(["config", "core.autocrlf", "true"]);
+    std::fs::remove_file(repo.path().join(".gitattributes")).expect("could not remove");
+    repo.git_ok(["checkout", "--", ".gitattributes"]);
+
+    let checked_out = repo.worktree_bytes(".gitattributes");
+    assert!(
+        checked_out.windows(2).any(|pair| pair == b"\r\n"),
+        "git did not rewrite the line endings, so this test proves nothing"
+    );
+
+    assert_eq!(
+        repo.xcrypt(["sync", "--check"]).status.code(),
+        Some(0),
+        "the gate fired on a section that is current in every way git can see"
+    );
+    assert_eq!(
+        checked_out,
+        repo.worktree_bytes(".gitattributes"),
+        "--check must never touch the working tree"
+    );
+
+    // And the write mode agrees with the gate: nothing to do, so nothing is
+    // written and the working tree stays clean. Rewriting the section with LF
+    // here left `git status` dirty with no way to settle it — the next checkout
+    // put the CRLF straight back.
+    repo.xcrypt_ok(["sync"]);
+    assert_eq!(
+        checked_out,
+        repo.worktree_bytes(".gitattributes"),
+        "sync rewrote a section that was already current"
+    );
+    repo.assert_status_clean();
+}
+
+#[test]
 fn init_lands_the_same_section_sync_would() {
     let declarations = "secrets/\n*.env\nsecrets/key.p12 binary\n!secrets/README.md\n";
 

@@ -254,21 +254,70 @@ fn spell(pattern: &str) -> String {
     quoted
 }
 
-/// Renders the body of the managed section.
+/// Renders the body of the managed section, LF-terminated.
 #[must_use]
 pub fn render_section(extra_lines: &[String]) -> String {
+    render_section_with(extra_lines, "\n")
+}
+
+/// Renders the body of the managed section with a chosen line terminator.
+///
+/// `ending` is `"\n"` everywhere a file is being created from nothing, and
+/// `"\r\n"` when the file being edited already spells its lines that way — see
+/// [`line_ending_of`] for why that is not cosmetic.
+#[must_use]
+pub fn render_section_with(extra_lines: &[String], ending: &str) -> String {
     let mut out = String::new();
     out.push_str(BEGIN);
-    out.push('\n');
+    out.push_str(ending);
     out.push_str(CATCH_ALL);
-    out.push('\n');
+    out.push_str(ending);
     for line in extra_lines {
         out.push_str(line);
-        out.push('\n');
+        out.push_str(ending);
     }
     out.push_str(END);
-    out.push('\n');
+    out.push_str(ending);
     out
+}
+
+/// The line terminator a rewrite of this file should reproduce.
+///
+/// **Not always LF, and that is a correctness matter rather than tidiness.**
+/// Nothing in the managed section declares `.gitattributes` itself, so under
+/// `core.autocrlf=true` — what Git for Windows installs by default — git checks
+/// that file out with CRLF. Rendering the replacement with LF then made the
+/// comparison in [`desired`] fail on a section that was current in every way git
+/// can see, and the consequences were all in the wrong direction:
+///
+/// * `sync --check`, which exists to be a CI gate, exited `1` on a healthy
+///   repository — and a gate that fires on the platform's default configuration
+///   is a gate that gets switched off, the same argument that won `status` its
+///   own exit code `6`;
+/// * `status` printed a note saying the per-pattern lines were out of date and
+///   the ciphertext was at risk of silent corruption, which was false;
+/// * running `sync` to settle it wrote an LF section into a CRLF file, leaving
+///   `git status` dirty with no way out: the next checkout put the CRLF back.
+///
+/// Measured on git 2.55: for a CRLF-spelled section `git check-attr filter text
+/// diff` answers `git-xcrypt`, `unset`, `git-xcrypt` — identical to the LF
+/// spelling. Git strips the `CR` itself, so both spellings enforce the same
+/// thing and the file's own convention is the one worth keeping.
+///
+/// The section's opening marker decides, because the section is the only part of
+/// the file a rewrite touches. With no section yet the file's first line decides,
+/// and an empty file gets LF.
+fn line_ending_of(contents: &str) -> &'static str {
+    let sample = marker_line(contents, BEGIN)
+        .map(|(begin, after)| &contents[begin..after])
+        .or_else(|| contents.split_inclusive('\n').next())
+        .unwrap_or_default();
+
+    if sample.ends_with("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    }
 }
 
 /// Whether `contents` shows any sign of a managed section.
@@ -396,7 +445,11 @@ pub fn read(path: &Path) -> Result<String> {
 /// [`Error::Io`] on a read failure, [`Error::Config`] on unbalanced markers.
 pub fn desired(path: &Path, extra_lines: &[String]) -> Result<(String, String)> {
     let existing = read(path)?;
-    let updated = upsert(&existing, &render_section(extra_lines))?;
+    // The file's own spelling, not ours: see [`line_ending_of`]. A file that
+    // already uses LF — every repository on Unix, and every one this tool
+    // created — renders exactly as it always did.
+    let section = render_section_with(extra_lines, line_ending_of(&existing));
+    let updated = upsert(&existing, &section)?;
     Ok((existing, updated))
 }
 
@@ -903,6 +956,51 @@ mod tests {
         let first = upsert("# mine\n", &render_section(&[])).expect("valid input");
         let second = upsert(&first, &render_section(&[])).expect("valid input");
         assert_eq!(first, second, "a second pass must not change the file");
+    }
+
+    #[test]
+    fn a_crlf_file_is_rewritten_in_its_own_spelling_and_still_gates_on_content() {
+        // Under `core.autocrlf=true` — the Git for Windows default — git checks
+        // `.gitattributes` out with CRLF, because nothing in the managed section
+        // declares that file. Rendering LF into it made every healthy Windows
+        // checkout report a stale section for ever.
+        //
+        // The other direction is what stops this being a way to switch the gate
+        // off: a CRLF section whose *content* is out of date has to stay out of
+        // date. Only the terminator follows the file.
+        let lines = vec!["*.env -text diff=git-xcrypt".to_string()];
+        let current = upsert("# mine\r\n", &render_section_with(&lines, "\r\n")).expect("valid");
+
+        assert!(current.contains("# >>> git-xcrypt >>>\r\n"), "{current:?}");
+        assert_eq!(line_ending_of(&current), "\r\n");
+        assert_eq!(
+            upsert(
+                &current,
+                &render_section_with(&lines, line_ending_of(&current))
+            )
+            .expect("valid"),
+            current,
+            "a settled CRLF section must compare equal to itself"
+        );
+
+        let stale = vec!["*.pem -text diff=git-xcrypt".to_string()];
+        assert_ne!(
+            upsert(
+                &current,
+                &render_section_with(&stale, line_ending_of(&current))
+            )
+            .expect("valid"),
+            current,
+            "following the file's spelling must not make a stale section look current"
+        );
+
+        // And nothing moves for a file that already uses LF, which is every
+        // repository this tool created and every one on Unix.
+        let lf = upsert("# mine\n", &render_section(&lines)).expect("valid");
+        assert_eq!(line_ending_of(&lf), "\n");
+        assert_eq!(line_ending_of(""), "\n");
+        assert_eq!(line_ending_of("*.png binary"), "\n");
+        assert_eq!(line_ending_of("*.png binary\r\n"), "\r\n");
     }
 
     #[test]
