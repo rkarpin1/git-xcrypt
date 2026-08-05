@@ -1001,6 +1001,15 @@ pub fn run(repo: &Repo, fix: bool) -> Result<Report> {
         // honours, and a `text` line in one of them converts the ciphertext.
         gitconfig::global_attributes_file(&config).as_deref(),
         ignore_case,
+        // The index copies git falls back to for a deleted `.gitattributes`:
+        // check-in reads them, so the verdict has to as well.
+        gitattributes::staged_fallbacks(
+            repo.work_tree(),
+            &repo.git_dir().join("index"),
+            repo.common_dir(),
+            hash,
+            ignore_case,
+        ),
     );
 
     inspect_index(

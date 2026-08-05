@@ -198,11 +198,23 @@ impl Context {
     fn attribute_stack(&mut self) -> Option<&mut gitattributes::AttributeResolver> {
         if self.attributes.is_none() {
             let location = self.location.as_ref()?;
+            // The index copies git falls back to for a deleted `.gitattributes`
+            // — without them the refusal went blind the moment the user deleted
+            // the file the refusal itself told them to edit, and git converted
+            // the ciphertext with exit 0. Measured; see `staged_fallbacks`.
+            let staged = gitattributes::staged_fallbacks(
+                &location.work_tree,
+                &location.git_dir.join("index"),
+                &location.common_dir,
+                location.hash,
+                location.ignore_case,
+            );
             let resolver = gitattributes::AttributeResolver::new(
                 &location.work_tree,
                 &location.common_dir,
                 location.attributes_file.as_deref(),
                 location.ignore_case,
+                staged,
             );
             self.attributes = Some(resolver);
         }

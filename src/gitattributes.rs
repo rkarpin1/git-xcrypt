@@ -835,6 +835,106 @@ fn collect_attribute_files(root: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// A `.gitattributes` whose working-tree file is gone but whose staged copy
+/// git still reads on the check-in path.
+///
+/// Git's `read_attr` tries the working-tree file first and, when it is not
+/// there, reads the **index** copy — measured on git 2.55: with a
+/// `secrets/** text` line staged in `.gitattributes` and the file deleted from
+/// the working tree, `git add` still converted the filter's output (7003 `CR`
+/// bytes eaten out of a 512 KiB ciphertext, exit 0, file unrecoverable at
+/// checkout). A resolver that read only the working tree was blind to exactly
+/// that — and deleting the file is the very move the check-in refusal's own
+/// message can prompt, when it says to delete the offending *line*.
+#[derive(Debug, Clone)]
+pub struct StagedAttributes {
+    /// The absolute path the file would occupy in the working tree.
+    pub path: PathBuf,
+    /// The staged contents.
+    pub contents: Vec<u8>,
+}
+
+/// The `.gitattributes` files git would read from the index for check-in.
+///
+/// One entry per `.gitattributes` recorded in the index whose working-tree file
+/// is absent; a file that is present wins outright on the check-in side, so it
+/// is not listed here at all. The name is compared the way git looks it up:
+/// byte-exact, or ASCII-case-folded when `core.ignorecase` is set — the same
+/// split the resolver itself applies to pattern matching.
+///
+/// Everything that cannot be read answers with an **empty list** rather than an
+/// error, and that direction is deliberate: the resolver's one consumer that
+/// must never grow a false refusal is the filter, and a missing fallback only
+/// ever reproduces the pre-2026-08-05 behaviour. `status` reports an unreadable
+/// index through its own `undetermined` section, not through this.
+#[must_use]
+pub fn staged_fallbacks(
+    work_tree: &Path,
+    index_path: &Path,
+    common_dir: &Path,
+    hash: gix_hash::Kind,
+    ignore_case: bool,
+) -> Vec<StagedAttributes> {
+    let Ok(crate::gitindex::Listed::Read(entries)) = crate::gitindex::list(index_path, hash) else {
+        return Vec::new();
+    };
+
+    let wanted = crate::repo::ATTRIBUTES_FILE.as_bytes();
+    let named = |name: &[u8]| {
+        if ignore_case {
+            name.eq_ignore_ascii_case(wanted)
+        } else {
+            name == wanted
+        }
+    };
+
+    use gix_object::Find as _;
+
+    let mut objects = None;
+    let mut buffer = Vec::new();
+    let mut found = Vec::new();
+    for entry in &entries {
+        if !entry.holds_content() {
+            continue;
+        }
+        let basename = entry
+            .path
+            .rsplit(|&byte| byte == b'/')
+            .next()
+            .unwrap_or(&entry.path);
+        if !named(basename) {
+            continue;
+        }
+
+        // The working-tree probe, by name, exactly as `collect_attribute_files`
+        // probes: a file that is there — under any spelling the filesystem
+        // resolves — is the one git reads, and the staged copy stays out of it.
+        let absolute = work_tree.join(crate::repo::working_tree_path(&entry.path));
+        if fs::symlink_metadata(&absolute).is_ok_and(|metadata| metadata.is_file()) {
+            continue;
+        }
+
+        // The object store is opened only when a fallback actually exists, so a
+        // repository whose attribute files are all on disk never pays for it.
+        if objects.is_none() {
+            objects = Some(crate::history::objects(common_dir, hash).ok());
+        }
+        let Some(Some(store)) = objects.as_ref() else {
+            return Vec::new();
+        };
+        let Ok(id) = gix_hash::oid::try_from_bytes(&entry.id) else {
+            continue;
+        };
+        if let Ok(Some(data)) = store.try_find(id, &mut buffer) {
+            found.push(StagedAttributes {
+                path: absolute,
+                contents: data.data.to_vec(),
+            });
+        }
+    }
+    found
+}
+
 /// What git resolves the `filter` attribute to for one path.
 ///
 /// The spelling of each variant is `git check-attr filter`'s own, so a report can
@@ -1169,12 +1269,19 @@ impl AttributeResolver {
     /// `.git/worktrees/side/info/attributes` is ignored in both. Reading the
     /// worktree's own directory therefore got it wrong twice over — it missed
     /// the source that decides and would have read one git never consults.
+    ///
+    /// `staged` is what [`staged_fallbacks`] found: the `.gitattributes` files
+    /// git reads from the **index** because their working-tree file is gone.
+    /// They take part in the ordinary precedence, by the directory they would
+    /// occupy — git treats the fallback copy exactly as it would treat the
+    /// file.
     #[must_use]
     pub fn new(
         work_tree: &Path,
         common_dir: &Path,
         global: Option<&Path>,
         ignore_case: bool,
+        staged: Vec<StagedAttributes>,
     ) -> Self {
         let mut collection = gix_attributes::search::MetadataCollection::default();
         let mut buf: Vec<u8> = Vec::new();
@@ -1188,26 +1295,50 @@ impl AttributeResolver {
         )
         .unwrap_or_default();
 
-        let mut sources: Vec<PathBuf> = Vec::new();
-        collect_attribute_files(work_tree, &mut sources);
+        let mut on_disk: Vec<PathBuf> = Vec::new();
+        collect_attribute_files(work_tree, &mut on_disk);
+        // The staged copies join the on-disk files in one list, so the sort
+        // below is the only thing deciding precedence for both.
+        let mut tree_sources: Vec<(PathBuf, Option<Vec<u8>>)> = on_disk
+            .into_iter()
+            .map(|path| (path, None))
+            .chain(
+                staged
+                    .into_iter()
+                    .map(|fallback| (fallback.path, Some(fallback.contents))),
+            )
+            .collect();
         // Shallowest first: git gives the file closest to the path the higher
         // precedence, and `Search` matches its lists last-added-first. Depth
         // before name, because a plain string sort does not order `a/x/.g`
         // against `a/.g` by depth in every alphabet.
-        sources.sort_by_key(|path| (path.components().count(), path.clone()));
+        tree_sources.sort_by_key(|(path, _)| (path.components().count(), path.clone()));
 
-        for source in &sources {
+        let mut sources: Vec<PathBuf> = Vec::new();
+        for (source, contents) in tree_sources {
             // Macros only where git takes them: the root file. Anywhere deeper a
             // `[attr]` line is an ordinary pattern to git.
             let is_root = source.parent() == Some(work_tree);
-            let _ = search.add_patterns_file(
-                source.clone(),
-                true,
-                Some(work_tree),
-                &mut buf,
-                &mut collection,
-                is_root,
-            );
+            match contents {
+                None => {
+                    let _ = search.add_patterns_file(
+                        source.clone(),
+                        true,
+                        Some(work_tree),
+                        &mut buf,
+                        &mut collection,
+                        is_root,
+                    );
+                }
+                Some(contents) => search.add_patterns_buffer(
+                    &contents,
+                    source.clone(),
+                    Some(work_tree),
+                    &mut collection,
+                    is_root,
+                ),
+            }
+            sources.push(source);
         }
 
         // Last, so it outranks every file in the working tree — which is exactly
@@ -1537,8 +1668,13 @@ mod tests {
                 .to_string()
         };
 
-        let mut resolver =
-            AttributeResolver::new(root, &root.join(".git"), global_path.as_deref(), false);
+        let mut resolver = AttributeResolver::new(
+            root,
+            &root.join(".git"),
+            global_path.as_deref(),
+            false,
+            Vec::new(),
+        );
         let ours = resolver.resolve(path.as_bytes());
 
         assert_eq!(

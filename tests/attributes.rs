@@ -695,6 +695,164 @@ fn a_foreign_text_line_below_the_managed_section_is_refused_before_the_file_is_l
     }
 }
 
+/// Stages `contents` as the index copy of `.gitattributes`, bypassing filters.
+///
+/// `git update-index --cacheinfo` neither runs the clean filter nor re-examines
+/// any other index entry, so the staged copy lands deterministically — a plain
+/// `git add .gitattributes` can re-clean a racy-clean secret in the same
+/// operation and trip the refusal this fixture exists to place, at a moment the
+/// test does not control.
+fn stage_attributes_copy(repo: &TestRepo, contents: &[u8]) {
+    let hashed = repo.git_with_stdin(["hash-object", "-w", "-t", "blob", "--stdin"], contents);
+    assert!(
+        hashed.status.success(),
+        "git hash-object failed: {}",
+        String::from_utf8_lossy(&hashed.stderr)
+    );
+    let id = String::from_utf8(hashed.stdout)
+        .expect("git prints a hash")
+        .trim()
+        .to_string();
+    repo.git_ok([
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        &format!("100644,{id},.gitattributes"),
+    ]);
+}
+
+/// What `git check-attr --cached` answers — the index copy alone.
+fn check_attr_cached(repo: &TestRepo, attribute: &str, path: &str) -> String {
+    let output = repo.git(["check-attr", "--cached", attribute, "--", path]);
+    String::from_utf8(output.stdout)
+        .expect("check-attr prints text")
+        .rsplit(": ")
+        .next()
+        .expect("check-attr always prints a value")
+        .trim()
+        .to_string()
+}
+
+#[test]
+fn a_dangerous_line_kept_only_in_the_index_still_refuses_after_the_file_is_deleted() {
+    // Git's check-in attribute stack reads the working-tree `.gitattributes`
+    // first and, when the file is gone, falls back to the **index** copy —
+    // measured on git 2.55: with `secrets/** text` staged and the file deleted,
+    // `git add` converted the filter's output (7003 `CR` bytes eaten out of a
+    // 512 KiB ciphertext), exited 0, and the checkout later fails the
+    // authentication tag and leaves no file. The refusal used to read only the
+    // working tree, so deleting the file — the very move its own message can
+    // prompt, when it says to delete the offending *line* — silenced the gate
+    // at the exact moment git kept converting.
+    let (repo, secret, blob) = repository_with_one_intact_secret();
+
+    let mut dangerous = repo.worktree_bytes(".gitattributes");
+    dangerous.extend_from_slice(b"secrets/** text\n");
+    stage_attributes_copy(&repo, &dangerous);
+    fs::remove_file(repo.path().join(".gitattributes")).expect("could not remove the file");
+
+    // The premise: the copy git falls back to really does carry the line.
+    assert_eq!(
+        check_attr_cached(&repo, "text", "secrets/store.p12"),
+        "set",
+        "the fixture no longer stages the shape it exists to catch"
+    );
+
+    let mut modified = secret.clone();
+    modified.extend_from_slice(b"one more line\r\n");
+    repo.write_file("secrets/store.p12", &modified);
+
+    let add = repo.git(["add", "secrets/store.p12"]);
+    let complaint = String::from_utf8_lossy(&add.stderr).into_owned();
+    assert!(
+        !add.status.success(),
+        "`git add` stored a ciphertext git converts via the index copy of a \
+         deleted `.gitattributes`, and exited {:?}:\n{complaint}",
+        add.status.code()
+    );
+    assert!(
+        complaint.contains(".gitattributes:") && complaint.contains("secrets/** text"),
+        "the refusal must name the staged line even though the file is gone \
+         from the working tree:\n{complaint}"
+    );
+
+    // Nothing was stored, so nothing is lost.
+    assert_eq!(
+        repo.blob_bytes("secrets/store.p12"),
+        blob,
+        "the committed ciphertext was damaged after all"
+    );
+}
+
+#[test]
+fn a_deleted_or_outranked_index_copy_never_provokes_a_refusal() {
+    // The other half, at the usual weight: with `required = true` a refusal one
+    // shape too wide blocks every git operation in the repository.
+
+    // 1. The file deleted while the index copy is *healthy*: git falls back to
+    //    a copy whose managed `-text` covers the path, so nothing converts and
+    //    nothing may refuse.
+    {
+        let (repo, secret, _blob) = repository_with_one_intact_secret();
+        fs::remove_file(repo.path().join(".gitattributes")).expect("could not remove the file");
+
+        let mut modified = secret.clone();
+        modified.extend_from_slice(b"one more line\r\n");
+        repo.write_file("secrets/store.p12", &modified);
+        let add = repo.git(["add", "secrets/store.p12"]);
+        assert!(
+            add.status.success(),
+            "a healthy index copy provoked a refusal:\n{}",
+            String::from_utf8_lossy(&add.stderr)
+        );
+        // The *staged* blob — nothing here commits, so `HEAD` still holds the
+        // old one.
+        let staged = repo.git_ok(["cat-file", "blob", ":secrets/store.p12"]);
+        assert_eq!(
+            staged.stdout.len(),
+            OVERHEAD + modified.len(),
+            "the ciphertext was converted after all, so the fallback did not \
+             reproduce what git reads"
+        );
+    }
+
+    // 2. A dangerous line staged but *removed from the working-tree file*: on
+    //    the check-in side the file outranks the index copy — measured on git
+    //    2.55, `git check-attr text` answers `unset` in this state — so the
+    //    staged copy must stay out of the stack entirely.
+    {
+        let (repo, secret, _blob) = repository_with_one_intact_secret();
+        let mut dangerous = repo.worktree_bytes(".gitattributes");
+        dangerous.extend_from_slice(b"secrets/** text\n");
+        stage_attributes_copy(&repo, &dangerous);
+
+        // The premises, one per source: the staged copy carries the line, the
+        // working tree does not, and git's check-in answer follows the file.
+        assert_eq!(
+            check_attr_cached(&repo, "text", "secrets/store.p12"),
+            "set",
+            "the fixture no longer stages the shape whose precedence it checks"
+        );
+        assert_eq!(
+            repo.check_attr("text", "secrets/store.p12"),
+            "unset",
+            "git no longer lets the working-tree file outrank the index copy, \
+             so this fixture proves the wrong thing"
+        );
+
+        let mut modified = secret.clone();
+        modified.extend_from_slice(b"one more line\r\n");
+        repo.write_file("secrets/store.p12", &modified);
+        let add = repo.git(["add", "secrets/store.p12"]);
+        assert!(
+            add.status.success(),
+            "the staged copy outranked the working-tree file in the refusal, \
+             which git does not let it do on check-in:\n{}",
+            String::from_utf8_lossy(&add.stderr)
+        );
+    }
+}
+
 /// Where a global attributes file can live, and how git is told about it.
 ///
 /// Both are resolved by git and neither is a path we can read verbatim: the
