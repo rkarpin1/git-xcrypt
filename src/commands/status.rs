@@ -820,7 +820,9 @@ pub fn run(repo: &Repo, fix: bool) -> Result<Report> {
         gitconfig::get(&config, "core.ignorecase").is_some_and(|value| gitconfig::is_true(&value));
     let mut filters = gitattributes::AttributeResolver::new(
         repo.work_tree(),
-        repo.git_dir(),
+        // The common directory: `info/` is shared by every checkout, so a linked
+        // worktree resolves the *main* `info/attributes` — see the resolver.
+        repo.common_dir(),
         gitconfig::get(&config, "core.attributesFile")
             .as_deref()
             .map(std::path::Path::new),

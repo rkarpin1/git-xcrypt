@@ -205,6 +205,27 @@ fn every_unusual_repository_gets_an_answer_and_the_right_one() {
         CLEAN,
     );
 
+    // And the unhealthy shape, which is the one that place actually costs
+    // something. `info/` is on git's common list, so both checkouts resolve the
+    // *main* `info/attributes` — measured on git 2.55, `git check-attr filter`
+    // answers `unset` in the linked worktree too, and `git add secrets/db.env`
+    // there exits 0 and stores the plain text. Asking this checkout's own git
+    // directory instead read a file git never consults and missed the one that
+    // decides, so `status` from the linked worktree exited 0 over a repository
+    // that was storing secrets in the clear.
+    std::fs::create_dir_all(main.path().join(".git/info")).expect("the info directory");
+    std::fs::write(
+        main.path().join(".git/info/attributes"),
+        b"secrets/** -filter\n",
+    )
+    .expect("writing info/attributes");
+    expect(
+        "a linked worktree whose shared info/attributes turns the filter off",
+        &linked.xcrypt(["status"]),
+        EXPOSED,
+    );
+    std::fs::remove_file(main.path().join(".git/info/attributes")).expect("removing it again");
+
     // --- A reference store that cannot be enumerated. -----------------------
     //
     // The measured failure this section exists for: no tips means the walk

@@ -810,8 +810,22 @@ impl AttributeResolver {
     ///
     /// `global` is `core.attributesFile`; `ignore_case` is `core.ignorecase`,
     /// which git applies to attribute matching as well as to path lookup.
+    ///
+    /// `common_dir`, **not this checkout's git directory**: `info/` is on git's
+    /// common list, so every linked worktree reads the *same*
+    /// `info/attributes`. Measured on git 2.55 with one linked worktree and
+    /// `secrets/** -filter` in the main `.git/info/attributes`: `git check-attr
+    /// filter` answers `unset` in both checkouts, and a file dropped in
+    /// `.git/worktrees/side/info/attributes` is ignored in both. Reading the
+    /// worktree's own directory therefore got it wrong twice over — it missed
+    /// the source that decides and would have read one git never consults.
     #[must_use]
-    pub fn new(work_tree: &Path, git_dir: &Path, global: Option<&Path>, ignore_case: bool) -> Self {
+    pub fn new(
+        work_tree: &Path,
+        common_dir: &Path,
+        global: Option<&Path>,
+        ignore_case: bool,
+    ) -> Self {
         let mut collection = gix_attributes::search::MetadataCollection::default();
         let mut buf: Vec<u8> = Vec::new();
         let mut search = gix_attributes::Search::new_globals(
@@ -848,7 +862,7 @@ impl AttributeResolver {
 
         // Last, so it outranks every file in the working tree — which is exactly
         // what makes it the source an audit is least likely to look at.
-        let info = git_dir.join("info").join("attributes");
+        let info = common_dir.join("info").join("attributes");
         let _ = search.add_patterns_file(info.clone(), true, None, &mut buf, &mut collection, true);
         sources.push(info);
         // Reported alongside the rest even though it was loaded first: a global
