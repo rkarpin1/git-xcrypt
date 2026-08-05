@@ -292,6 +292,27 @@ fn every_unusual_repository_gets_an_answer_and_the_right_one() {
          before the scan, and silence about that reads as `nothing found`:\n{text}"
     );
 
+    // A declaration that is *there* and cannot be read. The `?` used to hand
+    // this to the frozen table as `Error::Io`, code 1 — a bare "could not be
+    // read" with no verdict and no code a gate distinguishes from a typo.
+    // Measured with `chmod 000 .git-xcrypt`; provoked here with a directory
+    // where the file belongs, so the arm runs on all three platforms — what is
+    // checked is the branch, not the errno. It is the same state conflict as a
+    // deleted declaration: nothing can be checked, and nothing is stored in
+    // the clear over it, because the check-in path refuses on the same state.
+    let unreadable_declaration = TestRepo::init();
+    unreadable_declaration.init_xcrypt();
+    declared(&unreadable_declaration);
+    std::fs::remove_file(unreadable_declaration.path().join(".git-xcrypt"))
+        .expect("removing the declaration");
+    std::fs::create_dir(unreadable_declaration.path().join(".git-xcrypt"))
+        .expect("a directory where the file belongs");
+    expect(
+        "a configured repository whose .git-xcrypt cannot be read",
+        &unreadable_declaration.xcrypt(["status"]),
+        CONFIG,
+    );
+
     // A leak in history **and** a setup gap. This is the assertion the whole
     // change turns on: the verdict moves to `2`, and the leak is still named,
     // still counted, and still carries its rotate-first procedure. An operator

@@ -899,7 +899,24 @@ pub fn run(repo: &Repo, fix: bool) -> Result<Report> {
         );
     }
 
-    let declarations = Config::load(&repo.xcrypt_config_path())?;
+    // The same wrap as `.gitattributes` above, for the same reason: `?` alone
+    // surfaces an unreadable `.git-xcrypt` as `Error::Io`, code 1 — a bare
+    // "could not be read" with no verdict, no sections and no code a gate can
+    // act on, indistinguishable from a typo. Measured with `chmod 000
+    // .git-xcrypt`. It is a state conflict: a declaration nobody can read
+    // enforces nothing this command can prove, exactly like a missing one —
+    // and like there, nothing is stored in the clear over it, because the
+    // check-in path refuses on the same state.
+    let declarations = Config::load(&repo.xcrypt_config_path()).map_err(|err| match err {
+        crate::Error::Io(err) => crate::Error::Config(format!(
+            "{err}; status cannot tell which paths were meant to be encrypted, so \
+             nothing was checked. The check-in path refuses over the same state, \
+             so nothing is being stored in the clear; make {} readable and ask \
+             again",
+            crate::repo::CONFIG_FILE
+        )),
+        other => other,
+    })?;
     if declarations.missing {
         // Both, and they are two different statements. The gap is the state:
         // nothing here declares what to encrypt, so the configuration enforces
