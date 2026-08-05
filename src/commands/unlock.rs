@@ -315,8 +315,13 @@ fn interrupted(report: &Report, encrypted: &[Encrypted], err: Error) -> Error {
 }
 
 /// A working-tree file that carries our magic, and the header it carries.
+///
+/// `pub(super)` because `import-key` runs the same evidence pass before it
+/// installs anything: the headers name the key they want, and a key they
+/// contradict must be refused *before* it is on disk — see
+/// [`super::import_key`].
 #[derive(Debug)]
-struct Encrypted {
+pub(super) struct Encrypted {
     path: PathBuf,
     header: Header,
 }
@@ -351,7 +356,7 @@ struct Encrypted {
 /// own key then makes the parent's `unlock` fail with a key mismatch it cannot
 /// be talked out of, having decrypted nothing. Measured. A submodule has its own
 /// configuration, its own key and its own index; it needs its own `unlock`.
-fn collect_encrypted(repo: &Repo, walk: &mut Walk) -> Result<Vec<Encrypted>> {
+pub(super) fn collect_encrypted(repo: &Repo, walk: &mut Walk) -> Result<Vec<Encrypted>> {
     let mut found = Vec::new();
     let mut pending = vec![repo.work_tree().to_path_buf()];
 
@@ -424,11 +429,11 @@ fn collect_encrypted(repo: &Repo, walk: &mut Walk) -> Result<Vec<Encrypted>> {
 
 /// What the walk noticed on its way through, besides the files it found.
 #[derive(Debug, Default)]
-struct Walk {
+pub(super) struct Walk {
     /// Paths that could not be read, so may still hold ciphertext.
     unreadable: Vec<PathBuf>,
     /// Messages for the user, one per thing skipped.
-    warnings: Vec<String>,
+    pub(super) warnings: Vec<String>,
 }
 
 /// A path relative to the working tree, or the path itself if it is outside.
@@ -480,7 +485,7 @@ fn fill(file: &mut fs::File, buffer: &mut [u8]) -> std::io::Result<usize> {
 /// Deliberately an [`Error::Format`] rather than [`Error::KeyMismatch`]: both
 /// report exit code 4, and this one can name the file, which is what turns
 /// "authentication failed" into an instruction.
-fn refuse_foreign_keys(
+pub(super) fn refuse_foreign_keys(
     repo: &Repo,
     encrypted: &[Encrypted],
     key_id: &[u8; KEY_ID_LEN],

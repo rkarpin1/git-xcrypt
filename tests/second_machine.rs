@@ -119,6 +119,34 @@ fn a_clone_becomes_a_working_second_machine_and_its_edits_come_home() {
     );
     second.assert_status_clean();
 
+    // `import-key` must refuse the same evidence the same way. It used to look
+    // only for a key already in place — a fresh clone has none, so the wrong
+    // key installed cleanly, and from then on every honest answer pointed
+    // around the mistake: `unlock` refused over the first file, and importing
+    // the *right* key hit the different-key refusal, whose "replacing it would
+    // make every file unreadable" warning is false when the key in place has
+    // encrypted nothing. The way out was a by-hand deletion the user had no
+    // reason to understand. Refusing here is what keeps that state from ever
+    // forming.
+    let imported = second.xcrypt(["import-key", &wrong_key.to_string_lossy()]);
+    let complaint = String::from_utf8_lossy(&imported.stderr).into_owned();
+    assert_eq!(
+        imported.status.code(),
+        Some(4),
+        "importing a key every header in the tree contradicts was not refused:\n{complaint}"
+    );
+    assert!(
+        complaint.contains("secrets/db.env"),
+        "the refusal must name the file that is the evidence:\n{complaint}"
+    );
+    assert!(
+        !second.path().join(".git/git-xcrypt/keys/default").exists(),
+        "a refused import installed the wrong key anyway"
+    );
+    // And the right key still imports: the evidence agrees with it, so the
+    // refusal above cannot be one shape too wide.
+    second.xcrypt_ok(["import-key", &key_file.to_string_lossy()]);
+
     second.xcrypt_ok(["unlock", &key_file.to_string_lossy()]);
 
     second.assert_worktree_eq("secrets/db.env", FIRST);

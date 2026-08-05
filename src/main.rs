@@ -258,6 +258,11 @@ fn run_import_key(path: &std::path::Path) -> Result<()> {
     let report = commands::import_key::run(&repo, path)?;
 
     let key_id = git_xcrypt::format_key_id(&report.key_id);
+    // First, so "skipped" is read before the conclusion it qualifies: a file
+    // the evidence walk could not read might still name another key.
+    for warning in &report.warnings {
+        eprintln!("git-xcrypt: {warning}");
+    }
     if report.imported {
         eprintln!("git-xcrypt: imported key {key_id}");
     } else {

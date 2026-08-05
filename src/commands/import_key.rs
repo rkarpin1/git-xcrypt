@@ -7,6 +7,20 @@
 //! place is refused outright, and an identical one is an empty success — which
 //! is what makes re-running the command harmless.
 //!
+//! Accepting too easily has a second face, closed on 2026-08-05: a key the
+//! working tree's own headers contradict. Importing the wrong repository's key
+//! into a fresh clone used to succeed — no key was in place, so nothing
+//! conflicted — and from then on every command answered around the mistake:
+//! `unlock` refused (correctly) over the first file, and importing the *right*
+//! key hit the different-key refusal, whose "replacing it would make every file
+//! unreadable" warning is simply false when the key in place has encrypted
+//! nothing. The way out existed — the refusal names the key file to remove —
+//! but the state should never form. So a key that would actually be installed
+//! is asked past the same evidence `unlock` gathers: every encrypted file in
+//! the working tree names the key it wants, 38 bytes each, and a key they
+//! contradict is refused before it is on disk. A tree with no encrypted file
+//! offers no evidence and accepts any key, exactly as `unlock` does.
+//!
 //! Both halves of the filter are repaired at the same time, and neither is
 //! optional. `.git/config` is not versioned, so a clone has no driver; and the
 //! `* filter=git-xcrypt` line in `.gitattributes` is only there if whoever set
@@ -36,6 +50,8 @@ pub struct Report {
     pub config_written: bool,
     /// The managed `.gitattributes` section was written or repaired.
     pub attributes_written: bool,
+    /// What the evidence walk could not read, one message per skip.
+    pub warnings: Vec<String>,
 }
 
 /// Imports the key stored in `source`.
@@ -44,10 +60,25 @@ pub struct Report {
 ///
 /// [`Error::Usage`] when the file is not there, [`Error::Format`] when it is not
 /// a key file, [`Error::Config`] when the repository already holds a different
-/// key, [`Error::Io`] when the key cannot be written.
+/// key, [`Error::Format`] when a working-tree file was encrypted with a
+/// different key — the headers are the only evidence there is, and installing a
+/// key they contradict is the one state this command cannot cleanly leave —
+/// [`Error::Io`] when the key cannot be written.
 pub fn run(repo: &Repo, source: &Path) -> Result<Report> {
     let key = keyfile::read_portable(source)?;
     refuse_on_conflict(repo, &key)?;
+
+    // Only when the key would actually be installed: with the same key already
+    // in place there is nothing to install and the walk would cost a re-run of
+    // the command its harmlessness. The pass itself is `unlock`'s, on purpose —
+    // two spellings of "which key does this tree ask for" would drift.
+    let mut warnings = Vec::new();
+    if !repo.has_key() {
+        let mut walk = super::unlock::Walk::default();
+        let encrypted = super::unlock::collect_encrypted(repo, &mut walk)?;
+        super::unlock::refuse_foreign_keys(repo, &encrypted, &key.key_id())?;
+        warnings = walk.warnings;
+    }
 
     let imported = install(repo, &key)?;
     let config_written = super::init::register_driver(repo)?;
@@ -68,6 +99,7 @@ pub fn run(repo: &Repo, source: &Path) -> Result<Report> {
         imported,
         config_written,
         attributes_written,
+        warnings,
     })
 }
 
