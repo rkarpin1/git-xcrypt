@@ -99,7 +99,7 @@ pub fn run(repo: &Repo, key_source: Option<&Path>) -> Result<Report> {
     // is loaded here rather than after the key is installed, so a typo in it
     // cannot leave a key behind on its way out.
     let config = Config::load(&repo.xcrypt_config_path())?;
-    let git_config = gitconfig::open_full(repo.common_dir())?;
+    let git_config = gitconfig::open_full(repo.git_dir(), repo.common_dir())?;
     let autocrlf = gitconfig::get(&git_config, "core.autocrlf");
     let core_eol = gitconfig::get(&git_config, "core.eol");
 

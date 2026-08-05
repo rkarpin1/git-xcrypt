@@ -783,6 +783,81 @@ fn a_text_line_in_the_users_global_attributes_file_is_refused_like_any_other() {
 }
 
 #[test]
+fn a_linked_worktrees_own_config_is_the_one_that_counts() {
+    // `config.worktree` is per-checkout: git reads it from `$GIT_DIR`, which for
+    // a linked worktree is `…/.git/worktrees/<name>`, not from the common
+    // directory. This build read both files from the common directory, so a
+    // linked worktree was resolved against the *main* checkout's per-worktree
+    // configuration — nobody's configuration.
+    //
+    // Measured on git 2.55, 2026-08-05, 2 MB: with the linked worktree's
+    // `config.worktree` pointing `core.attributesFile` at a file declaring
+    // `vault/** text`, `git check-attr text` answered `set` there and
+    // `unspecified` in the main checkout. `git add` exited **0**, 40 bytes were
+    // eaten out of the blob, and the checkout left no file at all.
+    let home = TempDir::new().expect("could not create a home directory");
+    let repo = TestRepo::init().with_home(home.path());
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.xcrypt_ok(["sync"]);
+    // Declared after the last `sync`, the only state in which a source below the
+    // tree can win — see the global-file scenario above.
+    repo.write_xcrypt_config("secrets/\nvault/\n");
+
+    let secret = two_megabytes();
+    repo.write_file("vault/deploy.sh", &secret);
+    repo.commit_all("a secret, while nothing yet converts it");
+
+    let side = repo.add_worktree("side");
+    let attributes = home.path().join("side-attrs");
+    fs::write(&attributes, b"vault/** text\n").expect("could not write the attributes file");
+    side.git_ok(["config", "extensions.worktreeConfig", "true"]);
+    side.git_ok([
+        "config",
+        "--worktree",
+        "core.attributesFile",
+        &attributes.to_string_lossy(),
+    ]);
+
+    // The premise: git disagrees between the two checkouts, which is the whole
+    // point of a per-worktree setting.
+    assert_eq!(
+        side.check_attr("text", "vault/deploy.sh"),
+        "set",
+        "the fixture no longer reproduces the shape it exists to catch"
+    );
+    assert_eq!(
+        repo.check_attr("text", "vault/deploy.sh"),
+        "unspecified",
+        "the per-worktree setting leaked into the main checkout, so this proves \
+         nothing about which file was read"
+    );
+
+    let mut modified = secret.clone();
+    modified.extend_from_slice(b"one more line\r\n");
+    side.write_file("vault/deploy.sh", &modified);
+    let added = side.git(["add", "-A"]);
+    assert!(
+        !added.status.success(),
+        "`git add` in the linked worktree stored a ciphertext git is about to \
+         convert, and exited {:?}:\n{}",
+        added.status.code(),
+        String::from_utf8_lossy(&added.stderr)
+    );
+
+    // And the main checkout, which that line does not reach, keeps working —
+    // a refusal that spread to every checkout would be its own outage.
+    repo.write_file("vault/deploy.sh", &modified);
+    let untouched = repo.git(["add", "-A"]);
+    assert!(
+        untouched.status.success(),
+        "the main checkout was refused over a setting that belongs to another \
+         one:\n{}",
+        String::from_utf8_lossy(&untouched.stderr)
+    );
+}
+
+#[test]
 fn a_global_attributes_file_that_is_harmless_never_provokes_a_refusal() {
     // The other half, and it carries more weight here than usual. A global
     // attributes file is shared by every repository on the machine, so a

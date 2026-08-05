@@ -854,7 +854,7 @@ pub fn run(repo: &Repo, fix: bool) -> Result<Report> {
     // is a working registration and reporting it as missing would be wrong.
     // The common directory, because a linked worktree has a `config` file git
     // ignores — the same resolution `init` had to be taught.
-    let config = gitconfig::open_full(repo.common_dir())?;
+    let config = gitconfig::open_full(repo.git_dir(), repo.common_dir())?;
 
     for key in gitattributes::driver_keys() {
         match gitconfig::get(&config, &key) {

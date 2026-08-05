@@ -16,6 +16,69 @@ fn repo_with_secret() -> TestRepo {
     repo
 }
 
+/// A per-worktree configuration git has been told about but not yet written.
+///
+/// `extensions.worktreeConfig = true` is the command git's own documentation
+/// gives for enabling per-worktree configuration, and `config.worktree` does not
+/// appear until the first `git config --worktree` writes it. Git reads the
+/// extension as permission to look, not as a promise the file is there.
+///
+/// `gix-config` reads it as a promise. Measured on git 2.55, 2026-08-05: git ran
+/// `add`, `commit` and `status` at exit 0 in that state while this build could
+/// not start its filter — and with `required = true`, that is **every git
+/// operation in the repository** failing, `git add` exiting 128 with `could not
+/// read git configuration`. Fail-closed, so nothing was stored in the clear; an
+/// outage all the same, and one a documented git command walks straight into.
+///
+/// Both directions, because the tolerance has to stop at "missing": a file that
+/// is *there* and does not parse must still abort, or a repository whose
+/// `filter.git-xcrypt.required` cannot be read would pass for one that has it.
+#[test]
+fn a_per_worktree_config_git_has_not_written_yet_does_not_stop_the_filter() {
+    let repo = repo_with_secret();
+    repo.git_ok(["config", "extensions.worktreeConfig", "true"]);
+    assert!(
+        !repo.path().join(".git/config.worktree").exists(),
+        "the fixture no longer reproduces the shape it exists to catch: git \
+         wrote the per-worktree file by itself"
+    );
+
+    repo.write_file("second.env", b"api_key = also-a-secret\n");
+    let added = repo.git(["add", "-A"]);
+    assert!(
+        added.status.success(),
+        "the filter could not start over a per-worktree config git has not \
+         written yet, so every git operation in this repository fails: {}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    repo.commit_all("a secret, with the extension enabled and no file yet");
+    assert!(
+        repo.blob_is_encrypted("second.env"),
+        "the repository kept working but stopped encrypting, which is worse \
+         than the outage this replaced"
+    );
+
+    // The other direction. A file that exists and is broken is an answer this
+    // build must not guess at.
+    std::fs::write(repo.path().join(".git/config.worktree"), b"[unterminated\n")
+        .expect("could not write the per-worktree config");
+    repo.write_file("third.env", b"api_key = one-more\n");
+    let refused = repo.git(["add", "-A"]);
+    let complaint = String::from_utf8_lossy(&refused.stderr).into_owned();
+    assert!(
+        !refused.status.success(),
+        "`git add` went through over a per-worktree config nothing could parse"
+    );
+    assert!(
+        complaint.contains("config.worktree"),
+        "the refusal does not name the file nobody could parse:\n{complaint}"
+    );
+    // No `assert_not_staged` here, and the reason is the finding itself: with a
+    // broken file in the cascade **git** refuses before reaching any filter, so
+    // every later git command fails too and there is nothing left to ask. That
+    // is the correct outcome — it just cannot be observed through git.
+}
+
 #[test]
 fn a_failing_filter_aborts_the_add() {
     let repo = TestRepo::init();

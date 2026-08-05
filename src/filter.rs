@@ -99,10 +99,14 @@ impl Context {
 
         // Full precedence, not just `.git/config`: `core.autocrlf` lives in the
         // user's global file on nearly every machine that sets it at all.
-        // The common directory, not this worktree's: a linked worktree has a
-        // git dir of its own but no `config` in it, and the repository's real
-        // one is where git reads `core.autocrlf` from.
-        let git_config = crate::gitconfig::open_full(repo.common_dir())?;
+        //
+        // Both directories, because git splits them: `config` is shared and
+        // comes from the common one — a linked worktree has a git dir of its own
+        // with no `config` in it — while `config.worktree` belongs to *this*
+        // checkout. Reading that one from the common directory handed a linked
+        // worktree the main checkout's settings, and a `core.attributesFile` set
+        // there cost a file at checkout.
+        let git_config = crate::gitconfig::open_full(repo.git_dir(), repo.common_dir())?;
         Ok(Self {
             config,
             config_path,

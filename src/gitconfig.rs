@@ -5,6 +5,7 @@
 //! on exactly the platform where it hurts most. Writing only ever touches the
 //! repository-local file, which is the only one this tool has business changing.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use bstr::ByteSlice as _;
@@ -97,10 +98,20 @@ fn global_attributes_file_for(
 ///
 /// [`Error::Config`] when the file exists but cannot be parsed.
 pub fn open_local(path: &Path) -> Result<File> {
+    read_optional(path, gix_config::Source::Local)
+}
+
+/// One configuration file, where a missing one is empty and a broken one is not.
+///
+/// The asymmetry is the point: git creates these files lazily, so absence is an
+/// ordinary state and saying so costs nothing. A file that is *there* and does
+/// not parse is a different answer, and swallowing it would let a repository
+/// whose `filter.git-xcrypt.required` cannot be read pass for one that has it.
+fn read_optional(path: &Path, source: gix_config::Source) -> Result<File> {
     if !path.exists() {
-        return Ok(File::new(Metadata::from(gix_config::Source::Local)));
+        return Ok(File::new(Metadata::from(source)));
     }
-    File::from_path_no_includes(path.to_path_buf(), gix_config::Source::Local)
+    File::from_path_no_includes(path.to_path_buf(), source)
         .map_err(|err| Error::Config(format!("could not read {}: {err}", path.display())))
 }
 
@@ -113,12 +124,97 @@ pub fn open_local(path: &Path) -> Result<File> {
 /// the installer does it — and reading only the local file would leave the
 /// measured line-ending table unreachable on exactly the platform it exists for.
 ///
+/// This assembles the cascade the way `gix_config::File::from_git_dir` does,
+/// with **one** difference, and it is the reason it is spelled out here rather
+/// than called: that function reads `config.worktree` whenever
+/// `extensions.worktreeConfig` is true, and treats the file's absence as an
+/// error. Git treats it as empty — the extension is permission to look, not a
+/// promise the file exists, and git creates it lazily on the first
+/// `git config --worktree`.
+///
+/// Measured on git 2.55, 2026-08-05: in a repository where
+/// `extensions.worktreeConfig` was set and no `config.worktree` had been written
+/// yet, git ran `add`, `commit` and `status` at exit 0 while this build could
+/// not start its own filter — so with `required = true`, **every git operation
+/// in the repository failed**, `git add` exiting 128 with
+/// `could not read git configuration`. The trigger is the command git's own
+/// documentation gives for enabling per-worktree configuration, and the window
+/// is however long it takes to run the next one.
+///
+/// Fail-closed, so nothing was ever stored in the clear over it — but an outage
+/// is exactly what `required = true` turns a configuration read into, and the
+/// rest of this crate is careful about that.
+///
+/// **The two directories are different on purpose, and that is the second
+/// difference.** `config` is shared, so it comes from `common_dir`;
+/// `config.worktree` is per-checkout and comes from `git_dir`, which for a
+/// linked worktree is `…/.git/worktrees/<name>`. Reading both from the common
+/// directory — which is what this did, and what `gix-config` does when handed
+/// one path — gives a linked worktree the *main* checkout's per-worktree
+/// configuration, which is nobody's configuration.
+///
+/// Measured on git 2.55, 2026-08-05, 2 MB in a linked worktree whose
+/// `config.worktree` set `core.attributesFile` to a file declaring `vault/**
+/// text`: `git check-attr text` answered `set` there and `unspecified` in the
+/// main checkout, `git add` exited **0** because the refusal never saw the file,
+/// 40 bytes were eaten out of the blob, and the checkout left **no file at
+/// all**. Same shape as an unresolved `~/` in [`global_attributes_file`], one
+/// directory further out.
+///
 /// # Errors
 ///
-/// [`Error::Config`] when a file in the cascade cannot be parsed.
-pub fn open_full(git_dir: &Path) -> Result<File> {
-    File::from_git_dir(git_dir.to_path_buf())
-        .map_err(|err| Error::Config(format!("could not read git configuration: {err}")))
+/// [`Error::Config`] when a file in the cascade exists and cannot be parsed.
+pub fn open_full(git_dir: &Path, common_dir: &Path) -> Result<File> {
+    let broken =
+        |err: &dyn fmt::Display| Error::Config(format!("could not read git configuration: {err}"));
+
+    let mut local = read_optional(&common_dir.join("config"), gix_config::Source::Local)?;
+    // The one file git looks for only conditionally, and the one whose absence
+    // must not be an error. `Source::Worktree` rather than `Local`, so it keeps
+    // the precedence git gives it: above the local file, below the environment.
+    let worktree = get(&local, "extensions.worktreeConfig")
+        .is_some_and(|value| is_true(&value))
+        .then(|| {
+            read_optional(
+                &git_dir.join("config.worktree"),
+                gix_config::Source::Worktree,
+            )
+        })
+        .transpose()?;
+
+    let home = gix_path::env::home_dir();
+    let options = gix_config::file::init::Options {
+        includes: gix_config::file::includes::Options::follow(
+            gix_config::path::interpolate::Context {
+                home_dir: home.as_deref(),
+                ..Default::default()
+            },
+            gix_config::file::includes::conditional::Context {
+                git_dir: Some(git_dir),
+                branch_name: None,
+            },
+        ),
+        ..Default::default()
+    };
+
+    let mut config = File::from_globals().map_err(|err| broken(&err))?;
+    config
+        .resolve_includes(options)
+        .map_err(|err| broken(&err))?;
+    local
+        .resolve_includes(options)
+        .map_err(|err| broken(&err))?;
+    config.append(local).map_err(|err| broken(&err))?;
+    if let Some(mut worktree) = worktree {
+        worktree
+            .resolve_includes(options)
+            .map_err(|err| broken(&err))?;
+        config.append(worktree).map_err(|err| broken(&err))?;
+    }
+    config
+        .append(File::from_environment_overrides().map_err(|err| broken(&err))?)
+        .map_err(|err| broken(&err))?;
+    Ok(config)
 }
 
 /// Writes a configuration file back to disk, replacing it in one step.

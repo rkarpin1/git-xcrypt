@@ -289,7 +289,7 @@ pub fn run(repo: &Repo, confirm: &mut dyn Confirm) -> Result<Outcome> {
     // every checkout, and the walk below only ever sees one of them.
     refuse_other_worktrees(repo)?;
 
-    let git_config = gitconfig::open_full(repo.common_dir())?;
+    let git_config = gitconfig::open_full(repo.git_dir(), repo.common_dir())?;
     let hash =
         gitindex::object_hash(gitconfig::get(&git_config, "extensions.objectformat").as_deref());
 
@@ -764,8 +764,25 @@ fn describe_worktree(repo: &Repo, registration: &Path) -> String {
 /// When neither route answers, the checkout is reported as unknown rather than
 /// assumed absent — this function decides whether to refuse, and guessing "no
 /// checkout" is the guess that deletes the key.
+///
+/// **That applies to a configuration this build cannot read, too.** An earlier
+/// version turned an unparseable or unreadable `config` into `None`, which is
+/// the same guess by another route: a linked worktree would then have found no
+/// main checkout to refuse over. Measured on 2026-08-05, both shapes — a bad
+/// section header and `chmod 000` — happen to be caught a few lines later by
+/// [`gitconfig::open_full`], which reads the same file with `?`, so no run has
+/// ever reached the bad state. That is an accident of ordering rather than a
+/// guarantee, and it is exactly the shape the rest of this module refuses to
+/// rely on. A healthy repository is unaffected: its configuration parses, so
+/// this branch is unreachable there.
 fn main_checkout(repo: &Repo) -> Option<String> {
-    let config = gitconfig::open_local(&repo.config_path()).ok()?;
+    let Ok(config) = gitconfig::open_local(&repo.config_path()) else {
+        return Some(
+            "the main checkout, whose configuration this build could not read \
+             — so whether it has one, and where, is unknown"
+                .into(),
+        );
+    };
     if gitconfig::get(&config, "core.bare").as_deref() == Some("true") {
         // A bare repository has no checkout of its own to strand.
         return None;
