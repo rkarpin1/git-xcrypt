@@ -325,6 +325,29 @@ processes, `gpg` included.
 
 Being named `git-xcrypt` and on `PATH` also makes `git xcrypt <command>` work.
 
+## Verifying a downloaded release
+
+Every published archive carries a GitHub build provenance attestation. To check
+one before you trust it:
+
+```sh
+gh attestation verify git-xcrypt-<version>-<target>.tar.gz --repo <owner>/<repo>
+```
+
+That answers *which commit and which workflow run produced this file*, which is
+more than a bare signature would. There is no key to fetch and none to trust:
+the attestation is bound to the workflow's own identity.
+
+What it does **not** answer is whether these bytes follow from that source. The
+build is not reproducible — absolute paths and the compiler version reach the
+binary, so nobody can rebuild it and compare checksums. If that is the guarantee
+you need, build from source; `cargo install --path .` gives you a chain you
+control end to end.
+
+The `.sha256` file beside each archive is for spotting a truncated or corrupted
+download. It is not a security check: anyone who can replace the archive can
+replace the checksum next to it.
+
 ## Attribution
 
 `git-xcrypt` is *inspired by* [AGWA/git-crypt](https://github.com/AGWA/git-crypt)

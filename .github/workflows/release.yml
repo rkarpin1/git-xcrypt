@@ -9,10 +9,25 @@
 # libc — the self-containment requirement in `zalozenia.md` §Założenia
 # techniczne. macOS is built for both architectures; Windows for x86_64.
 #
-# Checksums are produced here. Signing is **not** yet set up: the PRD records the
-# counter-argument that an unsigned binary of a cryptographic tool is a new trust
-# vector, and that has to be answered with a real signing identity rather than a
-# workflow step that pretends to.
+# Checksums are produced here, and every published archive carries a build
+# provenance attestation — the answer to the PRD's counter-argument that an
+# unsigned binary of a cryptographic tool is a new trust vector. Settled
+# 2026-08-05 in favour of GitHub's attestations over a key of our own,
+# deliberately: a long-lived private key would have to live in this repository's
+# secrets for the release to stay automatic, which moves the trust vector rather
+# than closing it, and losing that key is the same class of failure this project
+# already documents for the repository key. An attestation has no key to lose,
+# and it says more than a signature would — which commit and which workflow run
+# produced the file.
+#
+# It is provenance, not reproducibility. Nobody can rebuild these bytes and
+# compare: `trim-paths` is not set and the toolchain is not pinned, so absolute
+# paths and compiler version reach the binary. That half of the counter-argument
+# is knowingly left open, recorded in `zalozenia.md` — do not let the presence of
+# an attestation be read as a claim it is closed.
+#
+# To verify a downloaded archive:
+#     gh attestation verify <archive> --repo <owner>/<repo>
 name: Release
 
 on:
@@ -24,8 +39,14 @@ on:
         description: "Tag to build (for a dry run)"
         required: true
 
+# `contents: write` publishes the release. The other two are what an attestation
+# needs: `id-token` to prove to Sigstore which workflow is asking, `attestations`
+# to record the result. Both are scoped to this workflow and neither gives it
+# anything else.
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -151,6 +172,19 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      # Attest the archives, not the checksum files: the checksum is only a
+      # restatement of the archive, so attesting it would prove nothing the
+      # archive's own attestation does not, and would invite verifying the
+      # wrong file.
+      #
+      # Before the upload, so a failure here stops the release rather than
+      # leaving published artefacts nobody attested.
+      - name: Attest the archives
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
       - uses: softprops/action-gh-release@v2
         with:
           files: |

@@ -111,6 +111,8 @@ Wszystkie FR mają priorytet `must-have` — użytkownik nie wskazał żadnego j
   > Socratic: Kontrargument przyjęty — "płytkie sprawdzenie daje fałszywe poczucie bezpieczeństwa: rzetelna odpowiedź wymaga przeszukania całej historii, nie tylko HEAD". FR zostaje; głębokość sprawdzenia jest nierozstrzygnięta — patrz `## Open Questions`.
 - FR-011: Użytkownik może zainstalować gotową binarkę dla swojej platformy bez kompilowania i bez dodatkowych bibliotek. Priorytet: must-have
   > Socratic: Kontrargument przyjęty — "binarka narzędzia kryptograficznego bez podpisu i odtwarzalnego builda to nowy wektor zaufania; instalacja ze źródeł ma przynajmniej łańcuch od źródła". FR zostaje; kontrargument obciąża sposób wydawania binariów, nie samą możliwość.
+  >
+  > **Stan na 2026-08-05 — odpowiedziana połowa.** Podpis: rozstrzygnięty na atestacje proweniencji GitHuba (`zalozenia.md` §Otwarte decyzje poz. 14), więc każde archiwum mówi, z którego commita i przebiegu powstało. Odtwarzalność: **świadomie otwarta** — build nie jest odtwarzalny, więc nikt z zewnątrz nie potwierdzi, że te bajty wynikają z tego kodu. `README.md` mówi to wprost i kieruje po tę gwarancję do budowania ze źródeł.
 
 ## Non-Functional Requirements
 
