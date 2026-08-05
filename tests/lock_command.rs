@@ -1,14 +1,13 @@
-//! Closing a repository, end to end through the binary and a real git.
+//! The one refusal in `lock` that only a case-insensitive filesystem can reach.
 //!
-//! `lock` deletes the only copy of a repository's key, so the properties worth
-//! proving here are mostly the ones about *not* acting: that a refusal changes
-//! nothing, that unsaved work stops the command with or without `--yes`, and
-//! that no key material ever leaves through a stream a redirect could capture.
-//!
-//! The one property about acting is the round trip. `unlock` → `lock` → `unlock`
-//! has to give the original bytes back and leave `git status` clean at every
-//! step, because that is what proves `lock` writes the same bytes the check-in
-//! path already committed rather than merely something that decrypts.
+//! Everything else `lock` refuses over is driven as a day's work in
+//! `tests/lock_unlock.rs` — the unsaved edit, the other checkout, the file that
+//! appears while the prompt waits. This one is here on its own because its
+//! premise is the *filesystem*, not the user: on APFS and on NTFS the index and
+//! the directory can disagree about a name with no signal anywhere, and on a
+//! case-sensitive filesystem the same steps are an ordinary rename that git
+//! reports. The test asserts whichever of the two it is standing on, so it says
+//! something true on all three platforms rather than being skipped on two.
 
 mod harness;
 
@@ -23,76 +22,6 @@ const MAGIC: &[u8] = b"\0GITXCRYPT\0";
 /// A directory outside every repository, to export into.
 fn elsewhere() -> TempDir {
     TempDir::new().expect("could not create a temporary directory")
-}
-
-/// A repository holding committed secrets, plus its key exported outside it.
-fn repository_with_secrets() -> (TestRepo, TempDir, std::path::PathBuf) {
-    let repo = TestRepo::init();
-    repo.init_xcrypt();
-    // `-text` on the script is the interesting case: its CRLF endings have to
-    // survive verbatim, which only holds if lock and the check-in path make the
-    // same conversion decision from the same declaration.
-    repo.write_xcrypt_config("secrets/\n*.env\nsecrets/deploy.sh -text\n");
-    repo.xcrypt_ok(["sync"]);
-    repo.write_file("secrets/db.env", b"api_key = do-not-commit-me\n");
-    repo.write_file("secrets/deploy.sh", b"#!/bin/sh\r\necho hi\r\n");
-    repo.write_file("secrets/blob.bin", &(0u8..=255).collect::<Vec<u8>>());
-    repo.write_file("secrets/empty.env", b"");
-    repo.write_file("README.md", b"public\n");
-    repo.commit_all("secrets and a readme");
-
-    assert!(repo.blob_bytes("secrets/db.env").starts_with(MAGIC));
-    repo.assert_blob_eq("README.md", b"public\n");
-
-    let outside = elsewhere();
-    let key = outside.path().join("repo.key");
-    repo.xcrypt_ok(["export-key", &key.to_string_lossy()]);
-    (repo, outside, key)
-}
-
-#[test]
-fn another_checkout_of_the_same_repository_stops_lock() {
-    // Every worktree reads the key from the common directory, and the walk only
-    // ever sees one checkout. Measured before this refusal existed: `lock` in
-    // the main worktree left the linked one holding plaintext and deleted the
-    // key both depended on, and `lock` there then failed with code 3 — a working
-    // tree in the clear with no key left to close it, reached on the success
-    // path.
-    let (repo, _outside, _key) = repository_with_secrets();
-    let linked = repo.add_worktree("side");
-
-    let output = repo.xcrypt(["lock", "--yes"]);
-
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "expected a state conflict, stderr was: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        repo.path().join(".git/git-xcrypt/keys/default").exists(),
-        "the shared key went while another checkout still needed it"
-    );
-    repo.assert_worktree_eq("secrets/db.env", b"api_key = do-not-commit-me\n");
-
-    // And from the other side, naming the main checkout it would have stranded.
-    let from_linked = linked.xcrypt(["lock", "--yes"]);
-    assert_eq!(from_linked.status.code(), Some(2));
-    assert!(
-        String::from_utf8_lossy(&from_linked.stderr).contains("other checkout"),
-        "the message must say why: {}",
-        String::from_utf8_lossy(&from_linked.stderr)
-    );
-
-    // Removing the worktree clears the way, which is what the message says.
-    repo.git_ok([
-        "worktree",
-        "remove",
-        "--force",
-        &linked.path().to_string_lossy(),
-    ]);
-    repo.xcrypt_ok(["lock", "--yes"]);
-    assert!(repo.worktree_bytes("secrets/db.env").starts_with(MAGIC));
 }
 
 /// A declared file the working-tree walk cannot see under the name the index

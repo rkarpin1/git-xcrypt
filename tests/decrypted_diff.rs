@@ -197,6 +197,31 @@ fn a_declared_path_git_stopped_filtering_is_still_reviewed_as_plaintext() {
         ],
         &["-api_key = one", "+api_key = two"],
     );
+
+    // And the gate says what is wrong, because being readable is not being
+    // safe: the next `git add` on this path stores `api_key = two` in the clear
+    // with exit code 0, and every other check in `status` passes. Naming the
+    // file was not enough — a note does not fail a CI gate.
+    let output = repo.xcrypt(["status"]);
+    let report = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "a repository git does not filter must fail the gate:\n{report}"
+    );
+    assert!(
+        report.contains("setup: git is NOT filtering"),
+        "the finding belongs in the setup section:\n{report}"
+    );
+    assert!(
+        report.contains("secrets/db.env"),
+        "the report has to name the path git leaves unfiltered:\n{report}"
+    );
+    assert!(
+        report.contains("`unset`"),
+        "the report has to quote what git resolves instead:\n{report}"
+    );
 }
 
 #[test]

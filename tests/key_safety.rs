@@ -324,3 +324,29 @@ fn export_key_refuses_a_git_directory_that_sits_outside_the_working_tree() {
         "the refusal still left a key inside the git directory"
     );
 }
+
+/// The one property of an exported key that only a Unix filesystem can state.
+///
+/// `export-key` writes the file `0600`, because the whole command exists to put
+/// a key somewhere the user will keep it and "somewhere" is often a shared
+/// machine. On Windows the equivalent is an ACL and this assertion cannot be
+/// written at all, so the gate below is a platform that is genuinely
+/// unreachable rather than one that was skipped.
+#[cfg(unix)]
+#[test]
+fn an_exported_key_is_readable_only_by_its_owner() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    let vault = TempDir::new().expect("could not create a temporary directory");
+    let destination = vault.path().join("repo.key");
+
+    repo.xcrypt_ok(["export-key", &destination.to_string_lossy()]);
+
+    let mode = fs::metadata(&destination)
+        .expect("the export must exist")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+}

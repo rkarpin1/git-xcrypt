@@ -86,6 +86,11 @@ fn a_secret_committed_before_its_pattern_is_found_fixed_forward_and_still_report
         text.contains("secrets/db.env"),
         "the report must name the path:\n{text}"
     );
+    assert!(
+        text.contains("in the clear:"),
+        "the file is still plain text in the index and in HEAD, and that is a \
+         separate finding from the history — the two need different repairs:\n{text}"
+    );
 
     // Rotation before rewriting, because a rewrite does not revoke a leak: the
     // secret is in forks, caches, CI logs and every clone that already exists.
