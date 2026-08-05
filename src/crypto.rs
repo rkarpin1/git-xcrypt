@@ -154,6 +154,30 @@ mod tests {
         }
     }
 
+    /// The module doc's claim, exercised on the one byte that can test it.
+    ///
+    /// "Flipping the suite or flag byte invalidates the tag" — but a flipped
+    /// suite or version is refused by `Header::parse` before any cipher runs,
+    /// so the only header byte that reaches the tag with a *valid* parse is
+    /// `flags`, flipped between its two legal values. That flip is exactly the
+    /// one that decides whether a checked-out file gets a CRLF conversion, so
+    /// it must fail authentication rather than quietly change the answer.
+    #[test]
+    fn a_flipped_flags_byte_fails_the_tag_instead_of_changing_the_conversion() {
+        let blob = encrypt(&key(), 0, b"one\ntwo\n").expect("encryption must succeed");
+        let mut flipped = blob.clone();
+        flipped[13] ^= FLAG_LF_NORMALIZED;
+        assert!(
+            crate::format::Header::parse(&flipped).is_ok(),
+            "the flipped byte must still parse, or this test asks nothing of \
+             the tag"
+        );
+        assert!(
+            matches!(decrypt(&key(), &flipped), Err(crate::Error::Crypto(_))),
+            "a header byte was altered and the tag did not notice"
+        );
+    }
+
     /// RFC 5297 Appendix A.1 — the specification's own vector.
     ///
     /// It pins the crate, not our wrapper: `aes-siv` has never been audited, so

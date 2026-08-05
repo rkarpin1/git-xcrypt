@@ -230,7 +230,11 @@ mod tests {
             (0u8..=255).collect(),
             (0u8..=255).cycle().take(100_000).collect(),
             vec![0u8; 4096],
-            b"\0GITXCRYPT".to_vec(),
+            // The full 11-byte magic, so the sample really wears it: an earlier
+            // spelling was ten bytes — one short — and covered nothing, since
+            // `looks_encrypted` said no. What this pins is that an *unselected*
+            // path passes through before the magic is even consulted.
+            b"\0GITXCRYPT\0not actually one of ours".to_vec(),
         ];
 
         for content in samples {
