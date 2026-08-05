@@ -153,7 +153,11 @@ jobs:
             shasum -a 256 "$archive" > "${archive}.sha256"
           fi
 
-      - uses: actions/upload-artifact@v4
+      # v4 runs on Node 20, which GitHub has deprecated and now force-runs on
+      # Node 24 with a warning on every job. v6 was the first to make Node 24 the
+      # default rather than opt-in; v7 also adds unzipped single-file uploads,
+      # which is opt-in through `archive` and changes nothing here.
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
           path: |
@@ -174,7 +178,12 @@ jobs:
     if: always() && needs.build.result == 'success'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      # Same Node 20 deprecation; v7 was the first with Node 24 as the default.
+      # v8 also makes a hash mismatch an error rather than a warning, which is
+      # the behaviour this project wants anyway: an archive that did not survive
+      # the trip between jobs must not reach an attestation saying it did.
+      # `merge-multiple` still means what it meant.
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
