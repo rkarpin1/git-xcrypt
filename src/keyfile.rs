@@ -275,6 +275,19 @@ fn parse_export_header(header: &str) -> Result<[u8; KEY_ID_LEN]> {
 
 /// Parses a `key_id` written as sixteen hex digits.
 fn parse_key_id(text: &str) -> Result<[u8; KEY_ID_LEN]> {
+    // Refused before the slicing below, not only for the message: the length
+    // gate counts bytes, and `&text[0..2]` on a header holding multi-byte
+    // characters lands inside one and panics — measured, `import-key` on a
+    // file whose header read `git-xcrypt-key-v1 a\u{20ac}\u{20ac}\u{20ac}\u{20ac}\u{20ac}` (sixteen bytes,
+    // six characters) aborted with `byte index 2 is not a char boundary`
+    // instead of naming the file. A key file is user input, and the convention
+    // is no panic on user input.
+    if !text.is_ascii() {
+        return Err(Error::Format(format!(
+            "`{text}` is not a key fingerprint; expected {} hex digits",
+            KEY_ID_LEN * 2
+        )));
+    }
     if text.len() != KEY_ID_LEN * 2 {
         return Err(Error::Format(format!(
             "`{text}` is not a key fingerprint; expected {} hex digits",
@@ -393,6 +406,23 @@ mod tests {
                 holds_a_key(text.as_bytes()),
                 "`{name}` is a usable key file that the diff driver would have printed"
             );
+        }
+    }
+
+    #[test]
+    fn a_header_with_multi_byte_characters_is_refused_rather_than_panicked_over() {
+        // The length gate counts bytes and the digit loop slices by byte
+        // offsets, so a header whose sixteen bytes are six characters landed a
+        // slice inside one and panicked -- measured, `import-key` on this exact
+        // shape aborted with `byte index 2 is not a char boundary` instead of
+        // naming the file. A key file is user input, and the convention is no
+        // panic on user input, so this must be a named refusal. Not
+        // `expect_err`: `MasterKey` has no `Debug` on purpose.
+        match decode_portable("git-xcrypt-key-v1 a\u{20ac}\u{20ac}\u{20ac}\u{20ac}\u{20ac}\nAAAA\n")
+        {
+            Err(Error::Format(_)) => {}
+            Err(other) => panic!("the refusal must be a format error, got: {other}"),
+            Ok(_) => panic!("a non-hex fingerprint must be refused"),
         }
     }
 
