@@ -98,8 +98,14 @@ fn lock_refuses_to_delete_the_key_over_a_declared_file_it_left_in_the_clear() {
             "the file is unchanged, so the user can rename it back and re-run"
         );
         let message = String::from_utf8_lossy(&output.stderr).into_owned();
+        // The **on-disk** spelling, since 2026-08-05. Selection folds ASCII case
+        // now, so the walk of the working tree recognises `Secrets/db.env` as
+        // declared and the refusal moves from "the index names a path this walk
+        // never saw" to "this declared file is not tracked under this name".
+        // Both refuse with the same code over the same state; this one names the
+        // spelling the user has to act on, which is the one on disk.
         assert!(
-            message.contains("secrets/db.env"),
+            message.contains("Secrets/db.env"),
             "the refusal does not name the file to look at:\n{message}"
         );
     } else {

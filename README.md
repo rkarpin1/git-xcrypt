@@ -272,6 +272,24 @@ exits 0, and the first thing that would have told you was the failed checkout.
   (`filter.<driver>.process`). Clients that reimplement git rather than calling
   it — JGit, and tools built on libgit2 — may not speak it and may treat the
   file as unfiltered. IDEs and GUIs that shell out to `git` are fine.
+- **Patterns fold ASCII case, and only ASCII case.** `secrets/` in `.git-xcrypt`
+  covers `Secrets/db.env` and `SECRETS/db.env`, and `*.env` covers `top.ENV` —
+  unconditionally, on every platform, whatever `core.ignorecase` says. That is
+  deliberate: on macOS and Windows `secrets` and `Secrets` are the *same*
+  directory, so a mis-spelled name cannot be seen at all, and reading
+  `core.ignorecase` would make the same repository encrypt different files on
+  different machines. Beyond ASCII nothing folds: `łąka/` does not cover
+  `ŁĄKA/`. Git has the same limit — with `core.ignorecase=true` its own patterns
+  do not fold non-ASCII letters either — and `.gitattributes` matches bytes, so
+  the generated line has no way to spell such a fold. If your paths carry
+  non-ASCII letters, declare each spelling you actually use.
+- **The files that bootstrap the tool are matched with case folded too**, so
+  `.GITATTRIBUTES`, `.GIT-XCRYPT` and `.Git-Xcrypt-Keys/` are never encrypted,
+  whatever your patterns say. On a case-insensitive filesystem `.GITATTRIBUTES`
+  *is* the attributes file, and encrypting it would switch the filter off for
+  the whole repository. The cost on a case-sensitive filesystem is the other
+  way round: a file you deliberately named `secrets/.GITATTRIBUTES` stays in the
+  clear.
 - `git archive` exports ciphertext: git does not apply filters to it.
 - Submodules have their own configuration and need their own `init`.
 - `working-tree-encoding` (character-set conversion, e.g. UTF-16) is not

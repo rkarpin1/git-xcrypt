@@ -285,43 +285,6 @@ impl Config {
             .is_some_and(|rule| rule.pattern.is_negative())
     }
 
-    /// Whether folding case would select a path that byte matching does not.
-    ///
-    /// **A question, not a change of mind.** Selection stays byte exact: what a
-    /// pattern means on a case-insensitive filesystem is an open decision in
-    /// `context/foundation/zalozenia.md`, and answering it by reading
-    /// `core.ignorecase` would put a *non-versioned* setting on the check-in
-    /// path, so the same repository would encrypt a different set of files on
-    /// macOS than on Linux. The founding document rules that out for
-    /// `core.autocrlf` in as many words, and the reason carries over unchanged.
-    ///
-    /// What is not open is whether anyone gets told. Measured on git 2.55 with
-    /// `core.ignorecase=true`, which is the default on APFS and on Git for
-    /// Windows: git folds case in `.gitignore` **and** in `.gitattributes`
-    /// matching, so a `*.pem` line in the managed section resolves
-    /// `filter=git-xcrypt`, `-text` and `diff=git-xcrypt` for `top.PEM` — while
-    /// this file leaves `top.PEM` in the clear. The rendered section therefore
-    /// reaches further than the filter, which AGENTS.md forbids in both
-    /// directions, and on such a filesystem the user cannot spell the difference
-    /// because the two names are one file.
-    ///
-    /// `status` asks this so it can say so. It reports the answer as
-    /// *undetermined*, never as an exposure: `5` tells an operator to rotate a
-    /// secret, and the remedy here is to settle a spelling and ask again.
-    ///
-    /// False whenever [`Config::decide`] already selects the path, so a caller
-    /// only ever sees the paths where the two answers differ.
-    #[must_use]
-    pub fn selected_only_when_folding_case(&self, path: &[u8]) -> bool {
-        if is_never_encrypted(path) || self.decide(path).encrypt {
-            return false;
-        }
-        self.rules
-            .iter()
-            .rfind(|rule| matches_with(&rule.pattern, path, Case::Fold))
-            .is_some_and(|rule| !rule.pattern.is_negative())
-    }
-
     /// What the patterns alone say, with the bootstrap exclusions set aside.
     ///
     /// Only one caller wants this: rendering `.gitattributes` has to know
@@ -367,6 +330,18 @@ impl Config {
 /// check-in path consults it before anything else, including before refusing on
 /// a missing `.git-xcrypt` — otherwise a user who deleted the file could not
 /// commit its replacement.
+///
+/// **Compared with ASCII case folded, like everything else here** — see
+/// [`MATCHING`], and note that this one is not a free consequence of that
+/// decision. On a case-insensitive filesystem `.GITATTRIBUTES` *is* the
+/// attributes file, so encrypting it would replace the catch-all line with
+/// ciphertext and turn the filter off for **every** file in the repository, not
+/// for one. On a case-sensitive filesystem the fold costs the opposite: a file
+/// deliberately named `secrets/.GITATTRIBUTES` stays in the clear. Folding is
+/// the direction taken because the rendered `.gitattributes` lines fold too, and
+/// a filter that encrypted a path those lines put git's defaults back on would
+/// leave ciphertext without `-text` — the shape measured destroying a 2 MB file
+/// at checkout. Recorded in `README.md` §Known limitations.
 #[must_use]
 pub fn is_never_encrypted(path: &[u8]) -> bool {
     // `.gitattributes` is matched by basename, not by root path: git reads one
@@ -377,12 +352,15 @@ pub fn is_never_encrypted(path: &[u8]) -> bool {
 
     // No `format!` here: this runs once per file in the repository, and the
     // allocation bought nothing that `strip_prefix` does not.
-    basename == ATTRIBUTES_FILE.as_bytes()
-        || path == CONFIG_FILE.as_bytes()
-        || path == KEY_ENVELOPE_DIR.as_bytes()
+    let same = |left: &[u8], right: &str| left.eq_ignore_ascii_case(right.as_bytes());
+
+    same(basename, ATTRIBUTES_FILE)
+        || same(path, CONFIG_FILE)
+        || same(path, KEY_ENVELOPE_DIR)
         || path
-            .strip_prefix(KEY_ENVELOPE_DIR.as_bytes())
-            .is_some_and(|rest| rest.starts_with(b"/"))
+            .get(..KEY_ENVELOPE_DIR.len())
+            .is_some_and(|head| same(head, KEY_ENVELOPE_DIR))
+            && path.get(KEY_ENVELOPE_DIR.len()) == Some(&b'/')
 }
 
 /// One line, split into the two things it declares.
@@ -703,27 +681,47 @@ fn parse_attributes(text: &str, line: usize) -> Result<Declared> {
     Ok(declared)
 }
 
+/// How every pattern in this file is matched. **Unconditionally**, and that is
+/// the decision rather than a detail of it.
+///
+/// Settled on 2026-08-05 as open decision 13, on the owner's judgement that it
+/// is the safest of the answers available. The failure it closes was measured:
+/// `.git-xcrypt` declares `secrets/`, the user creates `Secrets/db.env`, and on
+/// APFS and on NTFS those are **one** directory — `cd secrets` enters `Secrets`
+/// and `ls` shows a single entry, so nothing in the working tree can show the
+/// mistake. Byte-exact matching left the file unselected, `git add` exited `0`
+/// and the plaintext went into the object database.
+///
+/// **Unconditional is what keeps determinism.** The obvious alternative — fold
+/// when git folds — would read `core.ignorecase`, which git sets for itself by
+/// probing the filesystem and which is not versioned, so the same repository
+/// would encrypt a different set of files on macOS than on Linux. That is the
+/// argument that keeps `core.autocrlf` off the check-in path, and it carries over
+/// unchanged. Folding always reads nothing: the declaration alone decides, on
+/// every machine.
+///
+/// **ASCII, deliberately.** `gix-glob` folds with `to_ascii_lowercase`, and so
+/// does git: measured on git 2.55 with `core.ignorecase=true`, `łąka/**` matches
+/// neither `ŁĄKA/a.env` nor `Łąka/a.env`. Reaching further would also have
+/// nowhere to land — `.gitattributes` matches bytes, so the rendered `[łŁ]` is a
+/// set of four bytes rather than two characters and matches no spelling at all,
+/// and a filter that selected a path the rendered section cannot reach is the
+/// "narrower" half of the rule this project holds hardest. Recorded as a
+/// limitation in `README.md` §Known limitations.
+const MATCHING: Case = Case::Fold;
+
 /// Whether `pattern` matches `path`, honouring directory patterns.
 ///
 /// A pattern written as `secrets/` only matches a directory, so git also treats
 /// everything beneath it as matched. `gix-glob` answers about one path at a
 /// time, so the ancestors are offered to it explicitly.
 fn matches(pattern: &Pattern, path: &[u8]) -> bool {
-    matches_with(pattern, path, Case::Sensitive)
-}
-
-/// The same question asked with a chosen case sensitivity.
-///
-/// Only [`Config::selected_only_when_folding_case`] ever passes anything but
-/// [`Case::Sensitive`], and it does so to *report* a difference rather than to
-/// act on one — see that method for why selection itself stays byte exact.
-fn matches_with(pattern: &Pattern, path: &[u8], case: Case) -> bool {
-    if match_one(pattern, path, false, case) {
+    if match_one(pattern, path, false, MATCHING) {
         return true;
     }
 
     for (index, byte) in path.iter().enumerate() {
-        if *byte == b'/' && match_one(pattern, &path[..index], true, case) {
+        if *byte == b'/' && match_one(pattern, &path[..index], true, MATCHING) {
             return true;
         }
     }
@@ -761,6 +759,14 @@ mod tests {
             "sub/dir/.gitattributes",
             CONFIG_FILE,
             "\u{2e}git-xcrypt-keys/robert.age",
+            // The same three with ASCII case folded, because on APFS and NTFS
+            // `.GITATTRIBUTES` *is* the attributes file — encrypting it would
+            // replace the catch-all line with ciphertext and switch the filter
+            // off for every file in the repository. See `is_never_encrypted`.
+            ".GITATTRIBUTES",
+            "sub/dir/.GitAttributes",
+            ".GIT-XCRYPT",
+            "\u{2e}Git-Xcrypt-Keys/robert.age",
         ] {
             assert!(
                 !config.decide(path.as_bytes()).encrypt,
@@ -953,6 +959,39 @@ mod tests {
                 "a bare negation still works",
                 "secrets/\n!secrets/README.md\n",
                 b"secrets/README.md",
+                false,
+                TextMode::Auto,
+                None,
+            ),
+            // Open decision 13, settled 2026-08-05. See `MATCHING`.
+            (
+                "a pattern reaches every ASCII spelling of the name",
+                "secrets/\n",
+                b"SEcrets/db.env",
+                true,
+                TextMode::Auto,
+                None,
+            ),
+            (
+                "…attributes come with it",
+                "secrets/*.sh text\n",
+                b"SEcrets/Go.SH",
+                true,
+                TextMode::Text,
+                None,
+            ),
+            (
+                "…and so does a negation, or the hole closes on a rename",
+                "secrets/\n!secrets/README.md\n",
+                b"SEcrets/README.MD",
+                false,
+                TextMode::Auto,
+                None,
+            ),
+            (
+                "folding stops at ASCII, exactly where git stops",
+                "\u{142}\u{105}ka/\n",
+                "\u{141}\u{104}KA/a.txt".as_bytes(),
                 false,
                 TextMode::Auto,
                 None,

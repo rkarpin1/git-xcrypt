@@ -115,6 +115,12 @@ pub fn render_lines(config: &Config) -> Vec<String> {
 /// a file that is stored in the clear, and point a decrypting diff driver at it
 /// once S-05 registers one. The lines are emitted only when a pattern actually
 /// reaches them, so an ordinary configuration never carries them.
+///
+/// Folded like every other line here, because [`crate::config::is_never_encrypted`]
+/// compares these three names with ASCII case folded too. A line narrower than
+/// the exclusion would put `-text` and a decrypting diff driver on a file that is
+/// stored in the clear; a line broader than it would take them off one that is
+/// not. Both halves have to move together.
 fn bootstrap_exclusions(config: &Config) -> Vec<String> {
     let mut lines = Vec::new();
 
@@ -123,13 +129,13 @@ fn bootstrap_exclusions(config: &Config) -> Vec<String> {
     let reached = |path: &str| config.decide_ignoring_exclusions(path.as_bytes()).encrypt;
 
     if reached(ATTRIBUTES_FILE) || reached(&format!("sub/{ATTRIBUTES_FILE}")) {
-        lines.push(format!("**/{ATTRIBUTES_FILE} !text !diff"));
+        lines.push(format!("**/{} !text !diff", fold_case(ATTRIBUTES_FILE)));
     }
     if reached(CONFIG_FILE) {
-        lines.push(format!("/{CONFIG_FILE} !text !diff"));
+        lines.push(format!("/{} !text !diff", fold_case(CONFIG_FILE)));
     }
     if reached(&format!("{KEY_ENVELOPE_DIR}/recipient")) {
-        lines.push(format!("/{KEY_ENVELOPE_DIR}/** !text !diff"));
+        lines.push(format!("/{}/** !text !diff", fold_case(KEY_ENVELOPE_DIR)));
     }
     lines
 }
@@ -180,17 +186,214 @@ fn translate(pattern: &str) -> Vec<String> {
 
     let mut spellings = Vec::with_capacity(2);
     if !directory_only {
-        spellings.push(spell(&guard(core.to_string(), anchored)));
+        spellings.push(spell(&fold_case(&guard(core.to_string(), anchored))));
     }
-    spellings.push(spell(&guard(
+    spellings.push(spell(&fold_case(&guard(
         if anchored {
             format!("{core}/**")
         } else {
             format!("**/{core}/**")
         },
         anchored,
-    )));
+    ))));
     spellings
+}
+
+/// Spells a pattern so it matches either case of every ASCII letter.
+///
+/// The other half of open decision 13, settled on 2026-08-05, and it is not
+/// optional: [`crate::config::MATCHING`] folds ASCII case unconditionally, so a
+/// rendered line that did not would be **narrower** than the filter — and the
+/// narrow direction is the one measured eating 34 `CR` bytes out of a 2 MB
+/// ciphertext and losing the file at checkout. Emitting the fold rather than
+/// leaning on `core.ignorecase` is what makes the two agree on every machine:
+/// measured on git 2.55, `**/secrets/**` answers `unspecified` for
+/// `SEcrets/db.txt` where the setting is false, while
+/// `**/[sS][eE][cC][rR][eE][tT][sS]/**` answers `unset` whatever it is set to.
+///
+/// Four things in a pattern are not plain letters, and each is left meaning what
+/// it meant:
+///
+/// * **a glob escape.** `\s` is the literal `s`, so it becomes `[sS]` — the
+///   backslash was doing nothing a character class does not. `\*` and every
+///   other escaped metacharacter is passed through with its backslash.
+/// * **a character class.** `[a-z]` cannot become `[[aA]-[zZ]]`; the counterpart
+///   is added *inside* the brackets instead, giving `[a-zA-Z]`. A negated class
+///   gets it too, which is right: folding `[!a]` must stop it matching `A`.
+/// * **a POSIX class**, `[[:alpha:]]`, whose members are named rather than
+///   spelled, so there is nothing to rewrite and it is copied whole.
+/// * **anything outside ASCII**, which is copied byte for byte. That is the
+///   documented boundary — see [`crate::config::MATCHING`].
+///
+/// Quoting is not this function's business. It runs before [`spell`], which puts
+/// the quotes back around a pattern that needs them, and `[`, `]` and `-` are
+/// ordinary characters to git's C-unquoting. It runs *after* [`guard`] for the
+/// opposite reason: `guard` recognises a literal `[attr]` opening, and folding
+/// first would turn it into `[attrATTR]` and hide it.
+fn fold_case(pattern: &str) -> String {
+    let mut out = String::with_capacity(pattern.len() * 4);
+    let mut index = 0;
+
+    while index < pattern.len() {
+        let character = pattern[index..]
+            .chars()
+            .next()
+            .expect("index sits on a character boundary");
+
+        if character == '\\' {
+            match pattern[index + 1..].chars().next() {
+                Some(escaped) if escaped.is_ascii_alphabetic() => {
+                    push_either_case(&mut out, escaped);
+                    index += 1 + escaped.len_utf8();
+                }
+                Some(escaped) => {
+                    out.push('\\');
+                    out.push(escaped);
+                    index += 1 + escaped.len_utf8();
+                }
+                // A trailing backslash escapes nothing. The parser refuses one
+                // in `.git-xcrypt`, so this is only ever reached through a
+                // quoted pattern, and passing it through is what keeps the two
+                // files spelling the same name.
+                None => {
+                    out.push('\\');
+                    index += 1;
+                }
+            }
+            continue;
+        }
+
+        if character == '[' {
+            if let Some((folded, after)) = fold_class(pattern, index) {
+                out.push_str(&folded);
+                index = after;
+                continue;
+            }
+            // Unterminated: wildmatch reads the `[` as an ordinary character,
+            // and so must this.
+            out.push('[');
+            index += 1;
+            continue;
+        }
+
+        if character.is_ascii_alphabetic() {
+            push_either_case(&mut out, character);
+        } else {
+            out.push(character);
+        }
+        index += character.len_utf8();
+    }
+
+    out
+}
+
+/// Writes `letter` as the two-character class matching either of its cases.
+fn push_either_case(out: &mut String, letter: char) {
+    out.push('[');
+    out.push(letter.to_ascii_lowercase());
+    out.push(letter.to_ascii_uppercase());
+    out.push(']');
+}
+
+/// The same letter in the other case.
+fn flip_case(letter: char) -> char {
+    if letter.is_ascii_lowercase() {
+        letter.to_ascii_uppercase()
+    } else {
+        letter.to_ascii_lowercase()
+    }
+}
+
+/// Folds one bracket expression starting at `start`, returning it and its end.
+///
+/// `None` when the bracket is never closed, which wildmatch reads as a literal
+/// `[`. Members are kept exactly as written and their counterparts appended, so
+/// the class grows rather than changing shape: `[a-z_]` becomes `[a-z_A-Z]`.
+fn fold_class(pattern: &str, start: usize) -> Option<(String, usize)> {
+    let bytes = pattern.as_bytes();
+    let mut index = start + 1;
+    let mut body = String::new();
+    let mut extra = String::new();
+
+    // A leading `!` or `^` negates; a `]` straight after either is a member.
+    if matches!(bytes.get(index), Some(b'!' | b'^')) {
+        body.push(char::from(bytes[index]));
+        index += 1;
+    }
+    if bytes.get(index) == Some(&b']') {
+        body.push(']');
+        index += 1;
+    }
+
+    while index < bytes.len() {
+        if bytes[index] == b']' {
+            let mut out = String::with_capacity(body.len() + extra.len() + 2);
+            out.push('[');
+            out.push_str(&body);
+            out.push_str(&extra);
+            out.push(']');
+            return Some((out, index + 1));
+        }
+
+        // `[:alpha:]` and friends name their members, so there is nothing to
+        // add — and a `[` that opens one is not a member either.
+        if bytes[index] == b'[' && bytes.get(index + 1) == Some(&b':') {
+            let end = index + pattern[index..].find(":]")? + 2;
+            body.push_str(&pattern[index..end]);
+            index = end;
+            continue;
+        }
+
+        if bytes[index] == b'\\' {
+            let escaped = pattern[index + 1..].chars().next()?;
+            body.push('\\');
+            body.push(escaped);
+            if escaped.is_ascii_alphabetic() {
+                extra.push('\\');
+                extra.push(flip_case(escaped));
+            }
+            index += 1 + escaped.len_utf8();
+            continue;
+        }
+
+        let low = pattern[index..]
+            .chars()
+            .next()
+            .expect("index sits on a character boundary");
+        let after_low = index + low.len_utf8();
+
+        // A range, but only where the `-` really separates two members: a `-`
+        // immediately before the closing bracket is itself a member.
+        if bytes.get(after_low) == Some(&b'-')
+            && bytes.get(after_low + 1).is_some_and(|byte| *byte != b']')
+        {
+            let high = pattern[after_low + 1..].chars().next()?;
+            body.push(low);
+            body.push('-');
+            body.push(high);
+            // Only a range whose ends share a case has a counterpart range; the
+            // ends of anything else are not letters in the same alphabet and
+            // flipping them could invert the range.
+            if low.is_ascii_alphabetic()
+                && high.is_ascii_alphabetic()
+                && low.is_ascii_lowercase() == high.is_ascii_lowercase()
+            {
+                extra.push(flip_case(low));
+                extra.push('-');
+                extra.push(flip_case(high));
+            }
+            index = after_low + 1 + high.len_utf8();
+            continue;
+        }
+
+        body.push(low);
+        if low.is_ascii_alphabetic() {
+            extra.push(flip_case(low));
+        }
+        index = after_low;
+    }
+
+    None
 }
 
 /// What git reads as the start of a macro definition rather than a pattern.
@@ -1042,8 +1245,84 @@ mod tests {
         // slash matches nothing in `.gitattributes`, so the subtree needs
         // `/**`; and `secrets/**` carries a slash, which anchors it to the root,
         // while `.gitignore`'s `secrets/` floats. The filter encrypts
-        // `app/secrets/x`, so the line has to reach it.
-        assert_eq!(lines("secrets/\n"), ["**/secrets/** -text diff=git-xcrypt"]);
+        // `app/secrets/x`, so the line has to reach it. Since 2026-08-05 every
+        // ASCII letter is spelled as the class matching either of its cases,
+        // because selection folds unconditionally — see `fold_case`.
+        assert_eq!(
+            lines("secrets/\n"),
+            ["**/[sS][eE][cC][rR][eE][tT][sS]/** -text diff=git-xcrypt"]
+        );
+    }
+
+    /// What [`fold_case`] makes of every construct a pattern can hold.
+    ///
+    /// A table rather than a scenario, because the awkward rows are the ones no
+    /// realistic `.git-xcrypt` contains and every one of them is a silent
+    /// failure: a class turned inside out, an escape eaten, a POSIX name folded
+    /// into nonsense. Whether the *result* is what git matches is settled by
+    /// `tests/attributes.rs`, against a real `git check-attr`.
+    #[test]
+    fn folding_leaves_every_other_construct_meaning_what_it_meant() {
+        let rows: &[(&str, &str, &str)] = &[
+            ("a plain name", "secrets", "[sS][eE][cC][rR][eE][tT][sS]"),
+            ("digits and punctuation", "a1-_.b", "[aA]1-_.[bB]"),
+            ("wildcards are untouched", "*.e?v", "*.[eE]?[vV]"),
+            ("a glob escape on a letter", "\\a", "[aA]"),
+            ("a glob escape on a metacharacter", "\\*x", "\\*[xX]"),
+            ("a character class gains its counterpart", "[ab]", "[abAB]"),
+            ("a range gains its counterpart range", "[a-z]", "[a-zA-Z]"),
+            (
+                "a mixed class keeps its non-letters",
+                "[a-z_0-9]",
+                "[a-z_0-9A-Z]",
+            ),
+            ("a negated class folds too", "[!ab]", "[!abAB]"),
+            ("…including the other spelling of it", "[^a]", "[^aA]"),
+            ("a `]` first is a member", "[]a]", "[]aA]"),
+            ("a `-` last is a member", "[a-]", "[a-A]"),
+            (
+                "a POSIX class is named, not spelled",
+                "[[:alpha:]]",
+                "[[:alpha:]]",
+            ),
+            (
+                "…and its neighbours still fold",
+                "[[:digit:]x]",
+                "[[:digit:]xX]",
+            ),
+            ("an escape inside a class", "[\\a\\]]", "[\\a\\]\\A]"),
+            ("an unterminated class is a literal", "[ab", "[[aA][bB]"),
+            (
+                "nothing outside ASCII is touched",
+                "\u{142}\u{105}ka",
+                "\u{142}\u{105}[kK][aA]",
+            ),
+        ];
+
+        for (label, pattern, expected) in rows {
+            assert_eq!(
+                fold_case(pattern),
+                *expected,
+                "{label}: `{pattern}` folded wrongly"
+            );
+        }
+    }
+
+    #[test]
+    fn a_macro_opening_is_still_recognised_before_anything_is_folded() {
+        // `guard` tests the *unfolded* opening, so the order of the two is what
+        // keeps a pattern starting with `[attr]` out of git's macro branch —
+        // where the line is not a pattern at all and the `-text` it carries is
+        // simply absent. Folding first would spell it `[attrATTR]`, which no
+        // longer opens with the six characters git looks for, and the prefix
+        // would never be added.
+        assert_eq!(
+            lines("[attr]odd.env\n"),
+            [
+                "**/[attrATTR][oO][dD][dD].[eE][nN][vV] -text diff=git-xcrypt",
+                "**/[attrATTR][oO][dD][dD].[eE][nN][vV]/** -text diff=git-xcrypt",
+            ]
+        );
     }
 
     /// One attributes source: where it lives, relative to the repository root.

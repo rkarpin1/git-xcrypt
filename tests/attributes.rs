@@ -341,6 +341,163 @@ fn a_forgotten_sync_fails_the_gate_and_running_it_reaches_the_whole_subtree() {
     repo.assert_status_clean();
 }
 
+/// A secret worth spelling out, so a plaintext blob is recognisable on sight.
+const SECRET: &[u8] = b"AWS_SECRET=hunter2\n";
+
+/// Paths spelled in a case no line of `.git-xcrypt` uses, and what selects them.
+///
+/// One spelling per directory, deliberately: on APFS and on NTFS `mkdir secrets`
+/// and `mkdir Secrets` make **one** directory, so a fixture holding two spellings
+/// of the same name cannot exist on two of the three platforms. One file whose
+/// spelling differs from the pattern's is enough, and it is portable.
+const OTHER_SPELLINGS: &[&str] = &[
+    // The directory pattern `secrets/`, reached through a directory whose name
+    // is spelled differently. `.txt` rather than `.env` so nothing but the
+    // directory pattern can select it.
+    "SEcrets/db.txt",
+    // The floating pattern `*.env`, reached through the extension.
+    "top.ENV",
+    // …and at depth, so the `**/` the renderer adds is exercised too.
+    "app/nested/Deploy.Env",
+];
+
+#[test]
+fn a_pattern_reaches_every_ascii_spelling_of_a_name_and_the_rendered_line_keeps_up() {
+    // Open decision 13, settled on 2026-08-05: pattern matching folds ASCII case,
+    // unconditionally. The measured failure it closes: `.git-xcrypt` declares
+    // `secrets/`, the user creates `Secrets/db.env`, and on APFS and NTFS those
+    // are *one* directory — `cd secrets` enters `Secrets`, `ls` shows a single
+    // entry, and there is no way to see the mistake. The filter left the file
+    // alone, `git add` exited 0 and `AWS_SECRET=hunter2` went into the object
+    // database in the clear.
+    //
+    // Both axes are asserted for every spelling, because closing one alone opens
+    // the other. Selection folding without the rendering folding means the filter
+    // encrypts a path the managed `-text` does not reach — measured elsewhere in
+    // this file as 34 `CR` bytes eaten out of a ciphertext and the file
+    // unrecoverable at checkout.
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config(
+        "secrets/\n\
+         *.env\n\
+         !secrets/README.md\n\
+         \u{142}\u{105}ka/\n",
+    );
+    repo.xcrypt_ok(["sync"]);
+
+    for path in OTHER_SPELLINGS {
+        repo.write_file(path, SECRET);
+    }
+    // The negation, spelled differently too: a hole punched in a declaration has
+    // to stay a hole whichever way the file is spelled, or the file the user
+    // deliberately kept readable becomes unreadable instead.
+    repo.write_file("SEcrets/README.MD", b"nothing secret here\n");
+    // The name next door, which no pattern reaches in any spelling.
+    repo.write_file("notsecrets/a.txt", b"nothing secret here\n");
+    // The documented boundary: folding is ASCII, exactly as far as git folds.
+    // Measured on git 2.55 with `core.ignorecase=true` — `łąka/**` matches
+    // neither `ŁĄKA/a.env` nor `Łąka/a.env`. It cannot be pushed further from
+    // here either: `.gitattributes` matches bytes, so `[łŁ]` is a set of four
+    // bytes rather than two characters and matches no spelling at all. This row
+    // pins the boundary so nobody closes it by accident on one side only.
+    repo.write_file(
+        "\u{141}\u{104}KA/a.env.txt",
+        b"outside the ASCII boundary\n",
+    );
+    repo.commit_all("one file per spelling");
+    repo.assert_status_clean();
+
+    for path in OTHER_SPELLINGS {
+        assert!(
+            repo.blob_is_encrypted(path),
+            "{path}: a declared path spelled in another case was stored in the \
+             clear, which is the whole failure open decision 13 closed"
+        );
+        assert!(
+            !repo.object_exists_for(SECRET),
+            "{path}: the plaintext of a declared secret reached the object database"
+        );
+    }
+    assert!(
+        !repo.blob_is_encrypted("SEcrets/README.MD"),
+        "a negation stopped applying because the file is spelled differently"
+    );
+    assert!(
+        !repo.blob_is_encrypted("notsecrets/a.txt"),
+        "the folded pattern reached past what it declares"
+    );
+    assert!(
+        !repo.blob_is_encrypted("\u{141}\u{104}KA/a.env.txt"),
+        "folding reached beyond ASCII, which git does not do and \
+         `.gitattributes` cannot express"
+    );
+
+    // The second axis. `core.ignorecase=false` first, and that is what makes this
+    // half mean anything: with it true git folds the managed section's patterns
+    // itself, so a renderer that emits nothing of the sort still answers `unset`
+    // and the assertion proves nothing. False leaves the rendered spelling as the
+    // only thing that can reach these paths — measured on git 2.55, a plain
+    // `**/secrets/**` answers `unspecified` for `SEcrets/db.txt` there.
+    //
+    // Then true, because the rendered line must not depend on a setting that is
+    // not versioned and that git decides for itself by probing the filesystem.
+    for ignore_case in ["false", "true"] {
+        repo.set_config("core.ignorecase", ignore_case);
+
+        for path in OTHER_SPELLINGS {
+            assert_eq!(
+                repo.check_attr("filter", path),
+                "git-xcrypt",
+                "{path}: with core.ignorecase={ignore_case} git would not run the \
+                 filter for a path the filter encrypts"
+            );
+            assert_eq!(
+                repo.check_attr("text", path),
+                "unset",
+                "{path}: with core.ignorecase={ignore_case} the rendered line does \
+                 not reach a path the filter encrypts, so git may convert its \
+                 ciphertext and destroy it"
+            );
+            assert_eq!(
+                repo.check_attr("diff", path),
+                "git-xcrypt",
+                "{path}: with core.ignorecase={ignore_case} `git diff` would show \
+                 ciphertext for a path the filter encrypts"
+            );
+        }
+
+        assert_eq!(
+            repo.check_attr("text", "SEcrets/README.MD"),
+            "unspecified",
+            "with core.ignorecase={ignore_case} a file stored in the clear by a \
+             negation is carrying `-text`"
+        );
+        assert_eq!(
+            repo.check_attr("text", "notsecrets/a.txt"),
+            "unspecified",
+            "with core.ignorecase={ignore_case} the rendered line reaches past \
+             what the filter encrypts"
+        );
+        assert_eq!(
+            repo.check_attr("text", "\u{141}\u{104}KA/a.env.txt"),
+            "unspecified",
+            "with core.ignorecase={ignore_case} the rendered line folds beyond \
+             ASCII while the filter does not, so a file stored in the clear is \
+             carrying `-text`"
+        );
+    }
+    repo.set_config("core.ignorecase", "false");
+
+    // And the round trip, because an encrypted path is only encrypted if it comes
+    // back byte for byte.
+    for path in OTHER_SPELLINGS {
+        repo.recheckout(path);
+        repo.assert_worktree_eq(path, SECRET);
+    }
+    repo.assert_status_clean();
+}
+
 /// 2 MB whose bytes cover the whole range.
 ///
 /// The plaintext shape barely matters — what git would convert is the

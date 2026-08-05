@@ -584,17 +584,25 @@ fn refuse_if_the_tree_moved(repo: &Repo, config: &Config, before: &[Vec<u8>]) ->
 /// APFS, and NTFS with `core.ignorecase`, which git sets by default on both —
 /// those two can drift apart with **no signal anywhere**: after `mv secrets
 /// Secrets` the index still says `secrets/db.env`, `git status` is clean, and
-/// the walk selects nothing, because selection matches bytes. Measured on git
-/// 2.55 before this existed: `lock --yes` printed "no file here is declared for
-/// encryption", exited 0, deleted the key, and left `hunter2-secret` readable in
-/// the working tree. The interactive path did the same after a typed `yes`.
+/// the walk used to select nothing, because selection matched bytes. Measured on
+/// git 2.55 before this existed: `lock --yes` printed "no file here is declared
+/// for encryption", exited 0, deleted the key, and left `hunter2-secret`
+/// readable in the working tree. The interactive path did the same after a typed
+/// `yes`.
+///
+/// **Selection folds ASCII case since 2026-08-05, and this gate stays.** The
+/// walk now recognises `Secrets/db.env` as declared, so the refusal usually
+/// comes earlier and from a different sentence — "declared, and not tracked
+/// under this name". That closes one route into the state, not the state: the
+/// index and the directory can still disagree over Unicode normalisation, over
+/// a spelling outside ASCII, or over a path the walk cannot read at all.
 ///
 /// Asked last, after the encryption pass, because before it every declared path
 /// legitimately holds plain text — that is what the pass is for. Asked of the
-/// content rather than of the two spellings, which is what keeps it free of the
-/// open question about what a pattern means on such a filesystem: whatever the
-/// answer to that turns out to be, a command that is one statement away from
-/// "the key is gone" must not make it over a file it can still read.
+/// content rather than of the two spellings, which is what keeps it independent
+/// of what a pattern means on such a filesystem: whatever that answer is, a
+/// command that is one statement away from "the key is gone" must not make it
+/// over a file it can still read.
 ///
 /// A declared entry with nothing at its path is not a finding: a staged deletion
 /// leaves the index naming a file that is gone, and there is no plain text in a

@@ -25,9 +25,15 @@
 //! Measured on git 2.55/APFS — a file added as `secret.env` and renamed to
 //! `SECRET.env` reads as untracked here, and an NFD name on disk does not match
 //! the NFC name in the index. Both callers notice when a name they know is
-//! tracked does not match. It is the same underlying gap as the
-//! `core.ignorecase` question recorded against `S-02`, and closing *that* is a
-//! decision about what a pattern means, not one this module can take.
+//! tracked does not match. **This gap survived open decision 13**, settled on
+//! 2026-08-05: pattern matching now folds ASCII case, so a *declaration* reaches
+//! every spelling of a name — but the question here is a different one, whether
+//! an index entry and a directory entry are the same file, and neither the index
+//! nor `read_dir` folds anything. What changed is which refusal fires first: the
+//! walk below now recognises `Secrets/db.env` as declared, so `lock` stops on
+//! "declared and not tracked under this name" rather than on "the index names a
+//! path this walk never saw". Same state, same exit code, and the message now
+//! names the spelling on disk, which is the one the user has to act on.
 //!
 //! **Correction, 2026-08-05: the consequences were not "on the safe side for
 //! `lock`, which then refuses rather than proceeds", as this comment claimed
