@@ -121,6 +121,12 @@ fn refuse_bad_destination(repo: &Repo, destination: &Path, force: bool) -> Resul
 /// the usual `0755` — the file itself is `0600` either way, but a directory
 /// anyone can list is one more thing a user did not ask for. Directories that
 /// already exist keep whatever permissions their owner chose.
+///
+/// On Windows neither number applies: there is no mode to set, so the directory
+/// and the key file both inherit the ACL of wherever the user pointed this
+/// command. That is the limitation recorded in `README.md` §Known limitations,
+/// and it is why the message there tells a Windows user to pick the directory
+/// deliberately.
 fn create_key_directory(path: &Path) -> Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);

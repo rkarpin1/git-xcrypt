@@ -84,7 +84,9 @@ Make a copy the moment you run `init`:
 git-xcrypt export-key ~/backup/git-xcrypt-my-project.key
 ```
 
-The file is written with mode `0600`. Where it should **not** go:
+On Unix the file is written with mode `0600`. **On Windows nothing narrows it**
+— it inherits whatever its directory hands down, so there the directory you pick
+*is* the protection; see Known limitations. Where it should **not** go:
 
 - **not inside the repository or any other checkout of it** — `export-key`
   refuses those outright, because one `git add -A` would commit the key;
@@ -233,6 +235,15 @@ note, not a finding.
 - A file with mixed line endings does not survive the round trip: normalisation
   is lossy, so such a file comes back changed. Git warns about the same thing
   through `core.safecrlf`; whether to reproduce that warning is still open.
+- **Key files are only given permissions on Unix.** `init` and `export-key`
+  create them with mode `0600` there, before a single byte of key material
+  reaches the file. On Windows nothing sets permissions at all: the file
+  inherits the ACL of the directory it is created in, and narrowing it would
+  need `unsafe` platform bindings, which this crate forbids outright. The
+  repository's own key lives in `.git/` and is therefore as protected as the
+  rest of your checkout — but an exported key is exactly as protected as the
+  directory you chose for it, so on Windows choose one only your account can
+  read.
 - **There is no key backup mechanism.** Keeping a copy of the key file is
   entirely your job, and losing it costs the whole history of secrets. See "The
   key file is the only copy" above; this is a decided scope boundary for v0.1,

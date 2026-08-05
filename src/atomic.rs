@@ -88,10 +88,14 @@ pub fn write(path: &Path, contents: &[u8]) -> Result<()> {
 /// the target's permissions are **not** inherited — a key file that was somehow
 /// left world readable must not stay that way.
 ///
-/// On Windows there is no mode to set, so the file inherits the directory ACL.
-/// That is the protection git gives `.git/config`, and `.git/` is where the
-/// repository key lives, but it is weaker than `0600` and is recorded as such in
-/// `context/foundation/zalozenia.md`.
+/// **On Windows there is no mode to set, so nothing here narrows anything**: the
+/// file inherits the ACL of the directory it is created in. For the repository's
+/// own key that is the protection git gives `.git/config`, which is the same
+/// protection as the rest of the checkout. For `export-key` the user picks the
+/// directory, so the directory *is* the protection. Weaker than `0600` either
+/// way, and recorded as a limitation in `README.md` §Known limitations and in
+/// `context/foundation/zalozenia.md` — the founding document claimed owner-only
+/// ACLs here until 2026-08-05, which was never true of any build.
 ///
 /// # Errors
 ///
