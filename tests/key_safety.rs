@@ -209,6 +209,53 @@ fn the_key_survives_every_route_out_of_the_repository_that_ordinary_work_takes()
              database"
         );
     }
+
+    // --- And the driver's own decryption is not a way around the refusal. ---
+    //
+    // `textconv` normally receives plaintext, because git materialises both
+    // sides through smudge first — measured in S-05. A `-filter` line below the
+    // managed section switches smudge off while leaving the diff driver
+    // registered, so the driver receives *ciphertext* and decrypts it itself.
+    // Measured on git 2.55 before the fix: the refusal was asked only of the
+    // bytes read from disk, ciphertext is not a key file, and `git log -p`
+    // printed the decrypted master key to stdout with exit code 0.
+    let mut attributes = repo.worktree_bytes(".gitattributes");
+    attributes.extend_from_slice(b"secrets/** -filter\n");
+    repo.write_file(".gitattributes", &attributes);
+    repo.recheckout("secrets/notes.txt");
+    assert!(
+        !repo.worktree_bytes("secrets/notes.txt").starts_with(&raw),
+        "the fixture no longer reproduces the shape it exists to catch: smudge \
+         still ran, so the driver would receive plaintext anyway"
+    );
+
+    for arguments in [
+        vec!["--no-pager", "log", "-p"],
+        vec!["--no-pager", "show", "HEAD"],
+    ] {
+        let output = repo.git(&arguments);
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains(&material),
+            "`git {}` printed the repository key out of its own ciphertext",
+            arguments.join(" ")
+        );
+    }
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_git-xcrypt"))
+        .current_dir(repo.path())
+        .args(["diff", "secrets/notes.txt"])
+        .output()
+        .expect("could not run git-xcrypt");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "the driver did not refuse the ciphertext of a key file:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "a key reached stdout through the driver's own decryption"
+    );
 }
 
 #[test]

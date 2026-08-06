@@ -213,28 +213,6 @@ mod tests {
     }
 
     #[test]
-    fn an_encrypted_key_file_is_refused_after_decryption_too() {
-        // The check on the way in sees ciphertext for a key file that was
-        // committed under a declared pattern, and ciphertext is not a key file.
-        // The decrypting branch is reached exactly when the smudge filter did
-        // not run first — measured on git 2.55: a `secrets/** -filter` line
-        // below the managed section left the working tree holding ciphertext,
-        // and `git log -p` printed the decrypted master key to stdout. The
-        // refusal has to be asked of what is about to be printed, not only of
-        // what was read.
-        let exported = crate::keyfile::encode_portable(&key());
-        let blob =
-            crate::crypto::encrypt(&key(), 0, exported.as_bytes()).expect("encryption succeeds");
-
-        let error = convert(Some(&key()), b"secrets/backup.key", &blob).expect_err("must refuse");
-        assert_eq!(error.exit_code(), crate::exit::CONFIG);
-        assert!(
-            error.to_string().contains("export-key"),
-            "the refusal must say where a key is allowed to go: {error}"
-        );
-    }
-
-    #[test]
     fn a_key_file_is_refused_although_it_carries_no_data_magic() {
         // Both shapes. Neither starts with the data magic, so without this the
         // pass-through branch would print the repository's master key.
