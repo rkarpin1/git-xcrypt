@@ -93,13 +93,44 @@ On Unix the file is written with mode `0600`. **On Windows nothing narrows it**
 - **not inside the repository or any other checkout of it** — `export-key`
   refuses those outright, because one `git add -A` would commit the key;
 - **not into the git directory** — also refused;
-- **not into a CI log, a terminal scrollback or a shell redirect.** The key is
-  never printed to `stdout`; keep it that way.
+- **not into a CI log or a terminal scrollback.** `export-key --stdout` refuses
+  a terminal for exactly that reason. A shell redirect it cannot police: see
+  below.
 
 Where it should go is somewhere that survives losing the machine and that you
 trust with a plaintext secret: a password manager, an encrypted backup volume,
 or an offline device. Treat it exactly as you would treat the secrets it opens —
 because anyone holding it can read all of them, in every commit.
+
+### Handing the key to CI, without a file
+
+A runner's secret arrives as an environment variable, and writing it to disk
+means remembering to delete it from a machine that may not outlive the job. The
+two ends meet without a file:
+
+```sh
+git-xcrypt export-key --stdout | pbcopy      # paste into the secret store
+git-xcrypt export-key --stdout | gh secret set GITXCRYPT_KEY
+```
+
+```yaml
+- run: git-xcrypt unlock --key "$GITXCRYPT_KEY"
+  env:
+    GITXCRYPT_KEY: ${{ secrets.GITXCRYPT_KEY }}
+```
+
+Both forms carry the same text a key file holds, so the header still verifies
+the material behind it: a key truncated by a clipboard or a variable is refused,
+not installed.
+
+**Three costs, all yours to accept knowingly.** `--key` puts the material in
+`argv`, so it is visible to `ps` for as long as the command runs — measured on
+macOS: `ps -ww -o command -p <pid>` prints it verbatim — and an interactive
+shell records it in `~/.zsh_history` for good. The command says so on `stderr`
+every time. And `export-key --stdout > somewhere` is not checked at all: a
+process cannot portably learn the path behind its own file descriptor, so none
+of the refusals that keep a key out of the working tree apply to a redirect.
+For a file on disk, use `git-xcrypt export-key <path>`, which does check.
 
 `git-xcrypt lock` asks for a typed `yes` and prints the `key_id` before deleting
 the key, and refuses outright when declared files have uncommitted changes.
@@ -112,8 +143,8 @@ Those are speed bumps in front of the cliff. They are not a backup.
 | `init` | Generate the repository key, register the filter and the diff driver, create `.git-xcrypt`, write the managed `.gitattributes` section. |
 | `sync` | Regenerate the per-pattern `.gitattributes` lines. `--check` reports staleness through exit code 1 instead of writing. |
 | `status` | Report whether your declarations are actually enforced, scanning the whole reachable history. `--fix` re-stages declared files the index holds in the clear. Exits `2` when the setup does not enforce anything, `5` on a finding, `6` when it could not tell. |
-| `export-key` | Write the repository key to a file outside the working tree. This is also how you make the backup nothing else makes — see above. |
-| `unlock` | Decrypt the working tree and register the filter, installing a key file first if one is given. `--key-only` puts the key in place and repairs the setup without decrypting anything. |
+| `export-key` | Write the repository key to a file outside the working tree. This is also how you make the backup nothing else makes — see above. `--stdout` pipes it instead, for a secret store; refused when standard output is a terminal. |
+| `unlock` | Decrypt the working tree and register the filter, installing a key first if one is given — as a path, or as `--key <text>` for a CI secret. `--key-only` puts the key in place and repairs the setup without decrypting anything. |
 | `lock` | Encrypt the working tree and delete the key. Interactive by default; `--yes` skips the question but not the refusal on uncommitted changes. |
 | `diff`, `process` | Registered by `init` for git to call. Not meant to be run by hand. |
 

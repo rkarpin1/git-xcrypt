@@ -5,8 +5,16 @@
 //! one redirect into the repository directory, is all it takes". Three refusals
 //! close the routes that do not need a compromised machine:
 //!
-//! * the key never reaches `stdout` — not here and not anywhere else, so no
-//!   redirect and no CI log can capture it;
+//! * the key reaches `stdout` only when `--stdout` asks for it, and never when
+//!   `stdout` is a terminal — a key in the scrollback outlives the window, the
+//!   multiplexer's buffer and often the session log. Added 2026-08-06 for the
+//!   one workflow the file form cannot serve: piping the key straight into a
+//!   secret store (`| pbcopy`, `| gh secret set …`) without it ever touching
+//!   the disk. What that flag cannot police is a shell redirect: `--stdout >
+//!   secrets/key.txt` writes where the refusals below would have said no,
+//!   because a process cannot portably learn the path behind its own file
+//!   descriptor. Said out loud in the command's own warning and in the README,
+//!   because it is the FR-007 leak with the guard rail removed by hand;
 //! * a destination inside the working tree is refused outright, because that is
 //!   one `git add -A` away from a commit;
 //! * an existing file is refused unless `--force`, so a mistyped path cannot
@@ -28,6 +36,64 @@ pub struct Report {
     pub key_id: [u8; KEY_ID_LEN],
     /// Where it landed, resolved the way the refusal check saw it.
     pub path: PathBuf,
+}
+
+/// Writes the repository key to `stdout`, for piping into a secret store.
+///
+/// Refuses a terminal, and only a terminal: everything else is a pipe or a
+/// redirect the caller chose deliberately. The refusal is the cheap half of the
+/// bargain — see the module comment for the half no process can enforce.
+///
+/// # Errors
+///
+/// [`Error::Config`] when `stdout` is a terminal, [`Error::NoKey`] when the
+/// repository has no key, [`Error::Io`] when the write fails.
+pub fn to_stdout(repo: &Repo) -> Result<[u8; KEY_ID_LEN]> {
+    use std::io::IsTerminal as _;
+    to_writer(
+        repo,
+        &mut std::io::stdout().lock(),
+        std::io::stdout().is_terminal(),
+    )
+}
+
+/// [`to_stdout`], with the destination and the terminal answer as arguments.
+///
+/// Split for the same reason as `gitconfig::global_attributes_file_for`: the
+/// refusal this function exists for fires only when the destination is a
+/// terminal, and a test cannot portably arrange one — a pty is a Unix mechanism
+/// and this rule has to hold on all three platforms. Passing the answer in
+/// makes both arms reachable from anywhere, which is worth more than a guard
+/// that runs on one platform out of three.
+///
+/// # Errors
+///
+/// As [`to_stdout`].
+fn to_writer(
+    repo: &Repo,
+    out: &mut impl std::io::Write,
+    destination_is_a_terminal: bool,
+) -> Result<[u8; KEY_ID_LEN]> {
+    // Before the key is loaded, for the same reason as the destination checks:
+    // a refusal must not be reached with key material already in memory.
+    if destination_is_a_terminal {
+        return Err(Error::Config(
+            "refusing to print the key to a terminal: it would stay in the \
+             scrollback, in your multiplexer's buffer and in any session log.\n\
+             Pipe it somewhere (`git-xcrypt export-key --stdout | pbcopy`), or \
+             write a file with `git-xcrypt export-key <path>`."
+                .into(),
+        ));
+    }
+
+    let key = repo.load_key()?;
+    let key_id = key.key_id();
+    // The same text the file form writes, so one format round-trips through
+    // both routes and the header keeps verifying the material behind it.
+    let exported = keyfile::encode_portable(&key);
+    out.write_all(exported.as_bytes())?;
+    out.flush()?;
+    Ok(key_id)
 }
 
 /// Writes the repository key to `destination`.
@@ -238,5 +304,40 @@ mod tests {
 
         run(&repo, &path, true).expect("--force must replace it");
         assert!(keyfile::read_portable(&path).is_ok());
+    }
+
+    /// Both arms of the one refusal a test cannot arrange from outside.
+    ///
+    /// A terminal needs a pty, which is a Unix mechanism, and this rule has to
+    /// hold on all three platforms — so the answer arrives as an argument. The
+    /// negative arm carries as much weight as the positive one: refusing a pipe
+    /// would break the only workflow the flag exists for.
+    #[test]
+    fn the_key_goes_to_a_pipe_and_never_to_a_terminal() {
+        let dir = init_repo();
+        let repo = Repo::discover(dir.path()).expect("discovery");
+        crate::commands::init::run(&repo).expect("init must succeed");
+
+        let mut piped: Vec<u8> = Vec::new();
+        let key_id = to_writer(&repo, &mut piped, false).expect("a pipe must be written to");
+        let text = String::from_utf8(piped).expect("an export is text");
+        assert!(
+            text.contains(&crate::format_key_id(&key_id)),
+            "the export must name the key it holds: {text}"
+        );
+        // The one format, so a key piped out reads back through the same parser
+        // a file goes through — the header still verifies the material.
+        let parsed = keyfile::decode_portable(&text).expect("the export must parse");
+        assert_eq!(parsed.key_id(), key_id);
+
+        let mut to_a_terminal: Vec<u8> = Vec::new();
+        let refused = to_writer(&repo, &mut to_a_terminal, true)
+            .expect_err("a terminal destination must be refused");
+        assert_eq!(refused.exit_code(), crate::exit::CONFIG);
+        assert!(to_a_terminal.is_empty(), "the refusal still wrote the key");
+        assert!(
+            refused.to_string().contains("scrollback"),
+            "the refusal must say why, or it reads as a bug: {refused}"
+        );
     }
 }

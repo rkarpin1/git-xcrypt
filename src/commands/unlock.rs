@@ -71,6 +71,26 @@ pub struct Report {
     pub warnings: Vec<String>,
 }
 
+/// Where the key comes from, when one is offered at all.
+///
+/// A type rather than two `Option`s so the two cannot both be set, and so the
+/// call site reads as the choice it is. Both go through the same parser and the
+/// same refusals; only the reading differs.
+#[derive(Debug, Clone, Copy)]
+pub enum KeySource<'a> {
+    /// A file written by `export-key`.
+    File(&'a Path),
+    /// The text of such a file, handed over directly.
+    ///
+    /// **Visible in the process list for as long as the command runs, and kept
+    /// for ever in the shell's history** — measured on macOS: `ps -ww -o command
+    /// -p <pid>` prints the material verbatim. That is the price of the one
+    /// thing a file cannot do, which is arrive from a CI secret without ever
+    /// being written to disk, and it is the caller's to pay knowingly. The
+    /// binary says so on `stderr` every time.
+    Material(&'a str),
+}
+
 /// Unlocks `repo`, optionally installing the key at `key_source` first.
 ///
 /// With `key_only` the working tree is left exactly as it is: the key goes in,
@@ -90,10 +110,16 @@ pub struct Report {
 /// from the repository's own key file and not from anything a header said.
 /// [`Error::Format`] when a file in the working tree belongs to another key.
 /// [`Error::Io`] on a read or write failure.
-pub fn run(repo: &Repo, key_source: Option<&Path>, key_only: bool) -> Result<Report> {
+pub fn run(repo: &Repo, key_source: Option<KeySource<'_>>, key_only: bool) -> Result<Report> {
     let key = match key_source {
-        Some(path) => {
-            let key = keyfile::read_portable(path)?;
+        Some(source) => {
+            let key = match source {
+                KeySource::File(path) => keyfile::read_portable(path)?,
+                // The same parser, so the header still verifies the material
+                // behind it: a key truncated on its way through a clipboard or
+                // a CI variable is refused rather than installed.
+                KeySource::Material(text) => keyfile::decode_portable(text)?,
+            };
             // Asked before anything is written: a refusal that has already
             // installed a key has not refused.
             refuse_on_conflict(repo, &key)?;

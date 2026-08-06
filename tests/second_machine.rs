@@ -300,3 +300,111 @@ fn a_clone_of_a_repository_that_never_committed_its_attributes_still_encrypts() 
         "the plaintext the clone committed is an object in the remote"
     );
 }
+
+/// The route a CI job takes, where the key must never reach the disk.
+///
+/// A file is the wrong shape for a runner: the secret arrives as an environment
+/// variable, and writing it out means remembering to delete it from a machine
+/// that may not outlive the job. So the two ends meet without a file —
+/// `export-key --stdout` pipes the key into whatever holds secrets, and
+/// `unlock --key` takes the same text back.
+///
+/// **One text, one parser.** The stdout form emits exactly what the file form
+/// writes, so the header still verifies the material behind it and a key
+/// truncated by a clipboard or a variable is refused rather than installed.
+/// Proved here by truncating one, not by trusting the claim.
+///
+/// The cost of `--key` is real and measured — the material is visible in the
+/// process list while the command runs, and the shell records it — so the
+/// command says so on `stderr` every time. That sentence is asserted: a warning
+/// nobody prints is not a warning.
+#[test]
+fn a_key_travels_from_stdout_to_the_command_line_without_touching_the_disk() {
+    let first = TestRepo::init();
+    first.init_xcrypt();
+    first.write_xcrypt_config("secrets/\n");
+    first.xcrypt_ok(["sync"]);
+    first.write_file("secrets/db.env", FIRST);
+    first.commit_all("a secret");
+
+    let remote = BareRemote::new();
+    first.push_to(&remote, "main");
+
+    // `xcrypt` captures stdout, so this is a pipe — which is the only
+    // destination the flag accepts. The terminal arm cannot be arranged
+    // portably and is a unit test beside the code instead.
+    let exported = first.xcrypt_ok(["export-key", "--stdout"]);
+    let material = String::from_utf8(exported.stdout).expect("an export is text");
+    assert!(
+        material.starts_with("git-xcrypt-key-v1 "),
+        "stdout must carry the same text the file form writes: {material:?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&exported.stderr).contains(material.trim()),
+        "the key was echoed to stderr as well, so a CI log would capture it"
+    );
+
+    // Damaged in transit, which is what a clipboard or a variable does — two
+    // shapes, because they are caught by two different checks and only the
+    // second one needs the header.
+    let clone = remote.clone_to();
+    let (header, body) = material
+        .split_once('\n')
+        .expect("an export is a header and a key");
+
+    // Cut short: the material no longer decodes to a key-sized secret.
+    let truncated = format!("{header}\n{}=\n", &body.trim()[..body.trim().len() - 3]);
+    // Whole, valid, and someone else's: only the header can tell, because the
+    // material itself is a perfectly good key — just not this repository's.
+    let swapped = {
+        let stranger = TestRepo::init();
+        stranger.init_xcrypt();
+        let other = String::from_utf8(stranger.xcrypt_ok(["export-key", "--stdout"]).stdout)
+            .expect("an export is text");
+        let other_body = other
+            .split_once('\n')
+            .expect("an export is a header and a key")
+            .1;
+        format!("{header}\n{other_body}")
+    };
+
+    // The expected wording is the assertion, not just the code: both shapes end
+    // in `4`, and a working tree full of ciphertext would refuse the swapped key
+    // through `refuse_foreign_keys` even if nothing had looked at the header. So
+    // each shape has to be caught by the check it exists to exercise.
+    for (shape, offered, because) in [
+        ("truncated", &truncated, "base64"),
+        ("swapped", &swapped, "in transit"),
+    ] {
+        let refused = clone.xcrypt(["unlock", "--key", offered]);
+        let complaint = String::from_utf8_lossy(&refused.stderr).into_owned();
+        assert_eq!(
+            refused.status.code(),
+            Some(4),
+            "a {shape} key was accepted:\n{complaint}"
+        );
+        assert!(
+            complaint.contains(because),
+            "a {shape} key was refused, but by something other than the check              that should have caught it — expected {because:?}:\n{complaint}"
+        );
+        assert!(
+            !clone.path().join(".git/git-xcrypt/keys/default").exists(),
+            "a refused {shape} key was installed anyway"
+        );
+    }
+
+    // And the whole one opens the clone.
+    let unlocked = clone.xcrypt_ok(["unlock", "--key", &material]);
+    let said = String::from_utf8_lossy(&unlocked.stderr).into_owned();
+    clone.assert_worktree_eq("secrets/db.env", FIRST);
+    clone.assert_status_clean();
+    assert!(
+        said.contains("process list") && said.contains("shell"),
+        "the command did not name what handing it a key on the command line \
+         costs:\n{said}"
+    );
+    assert!(
+        !said.contains(material.trim()),
+        "the warning printed the key it was warning about"
+    );
+}

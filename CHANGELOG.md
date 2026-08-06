@@ -33,6 +33,14 @@ changed anything from.
 - **Commands** `init`, `sync`, `status`, `export-key`, `unlock`, `lock`, plus
   `diff` and `process`, which `init` registers for git to call.
   See the table in `README.md`.
+- **A key can reach CI without touching the disk.** `export-key --stdout` pipes
+  it into a secret store and refuses a terminal, where it would survive in the
+  scrollback; `unlock --key <text>` takes the same text back. Both carry the
+  format a key file holds, so the header keeps verifying the material behind it.
+  The costs are named on `stderr` at every use and in `README.md`: `--key` is
+  visible to `ps` while the command runs and is recorded by an interactive
+  shell, and a redirect out of `--stdout` escapes the checks that keep a key out
+  of the working tree.
 - **`status` as a CI gate.** It scans the whole reachable history for
   declared paths stored in the clear, resolves git's own `filter` and
   `text`/`eol` attributes for every declared path the way `git check-attr` does,

@@ -37,11 +37,21 @@ enum Command {
 
     /// Write the repository key to a file, to carry it to another machine.
     ///
-    /// The destination must be outside this repository's working tree. The key
-    /// is never printed, so redirecting this command's output captures nothing.
+    /// The destination must be outside this repository's working tree. With
+    /// `--stdout` the key goes to standard output instead, for piping straight
+    /// into a secret store — never to a terminal.
     ExportKey {
         /// Where to write the key. Must lie outside the working tree.
-        path: PathBuf,
+        #[arg(required_unless_present = "stdout", conflicts_with = "stdout")]
+        path: Option<PathBuf>,
+
+        /// Print the key to standard output instead of writing a file.
+        ///
+        /// Refused when standard output is a terminal. A shell redirect is
+        /// yours to aim: this cannot see where it points, so the checks that
+        /// keep a key out of the working tree do not apply.
+        #[arg(long)]
+        stdout: bool,
 
         /// Replace the destination if it already exists.
         #[arg(long)]
@@ -55,7 +65,15 @@ enum Command {
     /// file that is already in the clear is left alone.
     Unlock {
         /// A file written by `export-key`. Omit to use the key already here.
-        key: Option<PathBuf>,
+        #[arg(conflicts_with = "key")]
+        path: Option<PathBuf>,
+
+        /// The text of such a file, given directly instead of as a path.
+        ///
+        /// For a CI secret that must never touch the disk. It is visible in the
+        /// process list while this runs, and your shell will remember it.
+        #[arg(long, value_name = "TEXT")]
+        key: Option<String>,
 
         /// Put the key in place and repair the setup, but decrypt nothing.
         ///
@@ -150,8 +168,16 @@ fn main() -> ExitCode {
     match cli.command {
         Command::Init => report(run_init()),
         Command::Sync { check } => run_sync(check),
-        Command::ExportKey { path, force } => report(run_export_key(&path, force)),
-        Command::Unlock { key, key_only } => report(run_unlock(key.as_deref(), key_only)),
+        Command::ExportKey {
+            path,
+            stdout,
+            force,
+        } => report(run_export_key(path.as_deref(), stdout, force)),
+        Command::Unlock {
+            path,
+            key,
+            key_only,
+        } => report(run_unlock(path.as_deref(), key.as_deref(), key_only)),
         Command::Lock { yes } => run_lock(yes),
         Command::Status { fix } => run_status(fix),
         Command::Process => report(commands::process::run()),
@@ -233,8 +259,27 @@ fn run_init() -> Result<()> {
 /// two exports apart. The key itself goes to the file and nowhere else: this
 /// command is the one place the product hands a key over, so `stdout` staying
 /// empty is what makes `git-xcrypt export-key > somewhere` capture nothing.
-fn run_export_key(path: &std::path::Path, force: bool) -> Result<()> {
+fn run_export_key(path: Option<&std::path::Path>, stdout: bool, force: bool) -> Result<()> {
     let repo = Repo::discover_from_cwd()?;
+
+    if stdout {
+        let key_id = commands::export_key::to_stdout(&repo)?;
+        // On `stderr`, so a pipe carries the key and nothing else. Both halves
+        // are said: what just left, and the one check a redirect escapes.
+        eprintln!(
+            "git-xcrypt: wrote key {} to standard output",
+            git_xcrypt::format_key_id(&key_id)
+        );
+        eprintln!(
+            "git-xcrypt: whatever is on the other end of that pipe now holds the only \
+             way back into this repository's history. If you redirected it to a file, \
+             nothing checked where that file is — a path inside the working tree is one \
+             `git add -A` from a commit."
+        );
+        return Ok(());
+    }
+
+    let path = path.expect("clap requires a path unless --stdout is given");
     let report = commands::export_key::run(&repo, path, force)?;
 
     eprintln!(
@@ -253,9 +298,25 @@ fn run_export_key(path: &std::path::Path, force: bool) -> Result<()> {
 ///
 /// The file list goes to `stderr` like everything else. It names paths, which
 /// are not secret — the contents never appear.
-fn run_unlock(key: Option<&std::path::Path>, key_only: bool) -> Result<()> {
+fn run_unlock(path: Option<&std::path::Path>, key: Option<&str>, key_only: bool) -> Result<()> {
     let repo = Repo::discover_from_cwd()?;
-    let report = commands::unlock::run(&repo, key, key_only)?;
+
+    if key.is_some() {
+        // Every time, not once: the cost is paid at each invocation, and a
+        // warning the user has learned to expect is still the only notice they
+        // get that the key is now in two places nobody cleans up.
+        eprintln!(
+            "git-xcrypt: the key was given on the command line, so it is visible in the \
+             process list while this runs and your shell has already recorded it. Clear \
+             that history entry, or pass a file next time."
+        );
+    }
+    let source = match (path, key) {
+        (Some(path), _) => Some(commands::unlock::KeySource::File(path)),
+        (None, Some(text)) => Some(commands::unlock::KeySource::Material(text)),
+        (None, None) => None,
+    };
+    let report = commands::unlock::run(&repo, source, key_only)?;
 
     let key_id = git_xcrypt::format_key_id(&report.key_id);
     if report.key_imported {
