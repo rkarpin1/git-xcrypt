@@ -42,7 +42,7 @@ pub struct Report {
 /// [`Error::Config`] when `.git-xcrypt` is absent or cannot be understood, or
 /// when the managed section in `.gitattributes` has unbalanced markers;
 /// [`Error::Io`] on a read or write failure.
-pub fn run(repo: &Repo, check: bool, ignore_case: bool) -> Result<Report> {
+pub fn run(repo: &Repo, check: bool, rendering: gitattributes::Rendering) -> Result<Report> {
     let config = Config::load(&repo.xcrypt_config_path())?;
     if config.missing {
         return Err(Error::Config(format!(
@@ -51,12 +51,21 @@ pub fn run(repo: &Repo, check: bool, ignore_case: bool) -> Result<Report> {
         )));
     }
 
-    let lines = gitattributes::render_lines(&config, ignore_case);
+    let lines = gitattributes::render_lines(&config, rendering);
     let path = repo.attributes_path();
 
     let outcome = if check {
-        let (existing, wanted) = gitattributes::desired(&path, &lines)?;
-        if existing == wanted {
+        // Any shape this build writes counts as current, not just the one asked
+        // for on this command line. `--check` is a CI gate, and its question is
+        // "does the section still describe the declaration" — a repository that
+        // chose `--per-pattern` has not gone stale by being asked without the
+        // flag, and failing it there would teach the gate's owner to ignore it.
+        // A section that matches *none* of them is what staleness looks like.
+        let current = gitattributes::ACCEPTED.into_iter().any(|rendering| {
+            let lines = gitattributes::render_lines(&config, rendering);
+            gitattributes::desired(&path, &lines).is_ok_and(|(existing, wanted)| existing == wanted)
+        });
+        if current {
             Outcome::UpToDate
         } else {
             Outcome::Stale
@@ -103,24 +112,60 @@ mod tests {
     }
 
     #[test]
-    fn check_reports_staleness_without_writing() {
+    fn only_the_per_pattern_section_can_go_stale() {
+        // The global section is one line that says nothing about the
+        // declaration, so no change to `.git-xcrypt` can make it wrong — which
+        // is exactly why it is the default: `sync` stops being part of the flow.
         let (_dir, repo) = prepared("secrets/\n");
         let before = fs::read_to_string(repo.attributes_path()).expect("attributes");
-
-        let report = run(&repo, true, false).expect("check must succeed");
-
-        assert_eq!(report.outcome, Outcome::Stale);
+        assert_eq!(
+            run(&repo, true, gitattributes::Rendering::Global)
+                .expect("check must succeed")
+                .outcome,
+            Outcome::UpToDate,
+            "a global section was called stale, which it cannot be"
+        );
+        fs::write(repo.xcrypt_config_path(), "secrets/\n*.env\nmore/\n")
+            .expect("changing the declarations");
+        assert_eq!(
+            run(&repo, true, gitattributes::Rendering::Global)
+                .expect("check must succeed")
+                .outcome,
+            Outcome::UpToDate,
+            "a global section went stale over a changed declaration"
+        );
         assert_eq!(
             before,
             fs::read_to_string(repo.attributes_path()).expect("attributes"),
             "--check must never touch the working tree"
         );
 
-        run(&repo, false, false).expect("sync");
+        // Split, and it can. This is the trade `--per-pattern` buys into: the
+        // diff driver stops running for undeclared paths, and `sync` becomes
+        // something to run after every change to the declaration.
+        let per_pattern = gitattributes::Rendering::PerPattern { fold_case: false };
+        run(&repo, false, per_pattern).expect("sync --per-pattern");
         assert_eq!(
-            run(&repo, true, false).expect("check").outcome,
+            run(&repo, true, per_pattern).expect("check").outcome,
             Outcome::UpToDate,
             "the check and the write must not disagree"
+        );
+
+        let before = fs::read_to_string(repo.attributes_path()).expect("attributes");
+        fs::write(
+            repo.xcrypt_config_path(),
+            "secrets/\n*.env\nmore/\nlater/\n",
+        )
+        .expect("changing the declarations again");
+        assert_eq!(
+            run(&repo, true, per_pattern).expect("check").outcome,
+            Outcome::Stale,
+            "a split section did not notice the declaration changing under it"
+        );
+        assert_eq!(
+            before,
+            fs::read_to_string(repo.attributes_path()).expect("attributes"),
+            "--check must never touch the working tree"
         );
     }
 }

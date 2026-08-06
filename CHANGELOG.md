@@ -24,6 +24,12 @@ changed anything from.
   takes effect on the next `git add` with no synchronising command. Registered
   as `filter.git-xcrypt.process` — the long-running protocol, because a process
   per file measured 22× slower.
+- **A managed `.gitattributes` section that cannot go stale.** `init` writes two
+  lines covering the whole repository, neither naming a pattern, so `sync` is
+  not part of the ordinary flow. `sync --per-pattern` splits it per declared
+  pattern for repositories where the diff driver's per-blob cost matters —
+  measured, a 1000-file diff takes 8461 ms against 23 ms — and puts `sync` back
+  into the flow.
 - **`.git-xcrypt`**, a versioned declaration in `.gitignore` syntax, as the one
   source of truth for what is encrypted. Negations, directory patterns and
   anchoring behave as they do in `.gitignore`; after a pattern you may write the

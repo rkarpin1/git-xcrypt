@@ -70,7 +70,7 @@ fn every_declared_attribute_reaches_the_header_the_rendered_line_and_the_round_t
          secrets/dos.ps1      text eol=crlf\n\
          !secrets/README.md\n",
     );
-    repo.xcrypt_ok(["sync"]);
+    repo.xcrypt_ok(["sync", "--per-pattern"]);
 
     let cases = [
         Case {
@@ -253,7 +253,7 @@ fn a_forgotten_sync_fails_the_gate_and_running_it_reaches_the_whole_subtree() {
     let repo = TestRepo::init();
     repo.init_xcrypt();
     repo.write_xcrypt_config("secrets/\n");
-    repo.xcrypt_ok(["sync"]);
+    repo.xcrypt_ok(["sync", "--per-pattern"]);
 
     let checked = repo.xcrypt(["sync", "--check"]);
     assert_eq!(
@@ -291,7 +291,7 @@ fn a_forgotten_sync_fails_the_gate_and_running_it_reaches_the_whole_subtree() {
     );
 
     // --- `sync` closes it. ---------------------------------------------------
-    repo.xcrypt_ok(["sync"]);
+    repo.xcrypt_ok(["sync", "--per-pattern"]);
     assert_eq!(
         repo.xcrypt(["sync", "--check"]).status.code(),
         Some(0),
@@ -378,7 +378,7 @@ fn a_case_spelled_attributes_file_is_read_exactly_where_git_reads_it() {
     let repo = TestRepo::init();
     repo.init_xcrypt();
     repo.write_xcrypt_config("secrets/\n");
-    repo.xcrypt_ok(["sync"]);
+    repo.xcrypt_ok(["sync", "--per-pattern"]);
 
     repo.write_file("secrets/.GITATTRIBUTES", b"* text\n");
     let honoured = repo.check_attr("text", "secrets/db.env") == "set";
@@ -427,7 +427,7 @@ fn a_pattern_reaches_every_ascii_spelling_of_a_name_and_the_rendered_line_keeps_
          !secrets/README.md\n\
          \u{142}\u{105}ka/\n",
     );
-    repo.xcrypt_ok(["sync", "--ignorecase"]);
+    repo.xcrypt_ok(["sync", "--per-pattern", "--ignorecase"]);
 
     for path in OTHER_SPELLINGS {
         repo.write_file(path, SECRET);
@@ -541,76 +541,93 @@ fn a_pattern_reaches_every_ascii_spelling_of_a_name_and_the_rendered_line_keeps_
     repo.assert_status_clean();
 }
 
-/// What the default rendering does, and what it costs — measured, not assumed.
+/// The default section, which is one line and needs no `sync` at all.
 ///
-/// `sync --ignorecase` is opt-in since 2026-08-06, so the plain form is what
-/// almost every repository will hold. Selection still folds unconditionally,
-/// which means the two halves genuinely disagree for a path spelled in another
-/// case, and this is where that disagreement is written down rather than
-/// discovered later.
+/// Settled 2026-08-06. `init` writes `* -text diff=git-xcrypt` beside the
+/// catch-all, and that is the whole managed section: it says nothing about the
+/// declaration, so no change to `.git-xcrypt` can make it wrong and `sync`
+/// stops being something to remember. Which paths are encrypted still takes
+/// effect at once, because the filter reads the declaration itself.
 ///
-/// The good news is the part worth pinning: **nothing is stored in the clear
-/// and nothing is destroyed.** The filter still encrypts the oddly-spelled
-/// path, `text` resolves to `unspecified` rather than `set`, and the measured
-/// table says `unspecified` with no `eol` is one of the shapes git leaves
-/// alone. What is lost is the `diff` driver on that path — `git diff` shows it
-/// as binary — and the `-text` that would have made a foreign `text` line
-/// harmless. On a case-*insensitive* filesystem, where the odd spelling is the
-/// same file, none of this arises at all.
+/// Both halves of the trade are asserted here, because the cost is real and
+/// belongs next to the benefit. `-text` and the diff driver land on **every**
+/// file, declared or not — so git stops normalising line endings anywhere, and
+/// `git diff` spawns the driver per blob. Measured on git 2.55: a 1000-file
+/// diff takes 8461 ms against 23 ms with the driver unregistered, while a
+/// five-file diff takes 72 ms against 21 ms. `sync --per-pattern` is the way
+/// out, and the scenarios above cover that shape.
 #[test]
-fn the_default_rendering_covers_the_spelling_as_written_and_says_so() {
+fn the_default_section_is_one_line_and_needs_no_sync() {
     let repo = TestRepo::init();
     repo.init_xcrypt();
+    // No `sync` anywhere in this test, deliberately.
     repo.write_xcrypt_config("*.env\n");
-    repo.xcrypt_ok(["sync"]);
 
     let section = String::from_utf8(repo.worktree_bytes(".gitattributes")).expect("text");
     assert!(
-        section.contains("*.env -text diff=git-xcrypt"),
-        "the default rendering must spell the pattern the way `.git-xcrypt` \
-         does:\n{section}"
+        section.contains("* filter=git-xcrypt") && section.contains("* -text diff=git-xcrypt"),
+        "the default section is not the two global lines:\n{section}"
     );
     assert!(
-        !section.contains("[eE]"),
-        "the default rendering folded case without being asked:\n{section}"
+        !section.contains("*.env"),
+        "the default section names a declared pattern, so it can go stale:\n{section}"
     );
 
-    // `core.ignorecase=false` is what makes this mean anything: with it true git
-    // folds the rendered pattern itself and the two halves cannot disagree.
+    // `core.ignorecase=false` so the rendered spelling is the only thing that
+    // can reach these paths — the point being that `*` reaches all of them.
     repo.set_config("core.ignorecase", "false");
-    repo.write_file("top.ENV", SECRET);
-    repo.commit_all("a declared path, spelled the other way");
+    repo.write_file("db.env", SECRET);
+    repo.write_file("TOP.ENV", SECRET);
+    repo.write_file("notes.txt", b"an ordinary file\n");
+    repo.commit_all("a declared path, another spelling of it, and neither");
 
-    // Selection folds whatever the rendering says, and that is the half that
-    // keeps the secret out of the object database.
-    assert!(
-        repo.blob_is_encrypted("top.ENV"),
-        "selection stopped folding, which is the failure decision 13 closed"
-    );
+    for path in ["db.env", "TOP.ENV"] {
+        assert!(
+            repo.blob_is_encrypted(path),
+            "{path}: a declared path was stored in the clear"
+        );
+        assert_eq!(
+            repo.check_attr("text", path),
+            "unset",
+            "{path}: the ciphertext is not protected from git's CRLF conversion"
+        );
+        assert_eq!(
+            repo.check_attr("diff", path),
+            "git-xcrypt",
+            "{path}: `git diff` would show ciphertext"
+        );
+    }
     assert!(
         !repo.object_exists_for(SECRET),
         "the plaintext of a declared secret reached the object database"
     );
 
-    // And the cost, named exactly. `unspecified` — not `set` — is why this is a
-    // readability loss and not a data loss: the measured table has git leaving
-    // that shape alone.
-    assert_eq!(
-        repo.check_attr("text", "top.ENV"),
-        "unspecified",
-        "the default rendering reached a spelling it does not contain, so this \
-         test no longer describes what it costs"
+    // The cost, asserted rather than described: an undeclared file gets the
+    // same two attributes. Whoever narrows this later has to change this line
+    // and will read why.
+    assert!(
+        !repo.blob_is_encrypted("notes.txt"),
+        "an undeclared file was encrypted"
     );
     assert_eq!(
-        repo.check_attr("diff", "top.ENV"),
-        "unspecified",
-        "`git diff` coverage changed without this test being told"
+        repo.check_attr("text", "notes.txt"),
+        "unset",
+        "git still normalises an undeclared file, so this test no longer \
+         describes what the global section costs"
+    );
+    assert_eq!(
+        repo.check_attr("diff", "notes.txt"),
+        "git-xcrypt",
+        "the diff driver stopped covering undeclared files, so the measured \
+         cost above no longer applies"
     );
 
-    // The round trip still holds, which is the assertion that separates "less
-    // readable" from "broken".
-    repo.recheckout("top.ENV");
-    repo.assert_worktree_eq("top.ENV", SECRET);
+    // And it round-trips, which is what separates "broader" from "broken".
+    repo.recheckout("db.env");
+    repo.recheckout("TOP.ENV");
+    repo.assert_worktree_eq("db.env", SECRET);
+    repo.assert_worktree_eq("TOP.ENV", SECRET);
+    repo.assert_worktree_eq("notes.txt", b"an ordinary file\n");
     repo.assert_status_clean();
 }
 
@@ -683,7 +700,7 @@ fn a_foreign_text_line_below_the_managed_section_is_refused_before_the_file_is_l
         let repo = TestRepo::init();
         repo.init_xcrypt();
         repo.write_xcrypt_config("secrets/\n");
-        repo.xcrypt_ok(["sync"]);
+        repo.xcrypt_ok(["sync", "--per-pattern"]);
 
         // Committed while the configuration is still healthy, so there is an
         // intact blob to prove nothing damaged it later — and so the index knows
@@ -970,7 +987,7 @@ fn a_text_line_in_the_users_global_attributes_file_is_refused_like_any_other() {
         let repo = TestRepo::init().with_home(home.path());
         repo.init_xcrypt();
         repo.write_xcrypt_config("secrets/\n");
-        repo.xcrypt_ok(["sync"]);
+        repo.xcrypt_ok(["sync", "--per-pattern"]);
 
         // Declared after the last `sync`, so the managed section says nothing
         // about this subtree and the global file is free to.
@@ -1080,7 +1097,7 @@ fn a_linked_worktrees_own_config_is_the_one_that_counts() {
     let repo = TestRepo::init().with_home(home.path());
     repo.init_xcrypt();
     repo.write_xcrypt_config("secrets/\n");
-    repo.xcrypt_ok(["sync"]);
+    repo.xcrypt_ok(["sync", "--per-pattern"]);
     // Declared after the last `sync`, the only state in which a source below the
     // tree can win — see the global-file scenario above.
     repo.write_xcrypt_config("secrets/\nvault/\n");
@@ -1189,7 +1206,7 @@ fn the_shapes_git_leaves_alone_never_provoke_a_refusal() {
     // `binary` on one declared pattern, plain selection on the other, so the
     // managed section renders both `-text` and the `-diff` variant.
     repo.write_xcrypt_config("secrets/\nvault/  binary\n");
-    repo.xcrypt_ok(["sync"]);
+    repo.xcrypt_ok(["sync", "--per-pattern"]);
 
     let mut attributes = repo.worktree_bytes(".gitattributes");
     attributes.extend_from_slice(
@@ -1375,7 +1392,7 @@ fn a_name_with_a_space_is_declared_in_quotes_and_lives_the_whole_cycle() {
          !\"my secrets/README.md\"\n\
          \"!weird.env\"\n",
     );
-    repo.xcrypt_ok(["sync"]);
+    repo.xcrypt_ok(["sync", "--per-pattern"]);
 
     repo.write_file("my secrets/deploy.sh", CRLF);
     repo.write_file("app/my secrets/nested.env", SPACED);
@@ -1467,7 +1484,7 @@ fn a_name_that_ends_in_a_space_is_expressible_at_last() {
     let repo = TestRepo::init();
     repo.init_xcrypt();
     repo.write_xcrypt_config("\"secrets /\"\n");
-    repo.xcrypt_ok(["sync"]);
+    repo.xcrypt_ok(["sync", "--per-pattern"]);
 
     repo.write_file("secrets /db.env", SPACED);
     // The name next door, one byte shorter, which must stay in the clear: a
@@ -1572,7 +1589,7 @@ fn repository_with_one_intact_secret() -> (TestRepo, Vec<u8>, Vec<u8>) {
     repo.xcrypt_ok(["unlock", "--key-only", &key_file.to_string_lossy()]);
     repo.init_xcrypt();
     repo.write_xcrypt_config("secrets/\n");
-    repo.xcrypt_ok(["sync"]);
+    repo.xcrypt_ok(["sync", "--per-pattern"]);
 
     let secret = eight_kilobytes();
     repo.write_file("secrets/store.p12", &secret);

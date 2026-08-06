@@ -69,7 +69,13 @@ pub const CATCH_ALL: &str = "* filter=git-xcrypt";
 /// Within each group the order is the input's, so the section is a pure function
 /// of the configuration and two runs produce the same file.
 #[must_use]
-pub fn render_lines(config: &Config, fold: bool) -> Vec<String> {
+pub fn render_lines(config: &Config, rendering: Rendering) -> Vec<String> {
+    let fold = match rendering {
+        // One line, and nothing about it depends on the declaration — which is
+        // exactly what makes a stale section impossible in this mode.
+        Rendering::Global => return vec![GLOBAL_LINE.to_string()],
+        Rendering::PerPattern { fold_case } => fold_case,
+    };
     let mut lines: Vec<String> = Vec::new();
     let mut suppressed: Vec<String> = Vec::new();
 
@@ -258,6 +264,47 @@ fn translate(pattern: &str, fold: bool) -> Vec<String> {
 /// ordinary characters to git's C-unquoting. It runs *after* [`guard`] for the
 /// opposite reason: `guard` recognises a literal `[attr]` opening, and folding
 /// first would turn it into `[attrATTR]` and hide it.
+/// How the managed section spells what it protects.
+///
+/// Two shapes, and the choice is a trade this project measured rather than
+/// guessed. `Global` is one line covering the whole repository, so a clone works
+/// correctly the moment `init` has run and **`sync` is not part of the flow at
+/// all** — nothing can go stale because nothing depends on the declaration.
+/// `PerPattern` expands the declaration into a line each, which is what large
+/// repositories want: the `diff` driver then runs only for declared paths.
+///
+/// The cost that decides between them is the `diff` driver, and it is a process
+/// per blob — git has no long-running protocol for `textconv` the way it has one
+/// for filters. Measured on git 2.55, 2026-08-06, against the same repository
+/// with the driver unregistered:
+///
+/// | files in the diff | global | per pattern |
+/// | --- | --- | --- |
+/// | 5 | 72 ms | 21 ms |
+/// | 20 | 201 ms | 22 ms |
+/// | 100 | 899 ms | 25 ms |
+/// | 1000 | 8461 ms | 23 ms |
+///
+/// So an everyday diff pays nothing anyone notices, and a thousand-file review
+/// pays eight seconds. `Global` is the default because correctness without a
+/// second command is worth more than the tail; `sync --per-pattern` is the way
+/// out for a repository that lives in the tail.
+///
+/// The other half of `Global` is `-text` on every path, which stops git
+/// normalising line endings anywhere in the repository. That is the price of
+/// needing no `sync`: the same attribute is what keeps git's CRLF conversion
+/// off the ciphertext, and one line cannot say it for some paths only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rendering {
+    /// One line, covering everything. Correct with no `sync` in the flow.
+    Global,
+    /// One line per declared pattern, with ASCII case folded when asked.
+    PerPattern { fold_case: bool },
+}
+
+/// The one line `Rendering::Global` emits after the catch-all.
+const GLOBAL_LINE: &str = "* -text diff=git-xcrypt";
+
 /// [`render_lines`] in whichever spelling the file already uses.
 ///
 /// For the three commands that repair this section without being asked to
@@ -270,12 +317,25 @@ fn translate(pattern: &str, fold: bool) -> Vec<String> {
 /// literal one — the same default `sync` uses when nothing asks otherwise.
 #[must_use]
 pub fn render_lines_as_written(path: &std::path::Path, config: &Config) -> Vec<String> {
-    let folded = render_lines(config, true);
-    if desired(path, &folded).is_ok_and(|(existing, wanted)| existing == wanted) {
-        return folded;
+    for rendering in ACCEPTED {
+        let lines = render_lines(config, rendering);
+        if desired(path, &lines).is_ok_and(|(existing, wanted)| existing == wanted) {
+            return lines;
+        }
     }
-    render_lines(config, false)
+    render_lines(config, Rendering::Global)
 }
+
+/// Every spelling of the section this build considers current.
+///
+/// Order matters only for the tie nobody can hit — a repository declaring
+/// nothing renders the same either way — but it is `Global` first because that
+/// is the default a file with no history of `sync --per-pattern` will match.
+pub const ACCEPTED: [Rendering; 3] = [
+    Rendering::Global,
+    Rendering::PerPattern { fold_case: false },
+    Rendering::PerPattern { fold_case: true },
+];
 
 /// [`fold_case`] when asked, the pattern untouched when not.
 ///
@@ -1552,7 +1612,7 @@ mod tests {
     fn lines(config: &str) -> Vec<String> {
         render_lines(
             &Config::parse(config).expect("the test configuration must parse"),
-            true,
+            Rendering::PerPattern { fold_case: true },
         )
     }
 

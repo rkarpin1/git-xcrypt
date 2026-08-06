@@ -1597,16 +1597,16 @@ fn stale_section_note(repo: &Repo, declarations: &Config) -> Option<String> {
     // note is for is a section that matches *neither*, which is what a changed
     // declaration leaves behind.
     let path = repo.attributes_path();
-    let matches = |fold: bool| {
-        let lines = gitattributes::render_lines(declarations, fold);
+    let matches = |rendering| {
+        let lines = gitattributes::render_lines(declarations, rendering);
         gitattributes::desired(&path, &lines)
             .map(|(existing, desired)| existing == desired)
             .unwrap_or(false)
     };
-    if matches(false) || matches(true) {
+    if gitattributes::ACCEPTED.into_iter().any(matches) {
         return None;
     }
-    let lines = gitattributes::render_lines(declarations, false);
+    let lines = gitattributes::render_lines(declarations, gitattributes::Rendering::Global);
     let (existing, desired) = gitattributes::desired(&path, &lines).ok()?;
     (existing != desired).then(|| {
         format!(

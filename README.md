@@ -37,15 +37,38 @@ git add -A && git commit -m "add secrets"
 
 Your working tree still shows plaintext. The repository stores ciphertext.
 
-**Run `sync` after every change to `.git-xcrypt`.** Which paths get encrypted
-takes effect immediately — the filter reads `.git-xcrypt` on every `git add` —
-but the per-pattern lines `sync` writes carry `-text`, and that is what keeps
-git's own CRLF conversion away from the ciphertext. Without it, any other
-attribute declaring such a path `text` makes git rewrite the encrypted bytes:
-measured on a 2 MB file, `git add` exits 0, the damaged blob is committed, and
-the file is unrecoverable at checkout. `git-xcrypt sync --check` exits 1 on a
-stale section, which makes it usable as a CI gate, and `git-xcrypt status`
-mentions it too.
+**You do not normally need `sync` at all.** `init` writes a two-line section
+that covers the whole repository:
+
+```
+* filter=git-xcrypt
+* -text diff=git-xcrypt
+```
+
+Neither line mentions a pattern, so neither can fall out of step with
+`.git-xcrypt`. Which paths get encrypted is decided by the filter, which reads
+the declaration on every `git add`. The `-text` is what keeps git's own CRLF
+conversion away from the ciphertext — without it, any attribute declaring such a
+path `text` makes git rewrite the encrypted bytes: measured on a 2 MB file,
+`git add` exits 0, the damaged blob is committed, and the file is unrecoverable
+at checkout.
+
+The cost of covering everything is the diff driver, which git spawns once per
+blob — there is no long-running protocol for `textconv` as there is for filters.
+Measured on git 2.55, against the same repository with the driver unregistered:
+
+| files in the diff | default | `--per-pattern` |
+| --- | --- | --- |
+| 5 | 72 ms | 21 ms |
+| 20 | 201 ms | 22 ms |
+| 1000 | 8461 ms | 23 ms |
+
+An everyday diff pays nothing you would notice. If your reviews routinely span
+hundreds of files, `git-xcrypt sync --per-pattern` splits the section into a
+line per declared pattern, so the driver runs only where it has something to
+decrypt — and `sync` becomes something to run after every change to
+`.git-xcrypt`. `sync --check` exits 1 on a section that matches no shape this
+build writes, which makes it usable as a CI gate.
 
 ### On a second machine
 
@@ -141,7 +164,7 @@ Those are speed bumps in front of the cliff. They are not a backup.
 | Command | What it does |
 | --- | --- |
 | `init` | Generate the repository key, register the filter and the diff driver, create `.git-xcrypt`, write the managed `.gitattributes` section. |
-| `sync` | Regenerate the per-pattern `.gitattributes` lines. `--check` reports staleness through exit code 1 instead of writing; `--ignorecase` spells every ASCII letter as a class, so `*.env` becomes `*.[eE][nN][vV]`. |
+| `sync` | Rewrite the managed `.gitattributes` section. Rarely needed: the default section is one line and cannot go stale. `--per-pattern` splits it into a line per declared pattern, which confines the diff driver to declared paths; `--ignorecase` (with `--per-pattern`) spells every ASCII letter as a class. `--check` reports staleness through exit code 1 instead of writing. |
 | `status` | Report whether your declarations are actually enforced, scanning the whole reachable history. `--fix` re-stages declared files the index holds in the clear. Exits `2` when the setup does not enforce anything, `5` on a finding, `6` when it could not tell. |
 | `export-key` | Write the repository key to a file outside the working tree. This is also how you make the backup nothing else makes — see above. `--stdout` pipes it instead, for a secret store; refused when standard output is a terminal. |
 | `unlock` | Decrypt the working tree and register the filter, installing a key first if one is given — as a path, or as `--key <text>` for a CI secret. `--key-only` puts the key in place and repairs the setup without decrypting anything. |
