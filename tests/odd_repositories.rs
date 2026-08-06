@@ -472,6 +472,35 @@ fn every_unusual_repository_gets_an_answer_and_the_right_one() {
         String::from_utf8_lossy(&output.stdout)
     );
 
+    // --- A worktree registration directory that cannot be listed. ------------
+    //
+    // The listing is what covers every other checkout's `HEAD`, so a failure to
+    // take it must land in `undetermined` — exit 6 — rather than read as "no
+    // other checkouts", which is exit 0 over whatever those checkouts name.
+    // Same construction as the reference store below: a *file* where the
+    // directory belongs, so the branch runs on all three platforms and what is
+    // checked is the branch, not the errno.
+    let unlistable = TestRepo::init();
+    unlistable.init_xcrypt();
+    declared(&unlistable);
+    std::fs::write(
+        unlistable.path().join(".git/worktrees"),
+        b"not a directory\n",
+    )
+    .expect("writing over the registrations");
+    let output = unlistable.xcrypt(["status"]);
+    expect(
+        "a repository whose worktree registrations cannot be listed",
+        &output,
+        UNDETERMINED,
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("undetermined"),
+        "a repository whose worktree registrations cannot be listed: the report \
+         must say the scan was partial:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
     // --- One reference that will not parse, among others that do. -----------
     //
     // The store enumerates fine here; a single reference inside it does not.

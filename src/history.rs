@@ -917,31 +917,6 @@ mod tests {
     }
 
     #[test]
-    fn an_unlistable_worktree_registration_directory_is_not_an_empty_one() {
-        // The listing is what covers every other checkout's `HEAD`, so a
-        // failure to take it must land in `undetermined` rather than read as
-        // "no other checkouts". Provoked with a *file* where the directory
-        // belongs rather than a permission bit, so the branch runs on all
-        // three platforms — the same trick `tests/lock_unlock.rs` uses, and
-        // for the same reason: what is checked is the branch, not the errno.
-        let fixture = Fixture::new();
-        fixture.write("README.md", b"start\n");
-        fixture.commit("start");
-        fs::write(
-            fixture.dir.path().join(".git/worktrees"),
-            b"not a directory\n",
-        )
-        .expect("writing over the registrations");
-
-        let scan = fixture.scan("secrets/\n");
-
-        assert!(
-            scan.refs_unavailable,
-            "an unlistable worktrees directory was read as an empty one"
-        );
-    }
-
-    #[test]
     fn a_secret_reachable_only_through_a_tag_is_found() {
         // An annotated tag is an object of its own; without peeling it, the
         // commit behind it would never enter the walk.
