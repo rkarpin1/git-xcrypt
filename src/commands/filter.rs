@@ -194,6 +194,58 @@ impl Context {
         }
     }
 
+    /// Says so when normalising this file throws away the working tree's own
+    /// line endings, so the next checkout cannot restore it byte for byte.
+    ///
+    /// This is git's `core.safecrlf`, which we did not have — Open Decision 8,
+    /// closed 2026-08-06. Two shapes reach it, and neither is exotic:
+    ///
+    /// * **mixed `CRLF` and lone `LF`**, under the default `text=auto` as much as
+    ///   under an explicit `text`. The file comes back with every ending the same
+    ///   and `git status` stays **clean**, because the new bytes normalise to the
+    ///   plaintext already stored. Nothing at all signals it today.
+    /// * **`CR` immediately before `CRLF`** under an explicit `text`, which
+    ///   collapses a byte per pass and does show up as modified. Measured on git
+    ///   2.55: git is silent here even with `safecrlf=warn`, because its two
+    ///   counters cannot see a lone `CR`.
+    ///
+    /// **Narrower than git's**, deliberately. `core.safecrlf` asks whether the
+    /// bytes will change, so on a machine with `core.autocrlf=true` it warns
+    /// about every LF-only file; git can afford that because the setting is
+    /// opt-in and defaults to false. This one is always on and has no knob, so it
+    /// asks whether the original is *recoverable* — which leaves a uniform file
+    /// alone whichever ending it uses. A warning that fires on healthy content
+    /// would be worse than none here.
+    ///
+    /// **A warning and never a refusal**, unlike the conversion check above.
+    /// Git's own `safecrlf=true` refuses with `rc=128`, and we cannot: with
+    /// `required = true` that would stop every git operation in the repository
+    /// over content that is converted, not lost. The remedy is inside this tool —
+    /// declaring the path `binary` in `.git-xcrypt` stores it verbatim — so the
+    /// message names it.
+    ///
+    /// Asked on `clean` rather than reported by `status` for the reason the
+    /// conversion refusal is: `status` resolves only paths the index already
+    /// knows, so on a new file it says nothing until the checkout that changes it.
+    fn warn_if_the_round_trip_loses_bytes(
+        &self,
+        path: &[u8],
+        decision: &crate::rules::declaration::Decision,
+        content: &[u8],
+    ) {
+        if crate::rules::eol::normalisation_is_reversible(decision.text, content) {
+            return;
+        }
+        eprintln!(
+            "git-xcrypt: {}: its line endings are mixed, so they do not survive a \
+             round trip — after the next checkout this file will not be \
+             byte-for-byte what it is now. Give it one kind of line ending, or \
+             declare it `binary` in {} to store it verbatim.",
+            path.as_bstr(),
+            crate::git::repo::CONFIG_FILE
+        );
+    }
+
     /// Whether `path` needs the "already in `HEAD` in the clear" warning.
     ///
     /// Built on first use and kept for the rest of the process, which is what the
@@ -600,9 +652,10 @@ fn serve(context: &mut Context, request: &Request, output: &mut impl Write) -> R
             // shape of mistake that once turned a 301-file checkout into 301
             // warnings. Content that already carries our magic is not a first
             // encryption either: that is a re-add of something already stored.
+            let decision = context.config.decide(&request.pathname);
             let stored_as_ciphertext =
                 !crate::rules::declaration::is_never_encrypted(&request.pathname)
-                    && context.config.decide(&request.pathname).encrypt;
+                    && decision.encrypt;
 
             // Before the encryption, not after it, and unlike the warning below
             // this one *does* refuse. Git converts the filter's output, so what
@@ -625,7 +678,18 @@ fn serve(context: &mut Context, request: &Request, output: &mut impl Write) -> R
                 context.warn_if_the_section_is_stale();
             }
             if stored_as_ciphertext && !crate::crypto::format::looks_encrypted(&request.content) {
+                // Both of these are about content on its way from plaintext to
+                // ciphertext. Content that already carries our magic is a re-add
+                // of something stored, and asking either question about
+                // ciphertext would be nonsense — worse than nonsense for the
+                // line endings, since an explicit `text` normalises whatever it
+                // is handed and would report a locked repository's own blobs.
                 first_encryption = Some(request.pathname.clone());
+                context.warn_if_the_round_trip_loses_bytes(
+                    &request.pathname,
+                    &decision,
+                    &request.content,
+                );
             }
             decide::clean(
                 context.key.as_ref(),

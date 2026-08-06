@@ -124,12 +124,19 @@ pub fn should_normalise(mode: TextMode, content: &[u8]) -> bool {
 /// **An explicit `text` bypasses that classifier**, so a path declared
 /// `secrets/*.sh text` whose content holds `\r\r\n` does not round-trip: clean
 /// stores `\r\n`, smudge writes it back, and the next clean collapses it again,
-/// so `git status` reports the file as modified for good. Git does the same
-/// thing with an explicit `text` attribute — this is what `core.safecrlf` warns
-/// about, and whether to reproduce that warning is Open Decision 8 in
-/// `context/foundation/zalozenia.md`. Recorded here rather than claimed away,
-/// because an earlier version of this comment asserted the invariant held
-/// everywhere.
+/// so `git status` reports the file as modified until it is added again — which
+/// stores the collapsed bytes. Git does the same thing with an explicit `text`
+/// attribute, and measured on 2.55 it does **not** warn about it even with
+/// `core.safecrlf=warn`.
+///
+/// That is not the only shape, and not the worst one. Mixed `CRLF` and lone `LF`
+/// is normalised under plain `text=auto` too, so the default mode loses the
+/// distinction as well — and there `git status` stays *clean* while the working
+/// tree changes, because the new bytes normalise to the same plaintext.
+/// [`survives_the_round_trip`] answers for both, and the filter warns; Open
+/// Decision 8 in `context/foundation/zalozenia.md` closed on 2026-08-06.
+/// Recorded here rather than claimed away, because an earlier version of this
+/// comment asserted the invariant held everywhere.
 #[must_use]
 pub fn normalise_to_lf(content: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(content.len());
@@ -260,6 +267,67 @@ fn apply_where(content: &[u8], mode: EolMode, native_is_crlf: bool) -> Vec<u8> {
     }
 }
 
+/// Whether the working tree's own bytes can still be recovered from what
+/// `clean` is about to store.
+///
+/// Normalisation maps several working trees onto one plaintext, so for some
+/// content the original is simply gone. This asks about *that* — whether the
+/// information survives — and deliberately **not** whether the bytes change.
+/// The distinction is the whole design of this predicate, and it is where we
+/// part company with git's `core.safecrlf`.
+///
+/// Git asks the wider question: it counts `CRLF` and lone `LF` before and after
+/// a simulated round trip, so on a machine with `core.autocrlf=true` an ordinary
+/// LF-only file warns — measured on 2.55, `* text=auto` and `a\nb\nc\n` give
+/// `LF will be replaced by CRLF the next time Git touches it`. Git can afford
+/// that because `safecrlf` defaults to **false**; the warning is opt-in. Ours is
+/// always on and has no knob, so the wider question would put a line on `stderr`
+/// for every text file in every Windows checkout — and a warning that fires on
+/// healthy content is worse than none, because it teaches the reader to skip the
+/// two that mean something.
+///
+/// Recoverable means some line-ending mode reproduces the original, which is the
+/// question a *uniform* file always answers yes to and the two lossy shapes
+/// always answer no to. Measured on git 2.55, verdict = working tree compared
+/// byte for byte after `add`, `commit`, `rm`, `checkout`:
+///
+/// | content | git, `safecrlf=warn` | this |
+/// | --- | --- | --- |
+/// | `a\nb\nc\n`, out `CRLF` | warns | quiet — comes back as uniform `CRLF`, stable from then on |
+/// | `a\r\nb\r\nc\r\n`, out `LF` | warns | quiet — mirror image |
+/// | `a\r\nb\nc\r\n` mixed | warns | **catches** |
+/// | `a\r\r\nb` under `text` | **silent**, byte lost | **catches** |
+/// | `a\r\r\nb` under `auto` | silent, untouched | quiet — agrees, [`looks_binary`] declines to convert |
+///
+/// Git misses the fourth row because its two counters cannot see a lone `CR`:
+/// one `CRLF` goes in and one comes out, so the totals agree while a byte is
+/// gone.
+///
+/// Being a question about information rather than bytes, the answer needs no
+/// [`EolMode`] and reads no configuration — so it is the same on every machine,
+/// which is what keeps it from being one more thing that behaves differently on
+/// Windows.
+///
+/// The two lossy shapes fail differently and a caller must not promise either:
+/// mixed endings come back changed with `git status` **clean**, because the next
+/// clean normalises the new bytes to the plaintext already stored; `CR` before
+/// `CRLF` collapses one byte further on each pass and does show up as modified.
+#[must_use]
+pub fn normalisation_is_reversible(text: TextMode, content: &[u8]) -> bool {
+    if !should_normalise(text, content) {
+        // Stored verbatim, so nothing can be lost. Asked first because it is the
+        // answer for every binary file and for anything declared `-text`, which
+        // is also the remedy the warning built on this recommends.
+        return true;
+    }
+
+    let normalised = normalise_to_lf(content);
+    // One of the two directions has to reproduce the original. `Lf` succeeds for
+    // content that had no `CRLF` to begin with, `Crlf` for content whose every
+    // `LF` was part of one — that is, for a file that is uniform either way.
+    normalised == content || to_crlf(&normalised) == content
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,6 +453,69 @@ mod tests {
                     "{content:?} did not survive the Windows round trip"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn only_content_whose_original_is_unrecoverable_is_called_out() {
+        // The quiet rows carry more weight than the loud ones. This question is
+        // asked on every `git add` of every encrypted file and the answer has no
+        // knob to turn it off, so a predicate that fires on healthy content is
+        // worse than no predicate: it teaches the reader to skip the two lines
+        // that mean something. Every row is measured against git 2.55, verdict
+        // by byte-for-byte comparison after `add`, `commit`, `rm`, `checkout`.
+        let mixed = &b"a\r\nb\nc\r\n"[..];
+        let cr_before_crlf = &b"a\r\r\nb"[..];
+
+        // Mixed endings lose the distinction between the two kinds, and the
+        // default mode loses it as readily as an explicit `text`.
+        for text in [TextMode::Auto, TextMode::Text] {
+            assert!(
+                !normalisation_is_reversible(text, mixed),
+                "{text:?} must not promise mixed endings can come back"
+            );
+        }
+
+        // A `CR` before `CRLF` is the shape git's own counters miss: measured on
+        // 2.55, `* text` with `core.safecrlf=warn` stores `a\r\nb` in silence.
+        assert!(should_normalise(TextMode::Text, cr_before_crlf));
+        assert!(!normalisation_is_reversible(TextMode::Text, cr_before_crlf));
+
+        // …and under `text=auto` it cannot arise, because the lone `CR` makes
+        // `looks_binary` decline to convert at all — agreeing with git, which
+        // also leaves the file untouched there.
+        assert!(!should_normalise(TextMode::Auto, cr_before_crlf));
+        assert!(normalisation_is_reversible(TextMode::Auto, cr_before_crlf));
+
+        // The quiet side, and the row that made this predicate narrower than
+        // git's: a uniform file is recoverable whichever ending it uses, so an
+        // ordinary LF-only file must stay silent even though a Windows checkout
+        // will hand it back as CRLF. Git warns there; we must not.
+        for text in [TextMode::Auto, TextMode::Text] {
+            for content in [
+                &b"one\ntwo\n"[..],
+                b"one\r\ntwo\r\n",
+                b"",
+                b"no trailing newline",
+                b"\n",
+                b"\r\n",
+                b"blank\n\nlines\n",
+                b"blank\r\n\r\nlines\r\n",
+            ] {
+                assert!(
+                    normalisation_is_reversible(text, content),
+                    "{text:?} must stay quiet about the uniform {content:?}"
+                );
+            }
+        }
+
+        // Verbatim storage cannot lose anything, so `binary` — the remedy the
+        // warning recommends — had better answer yes to both lossy shapes.
+        for content in [mixed, cr_before_crlf, &b"\0\r\nbinary\n"[..]] {
+            assert!(
+                normalisation_is_reversible(TextMode::Binary, content),
+                "declaring {content:?} binary must make the round trip exact"
+            );
         }
     }
 }

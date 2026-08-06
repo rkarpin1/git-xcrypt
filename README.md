@@ -541,8 +541,16 @@ exits 0, and the first thing that would have told you was the failed checkout.
 - `working-tree-encoding` (character-set conversion, e.g. UTF-16) is not
   supported.
 - A file with mixed line endings does not survive the round trip: normalisation
-  is lossy, so such a file comes back changed. Git warns about the same thing
-  through `core.safecrlf`; whether to reproduce that warning is still open.
+  is lossy, so such a file comes back with one kind of ending. The filter says so
+  on `stderr` when it first encrypts such a file, and `git status` will **not** —
+  the changed bytes normalise to the plaintext already stored, so the file looks
+  untouched. Give the file one kind of line ending, or declare it `binary` in
+  `.git-xcrypt` to store it verbatim. This is what git covers with
+  `core.safecrlf`, and the question here is narrower on purpose: git warns
+  whenever the bytes would change, so with `core.autocrlf=true` it flags every
+  LF-only file; it can afford that because the setting is off by default. This
+  warning has no switch, so it fires only when the original could not be
+  restored at all.
 - **Key files are only given permissions on Unix.** `init` and `export-key`
   create them with mode `0600` there, before a single byte of key material
   reaches the file. On Windows nothing sets permissions at all: the file

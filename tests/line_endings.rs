@@ -222,3 +222,127 @@ fn the_line_ending_matrix_stores_one_blob_and_checks_out_what_each_machine_asks_
         }
     }
 }
+
+/// The line whose absence was Open Decision 8, closed 2026-08-06.
+///
+/// Normalisation maps several working trees onto one plaintext, so for two
+/// shapes the original cannot come back. Both are measured against git 2.55 and
+/// both were silent here until this test existed:
+///
+/// * **mixed `CRLF` and lone `LF`** — comes back with one kind of ending, and
+///   `git status` stays *clean*, because the new bytes normalise to the
+///   plaintext already stored. Nothing whatsoever signalled it.
+/// * **`CR` before `CRLF` under an explicit `text`** — loses a byte per pass.
+///   Git is silent on this one even with `core.safecrlf=warn`, because its two
+///   counters cannot see a lone `CR`.
+///
+/// The quiet half of this test is the important half. Git's own `safecrlf` asks
+/// whether the *bytes change*, so it warns about every LF-only file on a machine
+/// with `core.autocrlf=true`; it can afford that because it defaults to off.
+/// Ours has no knob, so it asks whether the original is *recoverable* — and a
+/// warning that fired on ordinary content would teach the reader to skip the two
+/// that matter.
+#[test]
+fn content_whose_original_cannot_come_back_is_named_and_nothing_else_is() {
+    // `core.autocrlf=true` throughout, deliberately: it is the configuration
+    // under which git's wider question would warn about nearly every file here,
+    // so it is where a predicate copied from git would show up as noise.
+    let repo = TestRepo::init();
+    repo.set_eol_config("true", "native");
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\nforced/ text\n");
+    repo.xcrypt_ok(["sync"]);
+
+    let warning = "do not survive a round trip";
+
+    // The quiet side first. Uniform endings either way, content with no endings
+    // at all, an empty file, binary content, and the remedy the message
+    // recommends — none of these may produce a line.
+    for (path, content) in [
+        ("secrets/lf.env", &b"first\nsecond\n"[..]),
+        ("secrets/crlf.env", b"first\r\nsecond\r\n"),
+        ("secrets/none.env", b"no line ending at all"),
+        ("secrets/empty.env", b""),
+        ("secrets/binary.env", b"\x00\x01mixed\r\nendings\n\x00"),
+        ("forced/lf.env", b"first\nsecond\n"),
+        ("forced/crlf.env", b"first\r\nsecond\r\n"),
+    ] {
+        repo.write_file(path, content);
+        let quiet = repo.git(["add", path]);
+        let said = String::from_utf8_lossy(&quiet.stderr).into_owned();
+        assert!(
+            quiet.status.success(),
+            "{path}: a healthy file was refused:\n{said}"
+        );
+        assert!(
+            !said.contains(warning),
+            "{path}: healthy content was called lossy, which is how a warning \
+             stops being read:\n{said}"
+        );
+    }
+
+    // Mixed endings, under the default mode — no attribute at all, which is what
+    // almost every declared path is in.
+    repo.write_file("secrets/mixed.env", b"first\r\nsecond\nthird\r\n");
+    let mixed = repo.git(["add", "secrets/mixed.env"]);
+    let said = String::from_utf8_lossy(&mixed.stderr).into_owned();
+    assert!(
+        mixed.status.success(),
+        "the warning refused a `git add`, which it must never do — with \
+         `required = true` that stops every git operation in the repository \
+         over content that is converted, not lost:\n{said}"
+    );
+    assert!(
+        said.contains(warning) && said.contains("secrets/mixed.env"),
+        "mixed line endings went by unnamed under the default mode:\n{said}"
+    );
+    assert!(
+        said.contains("binary"),
+        "the message must name the remedy that is inside this tool:\n{said}"
+    );
+
+    // And the shape git itself misses: a lone `CR` in front of a `CRLF`, which
+    // only reaches the conversion because an explicit `text` bypasses the
+    // binary classifier that would otherwise decline the file.
+    repo.write_file("forced/collapse.env", b"first\r\r\nsecond\n");
+    let collapsing = repo.git(["add", "forced/collapse.env"]);
+    let said = String::from_utf8_lossy(&collapsing.stderr).into_owned();
+    assert!(
+        collapsing.status.success(),
+        "refused rather than warned:\n{said}"
+    );
+    assert!(
+        said.contains(warning) && said.contains("forced/collapse.env"),
+        "a `CR` before a `CRLF` under an explicit `text` went by unnamed — this \
+         is the shape `core.safecrlf` does not catch either:\n{said}"
+    );
+
+    // The claim the warning makes has to be true, so prove the loss rather than
+    // trusting the predicate: commit, drop the working tree, check out again.
+    repo.commit_all("every shape");
+    for (path, written) in [
+        ("secrets/mixed.env", &b"first\r\nsecond\nthird\r\n"[..]),
+        ("forced/collapse.env", b"first\r\r\nsecond\n"),
+    ] {
+        repo.recheckout(path);
+        assert_ne!(
+            repo.worktree_bytes(path),
+            written,
+            "{path} came back unchanged, so the warning is now false"
+        );
+    }
+
+    // …and the quiet ones have to be telling the truth too, which is the same
+    // assertion pointed the other way.
+    for (path, written) in [
+        ("secrets/crlf.env", &b"first\r\nsecond\r\n"[..]),
+        ("secrets/binary.env", b"\x00\x01mixed\r\nendings\n\x00"),
+    ] {
+        repo.recheckout(path);
+        assert_eq!(
+            repo.worktree_bytes(path),
+            written,
+            "{path} was silently changed and nothing warned about it"
+        );
+    }
+}

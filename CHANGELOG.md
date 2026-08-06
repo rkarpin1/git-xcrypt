@@ -81,15 +81,20 @@ changed anything from.
   encryption is identical on every machine; the choice of LF or CRLF on the way
   out reads git's configuration, which is the only place a difference between
   machines is wanted.
-- **Three automatic checks on the `git add` path**, and only one of them stops
+- **Four automatic checks on the `git add` path**, and only one of them stops
   anything. A warning when a file is encrypted for the first time and the same
   path already sits in `HEAD` in the clear. A warning when the managed
   `.gitattributes` section no longer matches the declaration, said once per git
-  operation rather than once per file. And a refusal — not a warning — when
-  git's attribute stack would convert the ciphertext about to be written, which
-  is otherwise unrecoverable at checkout. The two warnings never return a
+  operation rather than once per file. A warning when normalising a file would
+  throw away its own line endings, so the working tree cannot come back — git
+  covers that with `core.safecrlf`, and this one is narrower on purpose: it asks
+  whether the original is recoverable, not whether the bytes change, so an
+  ordinary LF-only file stays silent where git's would warn on every checkout
+  with `core.autocrlf=true`. And a refusal — not a warning — when git's
+  attribute stack would convert the ciphertext about to be written, which is
+  otherwise unrecoverable at checkout. The three warnings never return a
   non-zero code: with `filter.git-xcrypt.required = true` that would abort every
-  git operation in the repository, which neither state deserves.
+  git operation in the repository, which none of those states deserves.
 - **Ready-made binaries** for Linux (musl, x86_64 and aarch64), macOS (x86_64
   and aarch64) and Windows (MSVC, x86_64), each with a SHA-256 sum and a
   [build provenance attestation](https://github.com/rkarpin1/git-xcrypt#verifying-a-downloaded-release)
