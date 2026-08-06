@@ -63,12 +63,21 @@ Measured on git 2.55, against the same repository with the driver unregistered:
 | 20 | 201 ms | 22 ms |
 | 1000 | 8461 ms | 23 ms |
 
-An everyday diff pays nothing you would notice. If your reviews routinely span
-hundreds of files, `git-xcrypt sync --per-pattern` splits the section into a
-line per declared pattern, so the driver runs only where it has something to
-decrypt — and `sync` becomes something to run after every change to
-`.git-xcrypt`. `sync --check` exits 1 on a section that matches no shape this
-build writes, which makes it usable as a CI gate.
+An everyday diff pays nothing you would notice, so the line `init` writes is
+fine to keep. Running `git-xcrypt sync` replaces it with a line per declared
+pattern —
+
+```
+* filter=git-xcrypt
+**/secrets/** filter=git-xcrypt -text diff=git-xcrypt
+*.key filter=git-xcrypt -text diff=git-xcrypt
+```
+
+— which confines the diff driver to declared paths and lets git go on
+normalising line endings everywhere else. The trade is that these lines *can*
+go stale, so run `sync` after every change to `.git-xcrypt`. `sync --global`
+goes back to the single line. `sync --check` exits 1 on a section that matches
+no shape this build writes, which makes it usable as a CI gate.
 
 ### On a second machine
 
@@ -164,7 +173,7 @@ Those are speed bumps in front of the cliff. They are not a backup.
 | Command | What it does |
 | --- | --- |
 | `init` | Generate the repository key, register the filter and the diff driver, create `.git-xcrypt`, write the managed `.gitattributes` section. |
-| `sync` | Rewrite the managed `.gitattributes` section. Rarely needed: the default section is one line and cannot go stale. `--per-pattern` splits it into a line per declared pattern, which confines the diff driver to declared paths; `--ignorecase` (with `--per-pattern`) spells every ASCII letter as a class. `--check` reports staleness through exit code 1 instead of writing. |
+| `sync` | Rewrite the managed `.gitattributes` section as one line per declared pattern. `--global` writes instead the single line `init` starts with, which covers everything and cannot go stale; `--ignorecase` spells every ASCII letter as a class. `--check` reports staleness through exit code 1 instead of writing. |
 | `status` | Report whether your declarations are actually enforced, scanning the whole reachable history. `--fix` re-stages declared files the index holds in the clear. Exits `2` when the setup does not enforce anything, `5` on a finding, `6` when it could not tell. |
 | `export-key` | Write the repository key to a file outside the working tree. This is also how you make the backup nothing else makes — see above. `--stdout` pipes it instead, for a secret store; refused when standard output is a terminal. |
 | `unlock` | Decrypt the working tree and register the filter, installing a key first if one is given — as a path, or as `--key <text>` for a CI secret. `--key-only` puts the key in place and repairs the setup without decrypting anything. |

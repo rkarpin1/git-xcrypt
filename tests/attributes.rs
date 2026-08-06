@@ -70,7 +70,7 @@ fn every_declared_attribute_reaches_the_header_the_rendered_line_and_the_round_t
          secrets/dos.ps1      text eol=crlf\n\
          !secrets/README.md\n",
     );
-    repo.xcrypt_ok(["sync", "--per-pattern"]);
+    repo.xcrypt_ok(["sync"]);
 
     let cases = [
         Case {
@@ -253,7 +253,7 @@ fn a_forgotten_sync_fails_the_gate_and_running_it_reaches_the_whole_subtree() {
     let repo = TestRepo::init();
     repo.init_xcrypt();
     repo.write_xcrypt_config("secrets/\n");
-    repo.xcrypt_ok(["sync", "--per-pattern"]);
+    repo.xcrypt_ok(["sync"]);
 
     let checked = repo.xcrypt(["sync", "--check"]);
     assert_eq!(
@@ -291,7 +291,7 @@ fn a_forgotten_sync_fails_the_gate_and_running_it_reaches_the_whole_subtree() {
     );
 
     // --- `sync` closes it. ---------------------------------------------------
-    repo.xcrypt_ok(["sync", "--per-pattern"]);
+    repo.xcrypt_ok(["sync"]);
     assert_eq!(
         repo.xcrypt(["sync", "--check"]).status.code(),
         Some(0),
@@ -378,7 +378,7 @@ fn a_case_spelled_attributes_file_is_read_exactly_where_git_reads_it() {
     let repo = TestRepo::init();
     repo.init_xcrypt();
     repo.write_xcrypt_config("secrets/\n");
-    repo.xcrypt_ok(["sync", "--per-pattern"]);
+    repo.xcrypt_ok(["sync"]);
 
     repo.write_file("secrets/.GITATTRIBUTES", b"* text\n");
     let honoured = repo.check_attr("text", "secrets/db.env") == "set";
@@ -427,7 +427,7 @@ fn a_pattern_reaches_every_ascii_spelling_of_a_name_and_the_rendered_line_keeps_
          !secrets/README.md\n\
          \u{142}\u{105}ka/\n",
     );
-    repo.xcrypt_ok(["sync", "--per-pattern", "--ignorecase"]);
+    repo.xcrypt_ok(["sync", "--ignorecase"]);
 
     for path in OTHER_SPELLINGS {
         repo.write_file(path, SECRET);
@@ -554,8 +554,8 @@ fn a_pattern_reaches_every_ascii_spelling_of_a_name_and_the_rendered_line_keeps_
 /// file, declared or not — so git stops normalising line endings anywhere, and
 /// `git diff` spawns the driver per blob. Measured on git 2.55: a 1000-file
 /// diff takes 8461 ms against 23 ms with the driver unregistered, while a
-/// five-file diff takes 72 ms against 21 ms. `sync --per-pattern` is the way
-/// out, and the scenarios above cover that shape.
+/// five-file diff takes 72 ms against 21 ms. Running `sync` at all replaces
+/// this with a line per pattern, which is what the scenarios above cover.
 #[test]
 fn the_default_section_is_one_line_and_needs_no_sync() {
     let repo = TestRepo::init();
@@ -700,7 +700,7 @@ fn a_foreign_text_line_below_the_managed_section_is_refused_before_the_file_is_l
         let repo = TestRepo::init();
         repo.init_xcrypt();
         repo.write_xcrypt_config("secrets/\n");
-        repo.xcrypt_ok(["sync", "--per-pattern"]);
+        repo.xcrypt_ok(["sync"]);
 
         // Committed while the configuration is still healthy, so there is an
         // intact blob to prove nothing damaged it later — and so the index knows
@@ -987,7 +987,7 @@ fn a_text_line_in_the_users_global_attributes_file_is_refused_like_any_other() {
         let repo = TestRepo::init().with_home(home.path());
         repo.init_xcrypt();
         repo.write_xcrypt_config("secrets/\n");
-        repo.xcrypt_ok(["sync", "--per-pattern"]);
+        repo.xcrypt_ok(["sync"]);
 
         // Declared after the last `sync`, so the managed section says nothing
         // about this subtree and the global file is free to.
@@ -1097,7 +1097,7 @@ fn a_linked_worktrees_own_config_is_the_one_that_counts() {
     let repo = TestRepo::init().with_home(home.path());
     repo.init_xcrypt();
     repo.write_xcrypt_config("secrets/\n");
-    repo.xcrypt_ok(["sync", "--per-pattern"]);
+    repo.xcrypt_ok(["sync"]);
     // Declared after the last `sync`, the only state in which a source below the
     // tree can win — see the global-file scenario above.
     repo.write_xcrypt_config("secrets/\nvault/\n");
@@ -1206,7 +1206,7 @@ fn the_shapes_git_leaves_alone_never_provoke_a_refusal() {
     // `binary` on one declared pattern, plain selection on the other, so the
     // managed section renders both `-text` and the `-diff` variant.
     repo.write_xcrypt_config("secrets/\nvault/  binary\n");
-    repo.xcrypt_ok(["sync", "--per-pattern"]);
+    repo.xcrypt_ok(["sync"]);
 
     let mut attributes = repo.worktree_bytes(".gitattributes");
     attributes.extend_from_slice(
@@ -1392,7 +1392,7 @@ fn a_name_with_a_space_is_declared_in_quotes_and_lives_the_whole_cycle() {
          !\"my secrets/README.md\"\n\
          \"!weird.env\"\n",
     );
-    repo.xcrypt_ok(["sync", "--per-pattern"]);
+    repo.xcrypt_ok(["sync"]);
 
     repo.write_file("my secrets/deploy.sh", CRLF);
     repo.write_file("app/my secrets/nested.env", SPACED);
@@ -1484,7 +1484,7 @@ fn a_name_that_ends_in_a_space_is_expressible_at_last() {
     let repo = TestRepo::init();
     repo.init_xcrypt();
     repo.write_xcrypt_config("\"secrets /\"\n");
-    repo.xcrypt_ok(["sync", "--per-pattern"]);
+    repo.xcrypt_ok(["sync"]);
 
     repo.write_file("secrets /db.env", SPACED);
     // The name next door, one byte shorter, which must stay in the clear: a
@@ -1589,7 +1589,7 @@ fn repository_with_one_intact_secret() -> (TestRepo, Vec<u8>, Vec<u8>) {
     repo.xcrypt_ok(["unlock", "--key-only", &key_file.to_string_lossy()]);
     repo.init_xcrypt();
     repo.write_xcrypt_config("secrets/\n");
-    repo.xcrypt_ok(["sync", "--per-pattern"]);
+    repo.xcrypt_ok(["sync"]);
 
     let secret = eight_kilobytes();
     repo.write_file("secrets/store.p12", &secret);

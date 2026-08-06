@@ -58,8 +58,9 @@ pub fn run(repo: &Repo, check: bool, rendering: gitattributes::Rendering) -> Res
         // Any shape this build writes counts as current, not just the one asked
         // for on this command line. `--check` is a CI gate, and its question is
         // "does the section still describe the declaration" — a repository that
-        // chose `--per-pattern` has not gone stale by being asked without the
-        // flag, and failing it there would teach the gate's owner to ignore it.
+        // still on the section `init` wrote has not gone stale by never having
+        // run `sync`, and failing it there would teach the gate's owner to
+        // ignore it.
         // A section that matches *none* of them is what staleness looks like.
         let current = gitattributes::ACCEPTED.into_iter().any(|rendering| {
             let lines = gitattributes::render_lines(&config, rendering);
@@ -140,11 +141,11 @@ mod tests {
             "--check must never touch the working tree"
         );
 
-        // Split, and it can. This is the trade `--per-pattern` buys into: the
+        // Split, and it can. That is the trade a plain `sync` buys into: the
         // diff driver stops running for undeclared paths, and `sync` becomes
         // something to run after every change to the declaration.
         let per_pattern = gitattributes::Rendering::PerPattern { fold_case: false };
-        run(&repo, false, per_pattern).expect("sync --per-pattern");
+        run(&repo, false, per_pattern).expect("sync");
         assert_eq!(
             run(&repo, true, per_pattern).expect("check").outcome,
             Outcome::UpToDate,

@@ -84,7 +84,7 @@ pub fn render_lines(config: &Config, rendering: Rendering) -> Vec<String> {
             if pattern.negated {
                 lines.push(format!("{spelling} !text !diff"));
             } else {
-                lines.push(format!("{spelling} -text diff={DRIVER}"));
+                lines.push(format!("{spelling} filter={DRIVER} -text diff={DRIVER}"));
                 if pattern.suppress_diff && !suppressed.contains(&spelling) {
                     suppressed.push(spelling);
                 }
@@ -267,11 +267,17 @@ fn translate(pattern: &str, fold: bool) -> Vec<String> {
 /// How the managed section spells what it protects.
 ///
 /// Two shapes, and the choice is a trade this project measured rather than
-/// guessed. `Global` is one line covering the whole repository, so a clone works
-/// correctly the moment `init` has run and **`sync` is not part of the flow at
-/// all** — nothing can go stale because nothing depends on the declaration.
-/// `PerPattern` expands the declaration into a line each, which is what large
-/// repositories want: the `diff` driver then runs only for declared paths.
+/// guessed.
+///
+/// `PerPattern` writes a line per declared pattern, each naming the filter, the
+/// `-text` that protects the ciphertext and the diff driver — the shape
+/// `git-crypt` users will recognise. It is what `sync` writes when nothing asks
+/// otherwise, and it confines the diff driver to declared paths.
+///
+/// `Global` is one line covering the whole repository. `init` writes it, so a
+/// repository works correctly before `sync` has ever run and nothing can go
+/// stale; `sync --global` puts it back. Its cost is the diff driver on every
+/// file.
 ///
 /// The cost that decides between them is the `diff` driver, and it is a process
 /// per blob — git has no long-running protocol for `textconv` the way it has one
@@ -286,9 +292,9 @@ fn translate(pattern: &str, fold: bool) -> Vec<String> {
 /// | 1000 | 8461 ms | 23 ms |
 ///
 /// So an everyday diff pays nothing anyone notices, and a thousand-file review
-/// pays eight seconds. `Global` is the default because correctness without a
-/// second command is worth more than the tail; `sync --per-pattern` is the way
-/// out for a repository that lives in the tail.
+/// pays eight seconds. `init` writes `Global` so a fresh repository is correct
+/// with no second command; `sync` writes `PerPattern`, which is what a
+/// repository settles into once anyone runs it.
 ///
 /// The other half of `Global` is `-text` on every path, which stops git
 /// normalising line endings anywhere in the repository. That is the price of
@@ -329,8 +335,9 @@ pub fn render_lines_as_written(path: &std::path::Path, config: &Config) -> Vec<S
 /// Every spelling of the section this build considers current.
 ///
 /// Order matters only for the tie nobody can hit — a repository declaring
-/// nothing renders the same either way — but it is `Global` first because that
-/// is the default a file with no history of `sync --per-pattern` will match.
+/// nothing renders the same either way. `Global` comes first because it is what
+/// `init` wrote, so it is what a repository nobody has run `sync` in will
+/// match.
 pub const ACCEPTED: [Rendering; 3] = [
     Rendering::Global,
     Rendering::PerPattern { fold_case: false },
@@ -1627,7 +1634,7 @@ mod tests {
         // because selection folds unconditionally — see `fold_case`.
         assert_eq!(
             lines("secrets/\n"),
-            ["**/[sS][eE][cC][rR][eE][tT][sS]/** -text diff=git-xcrypt"]
+            ["**/[sS][eE][cC][rR][eE][tT][sS]/** filter=git-xcrypt -text diff=git-xcrypt"]
         );
     }
 
@@ -1724,8 +1731,8 @@ mod tests {
         assert_eq!(
             lines("[attr]odd.env\n"),
             [
-                "**/[attrATTR][oO][dD][dD].[eE][nN][vV] -text diff=git-xcrypt",
-                "**/[attrATTR][oO][dD][dD].[eE][nN][vV]/** -text diff=git-xcrypt",
+                "**/[attrATTR][oO][dD][dD].[eE][nN][vV] filter=git-xcrypt -text diff=git-xcrypt",
+                "**/[attrATTR][oO][dD][dD].[eE][nN][vV]/** filter=git-xcrypt -text diff=git-xcrypt",
             ]
         );
     }

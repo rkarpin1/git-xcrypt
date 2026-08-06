@@ -68,27 +68,27 @@ enum Command {
         #[arg(long)]
         check: bool,
 
-        /// Write one line per declared pattern instead of one for everything.
+        /// Write one line covering everything instead of one per pattern.
         ///
-        /// The default section is a single `* -text diff=git-xcrypt`, which is
-        /// correct with no `sync` in the flow at all. Its cost is the diff
-        /// driver: git spawns it per blob, so a big review pays for files that
-        /// were never encrypted — measured, 1000 files in a diff, 8461 ms
-        /// against 23 ms. Splitting the section confines the driver to declared
-        /// paths, and makes `sync` part of the flow again: run it after every
-        /// change to `.git-xcrypt`, or the lines go stale.
+        /// **Nothing to do with git's `--global`; this file is the
+        /// repository's.** It replaces the per-pattern lines with a single
+        /// `* -text diff=git-xcrypt`, which is what `init` writes: correct
+        /// before `sync` has ever run, and unable to go stale because it names
+        /// no pattern. The cost is the diff driver, which git spawns per blob,
+        /// so a review touching many files pays for files that were never
+        /// encrypted — measured, 1000 files in a diff, 8461 ms against 23 ms.
         #[arg(long)]
-        per_pattern: bool,
+        global: bool,
 
         /// Spell every ASCII letter as a class, so `*.env` becomes `*.[eE][nN][vV]`.
         ///
-        /// Only meaningful with `--per-pattern`; the global line covers every
-        /// spelling already. Pattern matching in `.git-xcrypt` folds case
-        /// whatever this says, so on a case-insensitive filesystem — APFS, NTFS
-        /// — a file called `TOP.ENV` is encrypted either way. What the folded
-        /// line adds is the `-text` and `diff` that go with it on a
-        /// case-*sensitive* one.
-        #[arg(long, requires = "per_pattern")]
+        /// Pattern matching in `.git-xcrypt` folds case whatever this says, so
+        /// on a case-insensitive filesystem — APFS, NTFS — a file called
+        /// `TOP.ENV` is encrypted either way. What the folded line adds is the
+        /// `-text` and `diff` that go with it on a case-*sensitive* one, where
+        /// a plain `*.env` leaves those spellings unspecified. Pointless with
+        /// `--global`, whose one line covers every spelling already.
+        #[arg(long, conflicts_with = "global")]
         ignorecase: bool,
     },
 
@@ -231,9 +231,9 @@ fn main() -> ExitCode {
         Command::Init => report(run_init()),
         Command::Sync {
             check,
-            per_pattern,
+            global,
             ignorecase,
-        } => run_sync(check, per_pattern, ignorecase),
+        } => run_sync(check, global, ignorecase),
         Command::ExportKey {
             path,
             stdout,
@@ -590,8 +590,8 @@ fn status_and_describe(fix: bool) -> Result<ExitCode> {
 /// table, so a CI gate cannot tell a stale section from an unreadable file by
 /// the code alone; the message says which it is. The table has no spare code and
 /// `5` means an exposure, which a cosmetic section is not.
-fn run_sync(check: bool, per_pattern: bool, ignorecase: bool) -> ExitCode {
-    match sync_and_describe(check, per_pattern, ignorecase) {
+fn run_sync(check: bool, global: bool, ignorecase: bool) -> ExitCode {
+    match sync_and_describe(check, global, ignorecase) {
         Ok(code) => code,
         Err(err) => {
             eprintln!("git-xcrypt: {err}");
@@ -600,13 +600,13 @@ fn run_sync(check: bool, per_pattern: bool, ignorecase: bool) -> ExitCode {
     }
 }
 
-fn sync_and_describe(check: bool, per_pattern: bool, ignorecase: bool) -> Result<ExitCode> {
-    let rendering = if per_pattern {
+fn sync_and_describe(check: bool, global: bool, ignorecase: bool) -> Result<ExitCode> {
+    let rendering = if global {
+        git_xcrypt::gitattributes::Rendering::Global
+    } else {
         git_xcrypt::gitattributes::Rendering::PerPattern {
             fold_case: ignorecase,
         }
-    } else {
-        git_xcrypt::gitattributes::Rendering::Global
     };
     let repo = Repo::discover_from_cwd()?;
     let report = commands::sync::run(&repo, check, rendering)?;
