@@ -240,6 +240,12 @@ Zmierzone na git 2.55 (repozytoria tymczasowe, nie na tym projekcie), 2026-08-04
 
 Wydajność, `git add -A` na 2000 plików: bez filtra **540 ms**, catch-all z procesem na plik **12 105 ms** (22×), catch-all z filtrem długożyjącym **596 ms** (+10%, i to filtr prototypowy w Pythonie).
 
+**Doprecyzowanie z 2026-08-06: te 596 ms mierzą przepuszczanie, nie szyfrowanie.** Rozdzielone dopiero teraz, przy ustalaniu progu wydajnościowego, i rozdzielenie jest konieczne, bo catch-all tworzy **dwie populacje o zupełnie różnym koszcie**. Zmierzone na dzisiejszej binarce, `--release`, 2000 plików po ~3,9 KB, minimum z 7 przebiegów: bez filtra **562 ms**, filtr z pustą deklaracją (samo przepuszczanie) **592 ms**, filtr szyfrujący wszystko **680 ms**. Liczba z prototypu leży więc na przepuszczaniu, a nie na szyfrowaniu — i tak była dotąd czytana w `prd.md`, co sprostowano.
+
+**Ostrzeżenie pomiarowe, kosztowało dwa fałszywe wnioski, więc zapisane wprost: baza do porównań musi być nieściśliwa.** Zmierzone, 2000 plików po 46 KB: przy zwykłej, powtarzalnej treści tekstowej ramię szyfrujące wyszło **1196 ms** wolniejsze od bazy — i **1092 ms z tego, czyli 91%, to zlib gita**, który powtarzalny tekst ściska niemal do zera, a ciphertextu nie ściśnie w ogóle. Ten koszt jest dla użytkownika prawdziwy, ale nie jest nasz: tak działa każde szyfrowanie wobec kompresora i rusza się razem ze ściśliwością plików. Po podstawieniu treści losowej po obu stronach (zlib wypada z równania) narzut spadł do **104 ms**, czyli **11× mniej**, co daje **13 µs/plik + 0,85 ns/B**. Pierwsza próba progu, wyprowadzona z pomiaru na treści ściśliwej, byłaby budżetem nałożonym na gita.
+
+**Sam szyfr: 1,18 ns/B, czyli ~849 MB/s** (8 MB przez `diff`, minimum z 5 przebiegów) — zgodne z pomiarem przy `--cfg aes_armv8` wyżej i z nim porównywalne, bo tym samym przyrządem. Progi liczbowe i sposób ich egzekwowania: `prd.md` §Non-Functional Requirements.
+
 Konsekwencje wiążące:
 
 - **Filtr rejestrujemy jako `filter.git-xcrypt.process`** — protokół długożyjący, jeden proces na całą operację. To warunek wykonalności, nie optymalizacja: 22× dyskwalifikuje. Na Windows różnica będzie większa, bo spawn procesu jest tam droższy.
