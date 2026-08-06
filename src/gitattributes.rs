@@ -857,7 +857,7 @@ pub fn catch_all_present(path: &Path) -> Result<bool> {
     Ok(read(path)?.lines().any(|line| line.trim_end() == CATCH_ALL))
 }
 
-/// Lines outside the managed section that set or unset `filter`.
+/// Lines outside the managed section that touch one of `axes`.
 ///
 /// The catch-all is one line among many, and git takes the **last** match — so
 /// a line below the managed section saying `secrets/** -filter`, or setting
@@ -872,11 +872,17 @@ pub fn catch_all_present(path: &Path) -> Result<bool> {
 /// show a reader what to delete instead of only telling them a path is
 /// unfiltered.
 ///
+/// `axes` names the attributes worth looking for — `status` asks about `filter`
+/// alone, `sync` about the axes that can cost something. `diff` is deliberately
+/// on nobody's list: measured 2026-08-05, a foreign line setting `diff=lfs`,
+/// `-diff` or `diff` on a declared path costs a readable `git diff` and not one
+/// byte in the repository.
+///
 /// # Errors
 ///
 /// [`Error::Io`] when the file exists but cannot be read, [`Error::Config`] when
 /// it is not text.
-pub fn foreign_filter_lines(path: &Path) -> Result<Vec<String>> {
+pub fn foreign_lines_touching(path: &Path, axes: &[&str]) -> Result<Vec<String>> {
     let text = read(path)?;
     let mut inside = false;
     let mut found = Vec::new();
@@ -900,10 +906,13 @@ pub fn foreign_filter_lines(path: &Path) -> Result<Vec<String>> {
             .map(|(_, rest)| rest);
         if attributes.is_some_and(|rest| {
             rest.split_whitespace().any(|token| {
-                token == "filter"
-                    || token == "-filter"
-                    || token == "!filter"
-                    || token.starts_with("filter=")
+                axes.iter().any(|axis| {
+                    let bare = token
+                        .strip_prefix('-')
+                        .or_else(|| token.strip_prefix('!'))
+                        .unwrap_or(token);
+                    bare == *axis || bare.starts_with(&format!("{axis}="))
+                })
             })
         }) {
             found.push(trimmed.trim().to_string());

@@ -77,7 +77,10 @@ pattern —
 normalising line endings everywhere else. The trade is that these lines *can*
 go stale, so run `sync` after every change to `.git-xcrypt` — and if you forget,
 the filter says so on `stderr` the next time it encrypts something, without
-refusing the operation. `sync --global` goes back to the single line. `sync --check` exits 1 on a section that matches
+refusing the operation. `sync` also counts the lines outside its section that
+set `filter`, `text`, `eol` or `crlf` and points at `status`: git takes the last
+match, so one of them may outrank what `sync` just wrote, and only `status`
+resolves the attributes far enough to say. `sync --global` goes back to the single line. `sync --check` exits 1 on a section that matches
 no shape this build writes, which makes it usable as a CI gate.
 
 ### On a second machine

@@ -615,6 +615,24 @@ fn sync_and_describe(check: bool, global: bool, ignorecase: bool) -> Result<Exit
         eprintln!("git-xcrypt: {warning}");
     }
 
+    // One sentence, and deliberately not a verdict. Whether any of those lines
+    // reaches a declared path takes git's whole attribute stack to answer, and
+    // `status` answers it; saying more here would either duplicate that or
+    // quote an ordinary `*.psd filter=lfs` at its owner on every run until they
+    // stopped reading. The section this command just wrote is the *last* word
+    // only until something below it says otherwise — measured on git 2.55, a
+    // `secrets/** -filter` line under the section took `git add` to exit 0 with
+    // the plain text stored.
+    if report.foreign > 0 {
+        eprintln!(
+            "git-xcrypt: {} line(s) outside the managed section set `filter`, `text`, \
+             `eol` or `crlf`. Git takes the last match, so one of them may outrank \
+             what this just wrote — `git-xcrypt status` resolves the attributes the \
+             way git does and says whether any declared path is affected.",
+            report.foreign
+        );
+    }
+
     let attributes = repo.attributes_path().display().to_string();
     Ok(match report.outcome {
         Outcome::Updated => {

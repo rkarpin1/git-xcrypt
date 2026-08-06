@@ -1966,3 +1966,64 @@ fn a_ciphertext_that_really_was_altered_is_still_reported_as_altered() {
         );
     }
 }
+
+/// `sync` points at `status` when something outside its section could outrank it.
+///
+/// The section this command writes is the last word only until a line below it
+/// says otherwise — measured on git 2.55, a `secrets/** -filter` under the
+/// managed markers took `git add` to exit 0 with the plain text stored, and
+/// `sync` itself said nothing at all because its own question is only "does the
+/// section match the declaration".
+///
+/// One sentence, and deliberately not a verdict. Whether such a line actually
+/// reaches a declared path takes git's whole attribute stack to answer, and
+/// `status` answers it by running that stack; a second spelling here would be
+/// one too many. The price of not resolving is a sentence that also fires for a
+/// perfectly ordinary `*.psd filter=lfs` — which is why it says *may* outrank
+/// and names the command that knows, rather than quoting the line as a problem.
+///
+/// The silent half matters as much: `diff` is on nobody's list because a
+/// foreign line setting it costs a readable `git diff` and not one byte in the
+/// repository, measured 2026-08-05.
+#[test]
+fn sync_says_when_a_line_outside_its_section_might_outrank_it() {
+    const SPEAKS: [&str; 4] = [
+        "secrets/** -filter",
+        "*.psd filter=lfs",
+        "*.md text",
+        "*.sh eol=lf",
+    ];
+    const SILENT: [&str; 3] = ["*.png -diff", "# just a note", ""];
+
+    for line in SPEAKS.into_iter().chain(SILENT) {
+        let repo = TestRepo::init();
+        repo.init_xcrypt();
+        repo.write_xcrypt_config("secrets/\n");
+        if !line.is_empty() {
+            let mut attributes = repo.worktree_bytes(".gitattributes");
+            attributes.extend_from_slice(line.as_bytes());
+            attributes.push(b'\n');
+            repo.write_file(".gitattributes", &attributes);
+        }
+
+        let said = String::from_utf8_lossy(&repo.xcrypt_ok(["sync"]).stderr).into_owned();
+        let mentioned = said.contains("outside the managed section");
+        if SPEAKS.contains(&line) {
+            assert!(
+                mentioned,
+                "{line:?}: a line that can outrank the managed section went unmentioned:\n{said}"
+            );
+            assert!(
+                said.contains("git-xcrypt status"),
+                "{line:?}: the sentence must name the command that can actually \
+                 answer:\n{said}"
+            );
+        } else {
+            assert!(
+                !mentioned,
+                "{line:?}: an ordinary line provoked a warning, which is how a \
+                 warning stops being read:\n{said}"
+            );
+        }
+    }
+}

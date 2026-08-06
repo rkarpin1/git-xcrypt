@@ -1348,7 +1348,7 @@ fn foreign_source_note(
 ) -> Vec<String> {
     let mut notes = Vec::new();
     for source in filters.sources() {
-        let Ok(lines) = gitattributes::foreign_filter_lines(source) else {
+        let Ok(lines) = gitattributes::foreign_lines_touching(source, &["filter"]) else {
             continue;
         };
         if lines.is_empty() {

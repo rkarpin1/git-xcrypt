@@ -33,6 +33,17 @@ pub struct Report {
     /// Carried out rather than printed here so the binary owns every message,
     /// as it does for `init`.
     pub warnings: Vec<String>,
+    /// How many lines outside the managed section touch `filter`, `text`,
+    /// `eol` or `crlf`.
+    ///
+    /// A count and nothing more, on purpose. Whether any of them actually
+    /// reaches a declared path is a question about git's whole attribute stack,
+    /// and `status` already answers it by running that stack — a second
+    /// spelling here would be one too many, and a `sync` that quoted an
+    /// ordinary `*.psd filter=lfs` at its user every run would teach them to
+    /// stop reading it. So this only says "something outside this section could
+    /// have an opinion" and points at the command that knows.
+    pub foreign: usize,
 }
 
 /// Runs `sync` in `repo`, writing unless `check` is set.
@@ -77,8 +88,16 @@ pub fn run(repo: &Repo, check: bool, rendering: gitattributes::Rendering) -> Res
         Outcome::UpToDate
     };
 
+    // Cheap: one read of a file already on disk, no attribute resolution. An
+    // unreadable `.gitattributes` answers zero rather than failing — `sync` has
+    // just written it, and the gate for that state is `status`.
+    let foreign = gitattributes::foreign_lines_touching(&path, &["filter", "text", "eol", "crlf"])
+        .map(|lines| lines.len())
+        .unwrap_or(0);
+
     Ok(Report {
         outcome,
+        foreign,
         warnings: config.pointless_eol,
     })
 }
