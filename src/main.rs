@@ -13,9 +13,35 @@ use git_xcrypt::commands::sync::Outcome;
 use git_xcrypt::repo::{Repo, git_spelling};
 use git_xcrypt::{Result, commands, exit};
 
+/// The frozen exit-code table, shown under `--help`.
+///
+/// Here rather than only in the README because the one command most people run
+/// unattended is `status`, and what a CI job reads is this number. A table that
+/// lives only in prose is a table nobody consults at the moment it matters —
+/// and one that lives only in a doc comment drifts, which is exactly what
+/// happened to `status`'s own description between 2026-08-05 and 2026-08-06.
+const EXIT_CODES: &str = "\
+Exit codes:
+  0  success
+  1  usage error, or a failure with no better code
+  2  configuration or a state conflict — including a `status` run that found
+     the setup enforcing nothing
+  3  no repository key
+  4  bad format: magic, key id, unknown flag bit, or a failed tag
+  5  `status` found an exposure
+  6  `status` could not tell
+
+A CI gate should treat 2, 5 and 6 alike as a failure.";
+
 /// Transparent encryption of selected files in a git repository.
 #[derive(Debug, Parser)]
-#[command(name = "git-xcrypt", version, about, long_about = None)]
+#[command(
+    name = "git-xcrypt",
+    version,
+    about,
+    long_about = None,
+    after_long_help = EXIT_CODES,
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -26,7 +52,15 @@ enum Command {
     /// Generate a key and register the filter in this repository.
     Init,
 
-    /// Regenerate the cosmetic `.gitattributes` lines from `.git-xcrypt`.
+    /// Regenerate the per-pattern `.gitattributes` lines from `.git-xcrypt`.
+    ///
+    /// Run it after every change to `.git-xcrypt`. Which paths get encrypted
+    /// takes effect at once — the filter reads the declaration on every
+    /// `git add` — but these lines carry `-text`, and that is what keeps git's
+    /// own CRLF conversion off the ciphertext. Without it, any other attribute
+    /// calling such a path `text` makes git rewrite the encrypted bytes: `git
+    /// add` exits 0, the damaged blob is committed, and the file is
+    /// unrecoverable at checkout.
     Sync {
         /// Report whether the section is out of date instead of writing it.
         ///
@@ -97,9 +131,14 @@ enum Command {
 
     /// Report whether this repository's declarations are actually enforced.
     ///
-    /// Exits `5` on a finding, so it works as a CI gate. It answers "are my
-    /// declarations enforced", not "are there secrets here": a file that never
-    /// matched a pattern is invisible to it.
+    /// Made for a CI gate, so the exit code carries the answer: `2` when the
+    /// setup enforces nothing, `5` when something was found in the data, `6`
+    /// when the run could not tell, `0` when it checked and found nothing.
+    /// Treat `2`, `5` and `6` alike as a failure — they ask for three different
+    /// repairs, and only `0` means the question was answered.
+    ///
+    /// It answers "are my declarations enforced", not "are there secrets here":
+    /// a file that never matched a pattern is invisible to it.
     Status {
         /// Re-stage declared files the index holds in the clear.
         ///

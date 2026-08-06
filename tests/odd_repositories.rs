@@ -612,3 +612,75 @@ fn every_unusual_repository_gets_an_answer_and_the_right_one() {
         CONFIG,
     );
 }
+
+/// The help has to agree with what the exit codes actually do.
+///
+/// `status` is meant to be read by a CI job, so its own description is where a
+/// person looks up what the number means — and a description is the one part of
+/// a program nothing checks. Measured on 2026-08-06: `git-xcrypt status --help`
+/// still said "Exits `5` on a finding" a day after the precedence became
+/// `2` > `5` > `6` > `0`, so the help sent operators looking for a secret to
+/// rotate in a repository whose only fault was an unregistered filter.
+///
+/// The assertion is deliberately not "the text contains these words". Each code
+/// is **provoked on a real repository** and then looked for in the help, so the
+/// two can only agree by being right. A frozen table that drifts in either
+/// direction turns this red.
+#[test]
+fn the_help_names_every_exit_code_status_can_actually_produce() {
+    let help = String::from_utf8(
+        std::process::Command::new(env!("CARGO_BIN_EXE_git-xcrypt"))
+            .args(["status", "--help"])
+            .output()
+            .expect("could not run git-xcrypt")
+            .stdout,
+    )
+    .expect("help is text");
+
+    // A clone that never ran `init`: the catch-all line is there, the driver is
+    // not, so git enforces nothing. Configuration.
+    //
+    // The key is minted outside so the shallow clone below can open itself: an
+    // unconfigured shallow clone would answer `2`, since configuration outranks
+    // an unanswered question, and would prove nothing about `6`.
+    let carried = SharedKey::minted();
+    let source = TestRepo::init();
+    source.init_xcrypt_with(&carried);
+    declared(&source);
+    let remote = BareRemote::new();
+    source.push_to(&remote, "main");
+    let unconfigured = remote.clone_to();
+
+    // A secret committed before anything declared it. Data.
+    let leaked = TestRepo::init();
+    leaked.init_xcrypt();
+    leaked.write_xcrypt_config("# nothing declared yet\n");
+    leaked.write_file("secrets/db.env", SECRET);
+    leaked.commit_all("the leak");
+    leaked.write_xcrypt_config("secrets/\n");
+    leaked.xcrypt_ok(["sync"]);
+
+    // A shallow clone, which is what CI produces by default. Undetermined.
+    let shallow = source.clone_shallow();
+    shallow.xcrypt_ok(["unlock", &carried.as_arg()]);
+
+    // And a healthy one.
+    let healthy = TestRepo::init();
+    healthy.init_xcrypt();
+    declared(&healthy);
+
+    for (label, repo, code) in [
+        ("a clone that enforces nothing", &unconfigured, CONFIG),
+        ("a repository that leaked", &leaked, EXPOSED),
+        ("a shallow clone", &shallow, UNDETERMINED),
+        ("a healthy repository", &healthy, CLEAN),
+    ] {
+        let output = repo.xcrypt(["status"]);
+        expect(label, &output, code);
+        assert!(
+            help.contains(&format!("`{code}`")) || help.contains(&format!("  {code}  ")),
+            "{label}: `status` exits {code}, and its own help never mentions \
+             that number:\n{help}"
+        );
+    }
+}
