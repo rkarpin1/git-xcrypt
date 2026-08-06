@@ -28,60 +28,215 @@ secrets/deploy.ps1  text eol=crlf
 secrets/key.p12     binary
 ```
 
-Then run `git-xcrypt sync` and commit as usual:
+Then commit as usual:
 
 ```sh
-git-xcrypt sync                 # refresh the managed .gitattributes section
 git add -A && git commit -m "add secrets"
 ```
 
-Your working tree still shows plaintext. The repository stores ciphertext.
+That is the whole setup — **`sync` is not part of it.** Your working tree still
+shows plaintext; the repository stores ciphertext. Adding a pattern takes effect
+on the very next `git add`, because the filter reads `.git-xcrypt` itself rather
+than waiting for a command to translate it.
 
-**You do not normally need `sync` at all.** `init` writes a two-line section
-that covers the whole repository:
+## Everyday work
+
+Everything below is measured against a real git, not sketched.
+
+### Adding a secret to a project that already has some
+
+Nothing special: write the file, commit it. If it matches a pattern already in
+`.git-xcrypt`, it is encrypted on the way in.
+
+```sh
+echo 'STRIPE_KEY=sk_live_...' > secrets/payments.env
+git add -A && git commit -m "payment credentials"
+
+git cat-file blob HEAD:secrets/payments.env | head -c 11 | xxd
+# 00000000: 0047 4954 5843 5259 5054 00   .GITXCRYPT.
+```
+
+### Reading what actually changed in a secret
+
+The blob is binary, so `git diff` would normally show nothing useful. `init`
+registers a `textconv` driver that decrypts for comparison only:
+
+```sh
+git log -p -1 -- secrets/prod.env
+```
+
+```diff
+@@ -1,2 +1,2 @@
+-DB_PASS=hunter2
++DB_PASS=swordfish
+ API_KEY=abc
+```
+
+Nothing decrypted is written anywhere: `init` also sets
+`diff.git-xcrypt.cachetextconv = false`, because with caching on git stores the
+**decrypted** text as blobs under `refs/notes/textconv/` — inside `.git/`, where
+they would outlive `git-xcrypt lock`.
+
+### What someone without the key sees
+
+```sh
+git clone <url> && cd my-project
+head -c 24 secrets/prod.env | xxd
+# 00000000: 0047 4954 5843 5259 5054 0001 0101 9077  .GITXCRYPT......
+
+git-xcrypt status; echo $?
+# 2   — this clone has no filter registered, so it is not safe to commit from
+```
+
+Exit `2` is the point: a clone inherits `.gitattributes` through history but not
+`.git/config`, so git has no filter here until `unlock` runs. Committing a
+declared file from such a clone would store it in the clear.
+
+### The mistake that actually happens: declaring a pattern too late
+
+A secret was committed before anyone thought to declare it. The filter notices
+the moment it first encrypts that path:
+
+```sh
+echo '*.env' > .git-xcrypt
+git add -A && git commit -m "declare secrets"
+```
+
+```
+git-xcrypt: config/prod.env: this is the first time it is being encrypted, and
+HEAD already holds it in the clear. The plain text stays in history; run
+`git-xcrypt status` to see what is exposed, and rotate the secret if it was ever
+pushed.
+```
+
+```sh
+git-xcrypt status; echo $?
+# 5   VERDICT: 1 path(s) leaked in history.
+```
+
+**The commit above already fixed the future** — from now on that path is stored
+encrypted. What `status` keeps reporting is the past: the old plaintext blob is
+still reachable, and still on the hosting service if it was ever pushed. It goes
+on exiting `5` until that blob is gone, which is correct and deliberate.
+
+`git-xcrypt status --fix` re-stages any declared file the index still holds in
+the clear, which is the same repair for the case where you have not committed
+yet. Neither it nor anything else in this tool rewrites history — the report
+prints the `git-filter-repo` command for that, and the checklist starts with
+rotating the secret, because rewriting history does not un-leak anything already
+pushed, forked or cached.
+
+### Locking the repository before handing the machine over
+
+```sh
+git-xcrypt export-key ~/backup/my-project.key   # first, and only once
+git-xcrypt lock --yes
+```
+
+```sh
+head -c 11 secrets/prod.env | xxd -p
+# 0047495458435259505400        the working tree is ciphertext now
+git status --porcelain          # empty: the bytes match what was committed
+```
+
+The key is gone from `.git/`. `unlock` with the copy brings everything back:
+
+```sh
+git-xcrypt unlock ~/backup/my-project.key
+head -1 secrets/prod.env
+# DB_PASS=swordfish
+```
+
+`lock` refuses while a declared file has uncommitted changes, and `--yes` does
+not waive that — losing the key and losing unsaved work are different risks.
+
+### In CI
+
+```yaml
+- uses: actions/checkout@v5
+  with:
+    fetch-depth: 0                    # status needs full history
+
+- run: git-xcrypt unlock --key "$GITXCRYPT_KEY"
+  env:
+    GITXCRYPT_KEY: ${{ secrets.GITXCRYPT_KEY }}
+
+- run: git-xcrypt status              # the gate
+```
+
+Put the key there without it ever touching a disk:
+
+```sh
+git-xcrypt export-key --stdout | gh secret set GITXCRYPT_KEY
+```
+
+`--key` is visible in the process list while the command runs and is recorded by
+an interactive shell; the command says so every time. See
+[Handing the key to CI](#handing-the-key-to-ci-without-a-file).
+
+### Keeping one file readable inside a secret directory
+
+```gitignore
+secrets/
+!secrets/README.md
+```
+
+The negation wins, and the rendered `.gitattributes` line gives that one file
+git's defaults back, so it is stored in the clear and diffed normally.
+`git-xcrypt status` lists such paths in their own section, so an exception is
+never invisible.
+
+## The managed `.gitattributes` section
+
+`init` writes two lines and nothing else:
 
 ```
 * filter=git-xcrypt
 * -text diff=git-xcrypt
 ```
 
-Neither line mentions a pattern, so neither can fall out of step with
-`.git-xcrypt`. Which paths get encrypted is decided by the filter, which reads
-the declaration on every `git add`. The `-text` is what keeps git's own CRLF
-conversion away from the ciphertext — without it, any attribute declaring such a
-path `text` makes git rewrite the encrypted bytes: measured on a 2 MB file,
-`git add` exits 0, the damaged blob is committed, and the file is unrecoverable
-at checkout.
+Neither mentions a pattern, so neither can fall out of step with `.git-xcrypt`.
+The `-text` is what keeps git's own CRLF conversion away from the ciphertext —
+without it, any attribute declaring such a path `text` makes git rewrite the
+encrypted bytes: measured on a 2 MB file, `git add` exits 0, the damaged blob is
+committed, and the file is unrecoverable at checkout.
 
 The cost of covering everything is the diff driver, which git spawns once per
 blob — there is no long-running protocol for `textconv` as there is for filters.
 Measured on git 2.55, against the same repository with the driver unregistered:
 
-| files in the diff | default | `--per-pattern` |
+| files in the diff | what `init` writes | after `git-xcrypt sync` |
 | --- | --- | --- |
 | 5 | 72 ms | 21 ms |
 | 20 | 201 ms | 22 ms |
 | 1000 | 8461 ms | 23 ms |
 
-An everyday diff pays nothing you would notice, so the line `init` writes is
-fine to keep. Running `git-xcrypt sync` replaces it with a line per declared
-pattern —
+An everyday diff pays nothing you would notice, so the two lines are fine to
+keep. If your reviews routinely span hundreds of files, `git-xcrypt sync`
+replaces them with a line per declared pattern:
 
 ```
 * filter=git-xcrypt
 **/secrets/** filter=git-xcrypt -text diff=git-xcrypt
-*.key filter=git-xcrypt -text diff=git-xcrypt
+*.env filter=git-xcrypt -text diff=git-xcrypt
 ```
 
-— which confines the diff driver to declared paths and lets git go on
-normalising line endings everywhere else. The trade is that these lines *can*
-go stale, so run `sync` after every change to `.git-xcrypt` — and if you forget,
-the filter says so on `stderr` the next time it encrypts something, without
-refusing the operation. `sync` also counts the lines outside its section that
-set `filter`, `text`, `eol` or `crlf` and points at `status`: git takes the last
-match, so one of them may outrank what `sync` just wrote, and only `status`
-resolves the attributes far enough to say. `sync --global` goes back to the single line. `sync --check` exits 1 on a section that matches
-no shape this build writes, which makes it usable as a CI gate.
+That confines the diff driver to declared paths and lets git go on normalising
+line endings everywhere else. The trade is that these lines *can* go stale, so
+run `sync` after every change to `.git-xcrypt`. If you forget, the filter says
+so on `stderr` the next time it encrypts something, without refusing the
+operation:
+
+```
+git-xcrypt: .gitattributes no longer matches .git-xcrypt — run `git-xcrypt sync`.
+```
+
+`sync` also counts the lines outside its section that set `filter`, `text`,
+`eol` or `crlf` and points at `status`: git takes the last match, so one of them
+may outrank what `sync` just wrote, and only `status` resolves the attributes
+far enough to say. `sync --global` goes back to the two lines. `sync --check`
+exits 1 on a section that matches no shape this build writes, which makes it
+usable as a CI gate.
 
 ### On a second machine
 
@@ -274,8 +429,9 @@ differently:
   Measured on git 2.55: 34 `CR` bytes eaten out of a 2 MB blob, `git add` and
   `git commit` both exit 0, and the next checkout fails the authentication tag
   and leaves no file at all. Nothing is exposed; the file is simply gone, and no
-  key will ever bring it back. This is what the managed `-text` prevents, and
-  why `sync` belongs in your workflow rather than being cosmetic.
+  key will ever bring it back. This is what the managed `-text` prevents — the
+  line `init` writes covers every path, the ones `sync` writes cover the
+  declared ones.
 
   **Since 2026-08-05 the filter refuses this outright**, so the sentence above
   describes what *would* happen rather than what does. Git converts the filter's
