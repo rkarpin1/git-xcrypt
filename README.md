@@ -492,6 +492,14 @@ exits 0, and the first thing that would have told you was the failed checkout.
   `git-xcrypt unlock <key-file>`, then ask again. A shallow clone of the same
   repository exits `6` once it is unlocked: nothing is wrong with it, but the
   history it never fetched cannot be vouched for.
+- **Hardware AES on aarch64 depends on how you installed.** `aes` 0.8 keeps the
+  ARMv8 crypto extensions behind an opt-in cfg and offers no feature switch, so
+  this repository passes the flag through `.cargo/config.toml`. Cargo reads that
+  file from the directory it is invoked in and never from the crate it is
+  compiling, so release binaries and builds from a clone run the hardware
+  backend while `cargo install git-xcrypt` from the registry runs the software
+  one — measured at roughly 15× slower on a large file. §Building has the flag
+  to pass if you want it anyway. Not one stored byte differs between the two.
 - **Real git only.** The filter is registered under the long-running protocol
   (`filter.<driver>.process`). Clients that reimplement git rather than calling
   it — JGit, and tools built on libgit2 — may not speak it and may treat the
@@ -562,6 +570,23 @@ there). The binary is self-contained: no external libraries and no child
 processes, `gpg` included.
 
 Being named `git-xcrypt` and on `PATH` also makes `git xcrypt <command>` work.
+
+On **aarch64** — Apple Silicon and aarch64 Linux — the hardware AES instructions
+sit behind an opt-in flag in the cipher crate, and `.cargo/config.toml` in this
+repository passes it. Cargo reads that file from the directory it is *invoked*
+in, so a build from a clone gets the flag and so do the published release
+binaries; `cargo install git-xcrypt` from the registry does **not**, even though
+the file is packaged inside the crate. Measured on `aarch64-apple-darwin`,
+`--release`: an 8 MB blob through `git-xcrypt diff` takes 148 ms without it and
+9 ms with it. To install from the registry on aarch64 and still get that, take a
+release binary, or pass the flag yourself:
+
+```sh
+RUSTFLAGS="--cfg aes_armv8" cargo install git-xcrypt
+```
+
+Nothing stored changes either way — both backends compute the same AES, and the
+frozen format vectors pass with the flag and without it. Only speed differs.
 
 ## Verifying a downloaded release
 

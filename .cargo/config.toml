@@ -29,6 +29,15 @@
 # invoked in, so it covers the release workflow, `cargo build` and
 # `cargo install --path .` from a clone — but not `cargo install git-xcrypt`
 # from crates.io, which builds with cargo's own defaults and gets the software
-# backend on aarch64.
+# backend on aarch64. Named in `README.md` twice — at §Building, with the
+# `RUSTFLAGS` line that gets it back, and in §Known limitations.
+#
+# A build script does not close that gap, so nobody needs to try it twice: a
+# `cargo::rustc-cfg` emitted from `build.rs` applies to the crate that carries
+# the script, and this flag has to land on the compilation of the `aes`
+# dependency. There is no feature switch either — `aes` 0.8 gates the backend on
+# the cfg alone. The thing to check when `aes-siv` reaches a stable 0.8 is
+# whether a newer `aes` detects ARMv8 by itself; if it does, this file goes away
+# with the bump.
 [target.'cfg(target_arch = "aarch64")']
 rustflags = ["--cfg", "aes_armv8"]
