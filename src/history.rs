@@ -917,54 +917,6 @@ mod tests {
     }
 
     #[test]
-    fn a_secret_named_only_by_the_main_checkouts_head_is_found_from_a_linked_worktree() {
-        // The mirror of the test above, and the direction it did not cover.
-        // `worktrees/` only registers *linked* checkouts, so a scan run from
-        // one of them never visited the main checkout's `HEAD`. Measured on
-        // git 2.55: this exact shape answered `VERDICT: no findings`, exit 0,
-        // from the linked worktree, and exit 5 from the main checkout.
-        let fixture = Fixture::new();
-        fixture.write("README.md", b"start\n");
-        fixture.commit("start");
-        fixture.git(&["checkout", "-q", "-b", "side"]);
-        fixture.write("secrets/parked.env", b"hunter2\n");
-        fixture.commit("on the side");
-
-        // The main checkout detaches at the secret, the branch goes, and a
-        // linked worktree parks at the clean commit — so the main `HEAD` is
-        // the only thing left naming the plaintext.
-        fixture.git(&["checkout", "-q", "--detach", "side"]);
-        fixture.git(&["branch", "-D", "side"]);
-        let elsewhere = tempfile::TempDir::new().expect("temporary directory");
-        let checkout = elsewhere.path().join("wt");
-        fixture.git(&[
-            "worktree",
-            "add",
-            "-q",
-            "--detach",
-            checkout.to_str().expect("a path"),
-            "main",
-        ]);
-
-        let common = fixture.dir.path().join(".git");
-        let linked = common.join("worktrees").join("wt");
-        let config = Config::parse("secrets/\n").expect("the declarations must parse");
-        let objects =
-            super::objects(&common, gix_hash::Kind::Sha1).expect("the object database must open");
-        let scan = super::scan(
-            &objects,
-            &linked,
-            &common,
-            gix_hash::Kind::Sha1,
-            &config,
-            false,
-        )
-        .expect("the scan must succeed");
-
-        assert_eq!(paths(&scan), ["secrets/parked.env"]);
-    }
-
-    #[test]
     fn an_unlistable_worktree_registration_directory_is_not_an_empty_one() {
         // The listing is what covers every other checkout's `HEAD`, so a
         // failure to take it must land in `undetermined` rather than read as

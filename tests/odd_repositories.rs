@@ -416,6 +416,62 @@ fn every_unusual_repository_gets_an_answer_and_the_right_one() {
     );
     std::fs::remove_file(main.path().join(".git/info/attributes")).expect("removing it again");
 
+    // --- A leak only the main checkout's HEAD still names. -------------------
+    //
+    // `worktrees/` registers *linked* checkouts only, so a scan run from one of
+    // them has to remember the main checkout by another route — its `HEAD` is
+    // not in any list the linked git directory holds. Measured on git 2.55
+    // before the fix: this exact shape answered `VERDICT: no findings`, exit 0,
+    // from the linked worktree, and exit 5 from the main checkout — the same
+    // repository, two answers, and the clean one from the checkout a CI job is
+    // as likely to run in as any other.
+    //
+    // The construction parks the plaintext where only the main `HEAD` names
+    // it: committed on a branch while nothing was declared, the branch deleted,
+    // the main checkout left detached on that commit, and the linked worktree
+    // detached on the clean start.
+    let parked = TestRepo::init();
+    parked.init_xcrypt();
+    parked.write_xcrypt_config("# nothing declared yet\n");
+    parked.write_file("README.md", b"start\n");
+    parked.commit_all("start");
+    parked.git_ok(["checkout", "-q", "-b", "side"]);
+    parked.write_file("secrets/parked.env", SECRET);
+    parked.commit_all("the leak, while nothing was declared");
+    parked.git_ok(["checkout", "-q", "--detach", "side"]);
+    parked.git_ok(["branch", "-D", "side"]);
+
+    let elsewhere = tempfile::TempDir::new().expect("could not create a temporary directory");
+    let wt = elsewhere.path().join("wt");
+    parked.git_ok([
+        "worktree",
+        "add",
+        "-q",
+        "--detach",
+        &wt.to_string_lossy(),
+        "main",
+    ]);
+    // Declared in the checkout the question is asked from: the linked tree sits
+    // on the start commit, whose `.git-xcrypt` declares nothing.
+    std::fs::write(wt.join(".git-xcrypt"), b"secrets/\n").expect("declaring in the linked tree");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_git-xcrypt"))
+        .current_dir(&wt)
+        .arg("status")
+        .output()
+        .expect("could not run git-xcrypt");
+    expect(
+        "a linked worktree of a repository whose leak only the main HEAD names",
+        &output,
+        EXPOSED,
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("secrets/parked.env"),
+        "a linked worktree of a repository whose leak only the main HEAD names: \
+         the finding must name the path:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
     // --- One reference that will not parse, among others that do. -----------
     //
     // The store enumerates fine here; a single reference inside it does not.
