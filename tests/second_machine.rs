@@ -13,6 +13,8 @@
 
 mod harness;
 
+use std::fs;
+
 use harness::{BareRemote, MAGIC, OVERHEAD, TestRepo};
 use tempfile::TempDir;
 
@@ -85,7 +87,28 @@ fn a_clone_becomes_a_working_second_machine_and_its_edits_come_home() {
     let key_file = courier.path().join("repo.key");
     first.xcrypt_ok(["export-key", &key_file.to_string_lossy()]);
 
-    // The wrong one first, which is what a directory of exported keys makes
+    // A file that is not a key file at all, first. Carrying the export through
+    // a password manager or an email is exactly where a paste picks up stray
+    // characters, and a key file is user input: the convention is a named
+    // refusal, never a panic. Measured before the fix: this header's sixteen
+    // bytes are six characters, a slice landed inside one, and `import-key`
+    // aborted with `byte index 2 is not a char boundary` — exit 101, no file
+    // named. The exit code is the assertion: a panic cannot say `4`.
+    let mangled = courier.path().join("mangled.key");
+    fs::write(&mangled, "git-xcrypt-key-v1 a€€€€€\nAAAA\n").expect("writing");
+    let refused = second.xcrypt(["import-key", &mangled.to_string_lossy()]);
+    assert_eq!(
+        refused.status.code(),
+        Some(4),
+        "a mangled key file must be a format refusal, not a crash:\n{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(
+        !second.path().join(".git/git-xcrypt/keys/default").exists(),
+        "a refused import installed something anyway"
+    );
+
+    // The wrong one next, which is what a directory of exported keys makes
     // easy. Every file here is encrypted under a `key_id` this key does not
     // answer for, and the command has to find that out *before* it writes
     // anything: an unlock that installed the key and then gave up would leave a

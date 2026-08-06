@@ -409,23 +409,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_header_with_multi_byte_characters_is_refused_rather_than_panicked_over() {
-        // The length gate counts bytes and the digit loop slices by byte
-        // offsets, so a header whose sixteen bytes are six characters landed a
-        // slice inside one and panicked -- measured, `import-key` on this exact
-        // shape aborted with `byte index 2 is not a char boundary` instead of
-        // naming the file. A key file is user input, and the convention is no
-        // panic on user input, so this must be a named refusal. Not
-        // `expect_err`: `MasterKey` has no `Debug` on purpose.
-        match decode_portable("git-xcrypt-key-v1 a\u{20ac}\u{20ac}\u{20ac}\u{20ac}\u{20ac}\nAAAA\n")
-        {
-            Err(Error::Format(_)) => {}
-            Err(other) => panic!("the refusal must be a format error, got: {other}"),
-            Ok(_) => panic!("a non-hex fingerprint must be refused"),
-        }
-    }
-
     #[cfg(unix)]
     #[test]
     fn a_portable_key_file_is_owner_only() {
