@@ -255,6 +255,7 @@ Do wzięcia został jeden element: `S-07`. `S-08` zamknięty 2026-08-04, w wymag
 - **Kompatybilność z repozytoriami oryginalnego git-crypt** — Dlaczego: PRD §Non-Goals; własny format bez ścieżki migracji.
 - **Ukrywanie metadanych** — Dlaczego: PRD §Non-Goals; nazwy plików, rozmiary i fakt zmiany pozostają jawne z założenia konstrukcji.
 - **Ochrona przed skompromitowaną maszyną** — Dlaczego: PRD §Non-Goals; po odblokowaniu sekrety leżą jawnie na dysku.
+- **Buforowanie dyskowe dla wielkich plików** — Dlaczego: odłożone świadomie 2026-08-06 (`zalozenia.md` §Otwarte decyzje poz. 5). Dziś każdy plik trafia do RAM w całości i **szczyt pamięci wynosi ~2× jego rozmiar** — zmierzone: 128 MB → 258 MB RSS. Odłożenie nic nie zamraża: obie drogi wyjścia (buforowanie na dysku, nowy `suite` z trybem blokowym) mieszczą się w zamrożonym formacie, więc powrót do tematu nie kosztuje więcej później niż dziś. Wraca przy pierwszym zgłoszeniu OOM albo przy decyzji o wspieraniu plików rzędu gigabajta; produkt celuje dziś w pliki konfiguracyjne rzędu kilobajtów.
 - **Natywne czyszczenie historii (`purge-history`)** — Dlaczego: rozstrzygnięte 2026-08-04. Własny odpowiednik `git-filter-repo` w Ruście to element wielkości `S-01` (wywołanie zewnętrznego narzędzia odpada przez wymóg samowystarczalnej binarki), a operacja i tak nie cofa wycieku — sekret zostaje w forkach, cache'ach i cudzych klonach. W v0.1 `S-06` raportuje ekspozycję i wypisuje procedurę zaczynającą się od rotacji sekretu.
 
 ## Done
