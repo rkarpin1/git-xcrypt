@@ -30,7 +30,11 @@ changed anything from.
   stale. `sync` replaces them with a line per declared pattern —
   `*.key filter=git-xcrypt -text diff=git-xcrypt` — which confines the diff
   driver to declared paths; git spawns it per blob, and a 1000-file diff was
-  measured at 8461 ms against 23 ms. `sync --global` goes back.
+  measured at 8461 ms against 23 ms. `sync --global` goes back, `--ignorecase`
+  spells each ASCII letter as a class, and `--check` reports a stale section
+  through exit code 1 instead of writing. `sync` also counts the lines outside
+  its section that set `filter`, `text`, `eol` or `crlf` and points at `status`:
+  git takes the last match, so one of them may outrank what it just wrote.
 - **`.git-xcrypt`**, a versioned declaration in `.gitignore` syntax, as the one
   source of truth for what is encrypted. Negations, directory patterns and
   anchoring behave as they do in `.gitignore`; after a pattern you may write the
@@ -40,6 +44,13 @@ changed anything from.
 - **Commands** `init`, `sync`, `status`, `export-key`, `unlock`, `lock`, plus
   `diff` and `process`, which `init` registers for git to call.
   See the table in `README.md`.
+- **`export-key` will not write the key anywhere git can pick it up.** A
+  destination inside the working tree is refused, and so is one inside any other
+  checkout of the same repository or inside the git directory; an existing file
+  is refused unless `--force` says the replacement is meant, because that file
+  is somebody's only way back into a different repository. On Unix the export is
+  written with mode `0600`; on Windows nothing narrows it, so there the
+  directory you pick *is* the protection.
 - **A key can reach CI without touching the disk.** `export-key --stdout` pipes
   it into a secret store and refuses a terminal, where it would survive in the
   scrollback; `unlock --key <text>` takes the same text back. Both carry the
@@ -48,6 +59,18 @@ changed anything from.
   visible to `ps` while the command runs and is recorded by an interactive
   shell, and a redirect out of `--stdout` escapes the checks that keep a key out
   of the working tree.
+- **`unlock --key-only`** installs the key and repairs the filter registration
+  without decrypting anything, for a checkout that should stay as it is. The
+  evidence check still runs, so a key the working tree's own headers contradict
+  is refused before it reaches disk.
+- **`lock` refuses over everything it cannot account for**, because it deletes
+  the only copy of the key and `unlock` will not undo that. It asks for a typed
+  `yes` (`--yes` skips the question, never the warning), names the key by
+  fingerprint and never by material, and refuses outright when a declared file
+  holds uncommitted changes, when another checkout of the same repository reads
+  the same key, or when either appears while it is running — the working tree
+  and the other checkouts are both re-examined after the answer and again after
+  the encryption pass.
 - **`status` as a CI gate.** It scans the whole reachable history for
   declared paths stored in the clear, resolves git's own `filter` and
   `text`/`eol` attributes for every declared path the way `git check-attr` does,
@@ -58,11 +81,15 @@ changed anything from.
   encryption is identical on every machine; the choice of LF or CRLF on the way
   out reads git's configuration, which is the only place a difference between
   machines is wanted.
-- **Two automatic checks on the `git add` path.** A warning when a file is
-  encrypted for the first time and the same path already sits in `HEAD` in the
-  clear, and a refusal — not a warning — when git's attribute stack would
-  convert the ciphertext about to be written, which is otherwise unrecoverable
-  at checkout.
+- **Three automatic checks on the `git add` path**, and only one of them stops
+  anything. A warning when a file is encrypted for the first time and the same
+  path already sits in `HEAD` in the clear. A warning when the managed
+  `.gitattributes` section no longer matches the declaration, said once per git
+  operation rather than once per file. And a refusal — not a warning — when
+  git's attribute stack would convert the ciphertext about to be written, which
+  is otherwise unrecoverable at checkout. The two warnings never return a
+  non-zero code: with `filter.git-xcrypt.required = true` that would abort every
+  git operation in the repository, which neither state deserves.
 - **Ready-made binaries** for Linux (musl, x86_64 and aarch64), macOS (x86_64
   and aarch64) and Windows (MSVC, x86_64), each with a SHA-256 sum and a
   [build provenance attestation](https://github.com/rkarpin1/git-xcrypt#verifying-a-downloaded-release)
