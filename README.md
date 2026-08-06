@@ -235,8 +235,12 @@ git-xcrypt: .gitattributes no longer matches .git-xcrypt — run `git-xcrypt syn
 `eol` or `crlf` and points at `status`: git takes the last match, so one of them
 may outrank what `sync` just wrote, and only `status` resolves the attributes
 far enough to say. `sync --global` goes back to the two lines. `sync --check`
-exits 1 on a section that matches no shape this build writes, which makes it
-usable as a CI gate.
+exits **2** on a section that matches no shape this build writes, which makes it
+usable as a CI gate — the same code, on the same state, that `status` gives:
+a section that no longer covers every declared path is a setup that is not
+enforcing what it declares. Exit 1 stays what it has always been, a usage error,
+so a job can tell a stale section from a mistyped flag; before 2026-08-06 both
+were 1 and `status` disagreed with `sync --check` about the state entirely.
 
 ### On a second machine
 
@@ -332,7 +336,7 @@ Those are speed bumps in front of the cliff. They are not a backup.
 | Command | What it does |
 | --- | --- |
 | `init` | Generate the repository key, register the filter and the diff driver, create `.git-xcrypt`, write the managed `.gitattributes` section. |
-| `sync` | Rewrite the managed `.gitattributes` section as one line per declared pattern. `--global` writes instead the single line `init` starts with, which covers everything and cannot go stale; `--ignorecase` spells every ASCII letter as a class. `--check` reports staleness through exit code 1 instead of writing. |
+| `sync` | Rewrite the managed `.gitattributes` section as one line per declared pattern. `--global` writes instead the single line `init` starts with, which covers everything and cannot go stale; `--ignorecase` spells every ASCII letter as a class. `--check` reports staleness through exit code 2 instead of writing. |
 | `status` | Report whether your declarations are actually enforced, scanning the whole reachable history. `--fix` re-stages declared files the index holds in the clear. Exits `2` when the setup does not enforce anything, `5` on a finding, `6` when it could not tell. |
 | `export-key` | Write the repository key to a file outside the working tree. This is also how you make the backup nothing else makes — see above. `--stdout` pipes it instead, for a secret store; refused when standard output is a terminal. |
 | `unlock` | Decrypt the working tree and register the filter, installing a key first if one is given — as a path, or as `--key <text>` for a CI secret. `--key-only` puts the key in place and repairs the setup without decrypting anything. |

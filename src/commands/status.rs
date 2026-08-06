@@ -134,6 +134,35 @@ pub enum SetupGap {
     /// because without the declaration neither the index nor history can be
     /// judged at all.
     DeclarationMissing,
+    /// The managed `.gitattributes` section no longer matches `.git-xcrypt`.
+    ///
+    /// **A gap since 2026-08-06, and a note before that** (open decision 11).
+    /// What forced the change was not the severity but a contradiction: on one
+    /// and the same stale section `sync --check` exited `1` and `status` exited
+    /// `0` printing `VERDICT: no findings.` — two commands of one tool
+    /// disagreeing about one state, so the answer a CI job got depended on which
+    /// one it happened to run.
+    ///
+    /// **The argument for keeping it a note is recorded rather than erased,
+    /// because it is true:** it takes a *foreign* `text` attribute to make this
+    /// cost anything, since our own magic starts with NUL and `text=auto` or
+    /// `core.autocrlf` alone see binary and leave the ciphertext be. So this is
+    /// the one gap in this list that is conditional. It was resolved the other
+    /// way because the condition is invisible from here — the foreign attribute
+    /// may arrive in a `.gitattributes` a subdirectory away, or in
+    /// `$GIT_DIR/info/attributes`, which is not versioned — and because a
+    /// declaration whose `-text` does not reach every declared path is, in the
+    /// plain sense of what this command answers, not being enforced.
+    ///
+    /// What it costs when the condition is met is measured, on git 2.55: a 2 MB
+    /// file lost 34 `CR` bytes out of its **ciphertext**, `git add` exited 0,
+    /// the commit succeeded, and the checkout failed the authentication tag and
+    /// left no file at all. Nobody can decrypt that blob, ever.
+    ///
+    /// Every rendering this build writes counts as current, so a repository that
+    /// ran `sync --global` or `sync --ignorecase` is not sent to run the very
+    /// command that produced its section.
+    SectionStale,
     /// A file the whole mechanism bootstraps from is not tracked.
     ///
     /// `.gitattributes` is what makes git call the filter and `.git-xcrypt` is
@@ -215,6 +244,20 @@ impl fmt::Display for SetupGap {
                  enforced either. `git-xcrypt init` creates one; a clone gets it \
                  from the commit that carries it",
                 config = crate::git::repo::CONFIG_FILE
+            ),
+            Self::SectionStale => write!(
+                f,
+                "{} no longer matches {} — the per-pattern lines are out of \
+                 date, so the `-text` that keeps git's own CRLF conversion off \
+                 the ciphertext does not reach every declared path. Nothing is \
+                 stored in the clear over this, and it costs nothing until some \
+                 other attribute source declares one of those paths `text` — at \
+                 which point git corrupts the blob silently and the file is gone \
+                 at checkout, unrecoverably. A clone's `unlock` will also \
+                 rewrite the section and leave `git status` dirty. \
+                 `git-xcrypt sync` settles both",
+                crate::git::repo::ATTRIBUTES_FILE,
+                crate::git::repo::CONFIG_FILE
             ),
             Self::Untracked(path) => write!(
                 f,
@@ -977,7 +1020,7 @@ pub fn run(repo: &Repo, fix: bool) -> Result<Report> {
         return Ok(report);
     }
     report.warnings.extend(declarations.pointless_eol.clone());
-    report.notes.extend(stale_section_note(repo, &declarations));
+    report.setup.extend(stale_section_gap(repo, &declarations));
 
     let hash = index::object_hash(gitconfig::get(&config, "extensions.objectformat").as_deref());
     let objects = history::objects(repo.common_dir(), hash)?;
@@ -1577,25 +1620,11 @@ fn named(name: &[u8], err: crate::Error) -> crate::Error {
     }
 }
 
-/// Mentions a `.gitattributes` section that no longer matches `.git-xcrypt`.
+/// Reports a `.gitattributes` section that no longer matches `.git-xcrypt`.
 ///
-/// A note, never a gap: nothing here stores a secret in the clear, and code `5`
-/// means an exposure. But the note used to call the consequence a dirty `git
-/// status` after a clone's `unlock`, and that understates it badly enough to be
-/// its own defect — the wording is part of the safeguard, not decoration.
-///
-/// Measured on git 2.55. A declared path whose managed `-text` line is missing
-/// still gets encrypted (the filter reads `.git-xcrypt`, not `.gitattributes`),
-/// but git then applies **its own** CRLF conversion to the ciphertext whenever
-/// any other attribute source declares that path `text`. On a 2 MB file that ate
-/// 34 `CR` bytes: `git add` exited 0, the commit succeeded, and the later
-/// checkout failed the authentication tag and left no file at all. The blob in
-/// history cannot be decrypted by anyone, ever.
-///
-/// It takes a foreign `text` attribute to fire — our own magic starts with NUL,
-/// so `text=auto` and `core.autocrlf` alone see binary and leave it be — which
-/// is why this stays a note rather than a gap. It is not, however, cosmetic.
-fn stale_section_note(repo: &Repo, declarations: &Config) -> Option<String> {
+/// A [`SetupGap::SectionStale`] since 2026-08-06, where the reasoning lives; it
+/// was a note until then, and `sync --check` disagreed with it.
+fn stale_section_gap(repo: &Repo, declarations: &Config) -> Option<SetupGap> {
     // Either rendering counts as current. `sync --ignorecase` writes the folded
     // form deliberately, and a note that called it stale would send its user to
     // run the very command that produced it — a loop with no exit. What this
@@ -1613,19 +1642,7 @@ fn stale_section_note(repo: &Repo, declarations: &Config) -> Option<String> {
     }
     let lines = attributes::render_lines(declarations, attributes::Rendering::Global);
     let (existing, desired) = attributes::desired(&path, &lines).ok()?;
-    (existing != desired).then(|| {
-        format!(
-            "{} no longer matches {} — the per-pattern lines are out of date. \
-             Nothing is stored in the clear over this, but the missing `-text` \
-             lets git apply its own CRLF conversion to the ciphertext of any \
-             path some other attribute declares `text`, which corrupts the blob \
-             silently and costs the file at checkout. A clone's `unlock` will \
-             also rewrite the section and leave `git status` dirty. \
-             `git-xcrypt sync` settles both.",
-            crate::git::repo::ATTRIBUTES_FILE,
-            crate::git::repo::CONFIG_FILE
-        )
-    })
+    (existing != desired).then_some(SetupGap::SectionStale)
 }
 
 /// Mentions an absent diff driver, without letting it fail the gate.

@@ -270,9 +270,29 @@ fn a_forgotten_sync_fails_the_gate_and_running_it_reaches_the_whole_subtree() {
     let stale = repo.xcrypt(["sync", "--check"]);
     assert_eq!(
         stale.status.code(),
-        Some(1),
+        Some(2),
         "a stale section passed the gate, so CI would never notice:\n{}",
         String::from_utf8_lossy(&stale.stderr)
+    );
+
+    // `2`, not `1`, since 2026-08-06 — open decision 11. Code `1` carried five
+    // answers at once, a mistyped flag among them, so a CI job could not tell
+    // "the section is stale" from "you called me wrong" and the two need
+    // opposite fixes. What settles which code it should be is the agreement
+    // below: `status` answers the same thing about the same state, and until
+    // this change it exited `0` here saying `VERDICT: no findings.`
+    let seen = repo.xcrypt(["status"]);
+    assert_eq!(
+        seen.status.code(),
+        Some(2),
+        "`sync --check` calls this section stale and `status` does not — one \
+         tool, one state, two verdicts, and a CI job gets whichever it ran:\n{}",
+        String::from_utf8_lossy(&seen.stdout)
+    );
+    let said = String::from_utf8_lossy(&seen.stdout).into_owned();
+    assert!(
+        said.contains("no longer matches") && said.contains("sync"),
+        "the gap has to name the file and the one command that settles it:\n{said}"
     );
     assert_eq!(
         repo.worktree_bytes(".gitattributes"),

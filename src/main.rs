@@ -26,7 +26,7 @@ Exit codes:
   0  success
   1  usage error, or a failure with no better code
   2  configuration or a state conflict — including a `status` run that found
-     the setup enforcing nothing
+     the setup enforcing nothing, and a stale section under `sync --check`
   3  no repository key
   4  bad format: magic, key id, unknown flag bit, or a failed tag
   5  `status` found an exposure
@@ -644,12 +644,18 @@ fn sync_and_describe(check: bool, global: bool, ignorecase: bool) -> Result<Exit
             eprintln!("git-xcrypt: {attributes} was already up to date; nothing changed");
             ExitCode::SUCCESS
         }
+        // `CONFIG`, not `USAGE`, since 2026-08-06 — open decision 11. A stale
+        // section is a configuration that does not enforce what it declares,
+        // which is exactly what code `2` means and exactly what `status` now
+        // answers on the same state. Code `1` had five meanings here, among them
+        // a mistyped flag, so a CI job could not tell "the section is stale" from
+        // "you called me wrong" — and the fix for those two is opposite.
         Outcome::Stale => {
             eprintln!(
                 "git-xcrypt: {attributes} is out of date with {}; run `git-xcrypt sync`",
                 git_xcrypt::git::repo::CONFIG_FILE
             );
-            ExitCode::from(exit::USAGE)
+            ExitCode::from(exit::CONFIG)
         }
     })
 }

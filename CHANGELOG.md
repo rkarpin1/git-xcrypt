@@ -32,9 +32,11 @@ changed anything from.
   driver to declared paths; git spawns it per blob, and a 1000-file diff was
   measured at 8461 ms against 23 ms. `sync --global` goes back, `--ignorecase`
   spells each ASCII letter as a class, and `--check` reports a stale section
-  through exit code 1 instead of writing. `sync` also counts the lines outside
-  its section that set `filter`, `text`, `eol` or `crlf` and points at `status`:
-  git takes the last match, so one of them may outrank what it just wrote.
+  through exit code 2 instead of writing — the same code `status` gives on the
+  same state, so a CI job gets one answer rather than whichever command it ran.
+  `sync` also counts the lines outside its section that set `filter`, `text`,
+  `eol` or `crlf` and points at `status`: git takes the last match, so one of
+  them may outrank what it just wrote.
 - **`.git-xcrypt`**, a versioned declaration in `.gitignore` syntax, as the one
   source of truth for what is encrypted. Negations, directory patterns and
   anchoring behave as they do in `.gitignore`; after a pattern you may write the
@@ -128,7 +130,10 @@ future change goes in a new `suite` byte, not in a new version of these:
   the clear.
 - **Exit codes** — `0` success, `1` usage or unclassified failure, `2`
   configuration or state conflict, `3` no key, `4` bad format, `5` `status`
-  found an exposure, `6` `status` could not tell.
+  found an exposure, `6` `status` could not tell. A stale managed section is a
+  `2` from both `sync --check` and `status`: it used to be a `1` from one and a
+  clean `0` from the other, which meant the verdict depended on which command a
+  job happened to run.
 
 ### Deliberately not in this release
 
