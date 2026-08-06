@@ -6,8 +6,8 @@
 use std::io;
 
 use crate::Result;
-use crate::filter::{self, Context};
-use crate::repo::Repo;
+use crate::commands::filter::{self, Context};
+use crate::git::repo::Repo;
 
 /// Serves git's filter protocol until the stream closes.
 ///

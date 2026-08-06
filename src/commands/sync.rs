@@ -8,9 +8,10 @@
 //! `--check` exists so a CI job can say "the section is out of date" without
 //! writing to the working tree.
 
-use crate::config::Config;
-use crate::repo::{CONFIG_FILE, Repo};
-use crate::{Error, Result, gitattributes};
+use crate::git::attributes;
+use crate::git::repo::{CONFIG_FILE, Repo};
+use crate::rules::declaration::Config;
+use crate::{Error, Result};
 
 /// What `sync` found, and what it did about it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,7 +54,7 @@ pub struct Report {
 /// [`Error::Config`] when `.git-xcrypt` is absent or cannot be understood, or
 /// when the managed section in `.gitattributes` has unbalanced markers;
 /// [`Error::Io`] on a read or write failure.
-pub fn run(repo: &Repo, check: bool, rendering: gitattributes::Rendering) -> Result<Report> {
+pub fn run(repo: &Repo, check: bool, rendering: attributes::Rendering) -> Result<Report> {
     let config = Config::load(&repo.xcrypt_config_path())?;
     if config.missing {
         return Err(Error::Config(format!(
@@ -62,7 +63,7 @@ pub fn run(repo: &Repo, check: bool, rendering: gitattributes::Rendering) -> Res
         )));
     }
 
-    let lines = gitattributes::render_lines(&config, rendering);
+    let lines = attributes::render_lines(&config, rendering);
     let path = repo.attributes_path();
 
     let outcome = if check {
@@ -73,16 +74,16 @@ pub fn run(repo: &Repo, check: bool, rendering: gitattributes::Rendering) -> Res
         // run `sync`, and failing it there would teach the gate's owner to
         // ignore it.
         // A section that matches *none* of them is what staleness looks like.
-        let current = gitattributes::ACCEPTED.into_iter().any(|rendering| {
-            let lines = gitattributes::render_lines(&config, rendering);
-            gitattributes::desired(&path, &lines).is_ok_and(|(existing, wanted)| existing == wanted)
+        let current = attributes::ACCEPTED.into_iter().any(|rendering| {
+            let lines = attributes::render_lines(&config, rendering);
+            attributes::desired(&path, &lines).is_ok_and(|(existing, wanted)| existing == wanted)
         });
         if current {
             Outcome::UpToDate
         } else {
             Outcome::Stale
         }
-    } else if gitattributes::write_section(&path, &lines)? {
+    } else if attributes::write_section(&path, &lines)? {
         Outcome::Updated
     } else {
         Outcome::UpToDate
@@ -91,7 +92,7 @@ pub fn run(repo: &Repo, check: bool, rendering: gitattributes::Rendering) -> Res
     // Cheap: one read of a file already on disk, no attribute resolution. An
     // unreadable `.gitattributes` answers zero rather than failing — `sync` has
     // just written it, and the gate for that state is `status`.
-    let foreign = gitattributes::foreign_lines_touching(&path, &["filter", "text", "eol", "crlf"])
+    let foreign = attributes::foreign_lines_touching(&path, &["filter", "text", "eol", "crlf"])
         .map(|lines| lines.len())
         .unwrap_or(0);
 
@@ -139,7 +140,7 @@ mod tests {
         let (_dir, repo) = prepared("secrets/\n");
         let before = fs::read_to_string(repo.attributes_path()).expect("attributes");
         assert_eq!(
-            run(&repo, true, gitattributes::Rendering::Global)
+            run(&repo, true, attributes::Rendering::Global)
                 .expect("check must succeed")
                 .outcome,
             Outcome::UpToDate,
@@ -148,7 +149,7 @@ mod tests {
         fs::write(repo.xcrypt_config_path(), "secrets/\n*.env\nmore/\n")
             .expect("changing the declarations");
         assert_eq!(
-            run(&repo, true, gitattributes::Rendering::Global)
+            run(&repo, true, attributes::Rendering::Global)
                 .expect("check must succeed")
                 .outcome,
             Outcome::UpToDate,
@@ -163,7 +164,7 @@ mod tests {
         // Split, and it can. That is the trade a plain `sync` buys into: the
         // diff driver stops running for undeclared paths, and `sync` becomes
         // something to run after every change to the declaration.
-        let per_pattern = gitattributes::Rendering::PerPattern { fold_case: false };
+        let per_pattern = attributes::Rendering::PerPattern { fold_case: false };
         run(&repo, false, per_pattern).expect("sync");
         assert_eq!(
             run(&repo, true, per_pattern).expect("check").outcome,

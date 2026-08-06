@@ -39,12 +39,13 @@ use std::path::{Path, PathBuf};
 
 use bstr::ByteSlice as _;
 
-use crate::config::EolMode;
-use crate::decide::{self, Outcome};
-use crate::format::looks_encrypted;
-use crate::key::MasterKey;
-use crate::repo::Repo;
-use crate::{Error, Result, keyfile};
+use crate::crypto::format::looks_encrypted;
+use crate::crypto::key::MasterKey;
+use crate::crypto::keyfile;
+use crate::git::repo::Repo;
+use crate::rules::decide::{self, Outcome};
+use crate::rules::declaration::EolMode;
+use crate::{Error, Result};
 
 /// Reads `path` and returns the text git should diff.
 ///
@@ -52,7 +53,7 @@ use crate::{Error, Result, keyfile};
 ///
 /// [`Error::Config`] for a path inside the git directory, [`Error::Io`] when the
 /// file cannot be read, [`Error::NoKey`] when it is ours and no key is loaded,
-/// and the errors [`crate::crypto::decrypt`] reports for content that is ours
+/// and the errors [`crate::crypto::cipher::decrypt`] reports for content that is ours
 /// but belongs to another key, is truncated or fails authentication.
 pub fn run(path: &Path) -> Result<Outcome> {
     // Discovered once, up front, because both branches want it: one to refuse a
@@ -112,7 +113,10 @@ fn resolved(path: &Path) -> Option<PathBuf> {
     } else {
         std::env::current_dir().ok()?.join(path)
     };
-    Some(fs::canonicalize(&absolute).unwrap_or_else(|_| crate::repo::lexically_normal(&absolute)))
+    Some(
+        fs::canonicalize(&absolute)
+            .unwrap_or_else(|_| crate::git::repo::lexically_normal(&absolute)),
+    )
 }
 
 /// Puts the path in front of a bare I/O failure.
@@ -206,7 +210,7 @@ fn name_of(path: &Path) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::key::MASTER_KEY_LEN;
+    use crate::crypto::key::MASTER_KEY_LEN;
 
     fn key() -> MasterKey {
         MasterKey::from_bytes([5u8; MASTER_KEY_LEN])
@@ -216,10 +220,10 @@ mod tests {
     fn a_key_file_is_refused_although_it_carries_no_data_magic() {
         // Both shapes. Neither starts with the data magic, so without this the
         // pass-through branch would print the repository's master key.
-        let exported = crate::keyfile::encode_portable(&key());
+        let exported = crate::crypto::keyfile::encode_portable(&key());
         for content in [exported.as_bytes(), b"\0GITXCRYPTKEY\0\x01somekeymaterial"] {
             let error = convert(Some(&key()), b"notes.txt", content).expect_err("must refuse");
-            assert_eq!(error.exit_code(), crate::exit::CONFIG);
+            assert_eq!(error.exit_code(), crate::util::exit::CONFIG);
             assert!(
                 error.to_string().contains("export-key"),
                 "the refusal must say where a key is allowed to go: {error}"

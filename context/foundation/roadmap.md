@@ -199,7 +199,7 @@ Fundament poniżej zakłada ten stan i nie tworzy ponownie niczego, co jest zgł
 - **Prerequisites:** S-01 (zrobiony)
 - **Parallel with:** —
 - **Blockers:** —
-- **Termin wiążący — dotrzymany.** Element zamknięty 2026-08-04, przed `S-07`, czyli przed pierwszym publicznym wydaniem binarki. `looks_binary` jest zamrożony razem z formatem (`src/eol.rs:47`) — dopóki nie istnieje ani jedno repozytorium poza tym projektem, poprawka kosztuje jedną linię; po wydaniu kosztuje nowy `suite`, bo przesuwa granicę tekst/binarny i przepisuje ciphertext istniejących plików.
+- **Termin wiążący — dotrzymany.** Element zamknięty 2026-08-04, przed `S-07`, czyli przed pierwszym publicznym wydaniem binarki. `looks_binary` jest zamrożony razem z formatem (`src/rules/eol.rs:47`) — dopóki nie istnieje ani jedno repozytorium poza tym projektem, poprawka kosztuje jedną linię; po wydaniu kosztuje nowy `suite`, bo przesuwa granicę tekst/binarny i przepisuje ciphertext istniejących plików.
 - **Znalezisko (2026-08-04, review `looks_binary`):** `gather_stats` w `convert.c` gita v2.55.0 kończy się korektą, której nasz port nie ma:
   ```c
   /* If file ends with EOF then don't count this EOF as non-printable. */
@@ -208,7 +208,7 @@ Fundament poniżej zakłada ten stan i nie tworzy ponownie niczego, co jest zgł
   ```
   Zweryfikowane na żywym gicie 2.55, nie tylko z lektury źródeł: repozytorium tymczasowe, `* text=auto`, plik o treści `a\r\n\x1a` → blob `61 0a 1a`, czyli git **znormalizował CRLF**, więc uznał plik za tekst. Nasz `looks_binary` na tej samej treści liczy `printable = 1`, `nonprintable = 1`, `0 < 1` → **binarny**. Granica text/binary leży u nas o jeden bajt bliżej niż u gita.
 - **Zakres — zrobiony 2026-08-04:**
-  - korekta w `src/eol.rs::looks_binary` — po pętli zdejmowany jest jeden `nonprintable`, gdy `content.last() == Some(&0x1a)`; `saturating_sub`, bo panic w debug przerywa operację gita, a nie tylko test;
+  - korekta w `src/rules/eol.rs::looks_binary` — po pętli zdejmowany jest jeden `nonprintable`, gdy `content.last() == Some(&0x1a)`; `saturating_sub`, bo panic w debug przerywa operację gita, a nie tylko test;
   - `eol::tests::a_trailing_sub_is_forgiven_exactly_as_git_forgives_it` — dokładnie ta treść i granice korekty (dwa `SUB`, `SUB` w środku, `SUB` zużyty przez `0x01`, granica 128 : 127, `SUB` bez CR sprawdzony przez checkout);
   - osiem nowych wektorów w `tests/format_vectors.rs::binary_verdicts`, więc reguła jest zamrożona razem z formatem, a nie tylko przetestowana;
   - `tests/filter_edge_cases.rs::a_dos_end_of_file_marker_is_classified_the_way_git_classifies_it` — porównanie z **prawdziwym gitem** na czterech kształtach: repozytorium referencyjne z `* text=auto` daje werdykt, nasz blob musi mieć ten sam bit `flags` i ten sam rozmiar plaintextu;

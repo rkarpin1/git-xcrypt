@@ -18,13 +18,13 @@
 //! export's base64 alphabet for the URL-safe one — which makes every key in a
 //! password manager fail to import — both left all 392 tests green.
 
-use git_xcrypt::config::Config;
-use git_xcrypt::crypto::{decrypt, encrypt};
-use git_xcrypt::decide;
-use git_xcrypt::eol::looks_binary;
-use git_xcrypt::format::{FLAG_LF_NORMALIZED, OVERHEAD, looks_encrypted};
-use git_xcrypt::key::{MASTER_KEY_LEN, MasterKey};
-use git_xcrypt::keyfile;
+use git_xcrypt::crypto::cipher::{decrypt, encrypt};
+use git_xcrypt::crypto::format::{FLAG_LF_NORMALIZED, OVERHEAD, looks_encrypted};
+use git_xcrypt::crypto::key::{MASTER_KEY_LEN, MasterKey};
+use git_xcrypt::crypto::keyfile;
+use git_xcrypt::rules::decide;
+use git_xcrypt::rules::declaration::Config;
+use git_xcrypt::rules::eol::looks_binary;
 
 /// The key every vector below was produced with.
 ///

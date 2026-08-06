@@ -23,7 +23,7 @@ use crate::{Error, Result};
 /// `~/.config/git/attributes` while the same line in the tree is refused: `git
 /// add` exited **0**, 27 `CR` bytes were eaten out of the blob, the commit
 /// succeeded and the checkout left **no file at all**. The refusal in
-/// [`crate::filter`] and the gate in `status` both resolve the stack correctly;
+/// [`crate::commands::filter`] and the gate in `status` both resolve the stack correctly;
 /// they simply were not being handed this file, so both reported a healthy
 /// repository over a destroyed one.
 ///
@@ -226,7 +226,7 @@ pub fn open_full(git_dir: &Path, common_dir: &Path) -> Result<File> {
 ///
 /// [`Error::Io`] when the file cannot be written.
 pub fn save_local(path: &Path, config: &File) -> Result<()> {
-    crate::atomic::write(path, &config.to_bstring())
+    crate::util::atomic::write(path, &config.to_bstring())
 }
 
 /// Sets a dotted key such as `filter.git-xcrypt.required`, creating what is missing.

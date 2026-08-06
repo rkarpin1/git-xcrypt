@@ -8,8 +8,8 @@
 use aes_siv::KeyInit;
 use aes_siv::siv::Aes256Siv;
 
-use crate::format::{Header, KEY_ID_LEN, SUITE_AES_256_SIV};
-use crate::key::MasterKey;
+use crate::crypto::format::{Header, KEY_ID_LEN, SUITE_AES_256_SIV};
+use crate::crypto::key::MasterKey;
 use crate::{Error, Result};
 
 /// Encrypts `plaintext`, recording `flags` in the authenticated header.
@@ -59,7 +59,7 @@ pub fn decrypt(key: &MasterKey, blob: &[u8]) -> Result<(u8, Vec<u8>)> {
     let suite_key = key.suite_key(header.suite)?;
     // The associated data must be the bytes actually on disk, not a header we
     // rebuild from expected values — rebuilding would hide a tampered byte.
-    let (header_bytes, body) = blob.split_at(crate::format::HEADER_LEN);
+    let (header_bytes, body) = blob.split_at(crate::crypto::format::HEADER_LEN);
 
     let mut cipher = Aes256Siv::new(suite_key.expose_bytes().as_slice().into());
     let plaintext = cipher
@@ -84,8 +84,8 @@ pub fn blob_key_id(blob: &[u8]) -> Result<[u8; KEY_ID_LEN]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::{FLAG_LF_NORMALIZED, OVERHEAD};
-    use crate::key::MASTER_KEY_LEN;
+    use crate::crypto::format::{FLAG_LF_NORMALIZED, OVERHEAD};
+    use crate::crypto::key::MASTER_KEY_LEN;
 
     fn key() -> MasterKey {
         MasterKey::from_bytes([42u8; MASTER_KEY_LEN])
@@ -168,7 +168,7 @@ mod tests {
         let mut flipped = blob.clone();
         flipped[13] ^= FLAG_LF_NORMALIZED;
         assert!(
-            crate::format::Header::parse(&flipped).is_ok(),
+            crate::crypto::format::Header::parse(&flipped).is_ok(),
             "the flipped byte must still parse, or this test asks nothing of \
              the tag"
         );

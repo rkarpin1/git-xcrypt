@@ -10,7 +10,7 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::format::{KEY_ID_LEN, SUITE_AES_256_SIV};
+use crate::crypto::format::{KEY_ID_LEN, SUITE_AES_256_SIV};
 use crate::{Error, Result};
 
 /// Length of the master key stored in the key file.

@@ -13,7 +13,7 @@
 //! smudge never has to ask `.git-xcrypt` — which also removes a real race, since
 //! git does not promise to write `.git-xcrypt` before the files it filters.
 
-use crate::config::{EolMode, TextMode};
+use crate::rules::declaration::{EolMode, TextMode};
 
 /// Whether git — and therefore we — would treat this content as binary.
 ///
@@ -224,7 +224,7 @@ fn writes_crlf_where(autocrlf: Option<&str>, core_eol: Option<&str>, native_is_c
 /// Shared with `status`, which has to read `filter.git-xcrypt.required` by the
 /// same rule: two answers to "is this git boolean true" is one answer too many.
 fn is_git_true(value: &str) -> bool {
-    crate::gitconfig::is_true(value)
+    crate::git::config::is_true(value)
 }
 
 /// Applies a resolved line-ending mode to content that was normalised to LF.

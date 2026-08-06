@@ -10,8 +10,9 @@ use clap::{Parser, Subcommand};
 
 use git_xcrypt::commands::status::Verdict;
 use git_xcrypt::commands::sync::Outcome;
-use git_xcrypt::repo::{Repo, git_spelling};
-use git_xcrypt::{Result, commands, exit};
+use git_xcrypt::git::repo::{Repo, git_spelling};
+use git_xcrypt::util::exit;
+use git_xcrypt::{Result, commands};
 
 /// The frozen exit-code table, shown under `--help`.
 ///
@@ -534,7 +535,7 @@ fn lock_and_describe(assume_yes: bool) -> Result<ExitCode> {
 /// Its own exit path rather than [`report`], because a repository with a problem
 /// is not a broken tool: the table gives that its own code, `5`, so a CI gate
 /// can tell the two apart without reading the message. A third code, `6`, says
-/// the run could not answer — see [`git_xcrypt::exit::UNDETERMINED`].
+/// the run could not answer — see [`git_xcrypt::util::exit::UNDETERMINED`].
 ///
 /// The report goes to `stdout` — this is not the filter path, where git reads
 /// `stdout` as file content, and a gate that has to be scraped off `stderr` is a
@@ -602,9 +603,9 @@ fn run_sync(check: bool, global: bool, ignorecase: bool) -> ExitCode {
 
 fn sync_and_describe(check: bool, global: bool, ignorecase: bool) -> Result<ExitCode> {
     let rendering = if global {
-        git_xcrypt::gitattributes::Rendering::Global
+        git_xcrypt::git::attributes::Rendering::Global
     } else {
-        git_xcrypt::gitattributes::Rendering::PerPattern {
+        git_xcrypt::git::attributes::Rendering::PerPattern {
             fold_case: ignorecase,
         }
     };
@@ -646,7 +647,7 @@ fn sync_and_describe(check: bool, global: bool, ignorecase: bool) -> Result<Exit
         Outcome::Stale => {
             eprintln!(
                 "git-xcrypt: {attributes} is out of date with {}; run `git-xcrypt sync`",
-                git_xcrypt::repo::CONFIG_FILE
+                git_xcrypt::git::repo::CONFIG_FILE
             );
             ExitCode::from(exit::USAGE)
         }

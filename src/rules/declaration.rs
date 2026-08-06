@@ -20,7 +20,7 @@ use bstr::{BStr, ByteSlice};
 use gix_glob::pattern::Case;
 use gix_glob::{Pattern, wildmatch};
 
-use crate::repo::{ATTRIBUTES_FILE, CONFIG_FILE, KEY_ENVELOPE_DIR};
+use crate::git::repo::{ATTRIBUTES_FILE, CONFIG_FILE, KEY_ENVELOPE_DIR};
 use crate::{Error, Result};
 
 /// How a path's content is treated before encryption.

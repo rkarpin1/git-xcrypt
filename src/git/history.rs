@@ -66,8 +66,8 @@ use gix_hash::ObjectId;
 use gix_object::{Find as _, FindExt as _, FindHeader as _};
 use gix_ref::file::ReferenceExt as _;
 
-use crate::config::Config;
-use crate::format;
+use crate::crypto::format;
+use crate::rules::declaration::Config;
 use crate::{Error, Result};
 
 /// One declared path that reachable history holds in the clear.

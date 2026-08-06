@@ -52,11 +52,15 @@
 
 use std::fmt;
 
-use crate::config::Config;
-use crate::repo::{DRIVER, Repo, git_spelling};
+use crate::git::repo::{DRIVER, Repo, git_spelling};
+use crate::rules::declaration::Config;
 use gix_object::Write as _;
 
-use crate::{Result, gitattributes, gitconfig, gitindex, history};
+use crate::Result;
+use crate::git::attributes;
+use crate::git::config as gitconfig;
+use crate::git::history;
+use crate::git::index;
 
 /// One reason git would not be filtering this repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,8 +159,8 @@ impl fmt::Display for SetupGap {
             Self::CatchAllMissing => write!(
                 f,
                 "{} carries no `{}` line, so git never calls the filter",
-                crate::repo::ATTRIBUTES_FILE,
-                gitattributes::CATCH_ALL
+                crate::git::repo::ATTRIBUTES_FILE,
+                attributes::CATCH_ALL
             ),
             Self::FilterUnresolved {
                 paths,
@@ -172,7 +176,7 @@ impl fmt::Display for SetupGap {
                      name every file carrying a `filter` line. Deleting or narrowing that \
                      line is the fix — `git-xcrypt init` will not remove it. Reached: {}",
                     paths.join(", "),
-                    catch_all = gitattributes::CATCH_ALL
+                    catch_all = attributes::CATCH_ALL
                 )?;
                 if *total > paths.len() {
                     write!(f, ", … and {} more", total - paths.len())?;
@@ -210,7 +214,7 @@ impl fmt::Display for SetupGap {
                  this repository refuses until it is back — and nothing is \
                  enforced either. `git-xcrypt init` creates one; a clone gets it \
                  from the commit that carries it",
-                config = crate::repo::CONFIG_FILE
+                config = crate::git::repo::CONFIG_FILE
             ),
             Self::Untracked(path) => write!(
                 f,
@@ -240,7 +244,7 @@ pub struct Report {
     /// Declared paths that reachable history holds in the clear.
     ///
     /// Nothing local repairs this. The report says so in as many words.
-    pub leaked: Vec<crate::history::Exposure>,
+    pub leaked: Vec<crate::git::history::Exposure>,
     /// Paths a negation deliberately keeps in the clear.
     ///
     /// Listed rather than left out: a hole a user wrote on purpose must not be
@@ -295,8 +299,8 @@ pub struct Scanned {
 /// were made after measuring a case where the shared code sent a reader the
 /// wrong way: `6` because a healthy `git clone --depth 1` failed the gate like a
 /// leaking repository, and `2` because a repository that had never run `init`
-/// was told an exposure had been found. See [`crate::exit::UNDETERMINED`] and
-/// [`crate::exit::CONFIG`].
+/// was told an exposure had been found. See [`crate::util::exit::UNDETERMINED`] and
+/// [`crate::util::exit::CONFIG`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
     /// Everything was checked and nothing was found.
@@ -508,8 +512,8 @@ impl fmt::Display for Report {
                 writeln!(
                     f,
                     "    git add {} {} && git commit",
-                    crate::repo::ATTRIBUTES_FILE,
-                    crate::repo::CONFIG_FILE
+                    crate::git::repo::ATTRIBUTES_FILE,
+                    crate::git::repo::CONFIG_FILE
                 )?;
             }
         }
@@ -635,8 +639,8 @@ impl Report {
                 f,
                 "\n  This is exit code {undetermined}, not {exposed}: settle the reasons above \
                  and ask again. Nothing here was found — it was not looked at.",
-                undetermined = crate::exit::UNDETERMINED,
-                exposed = crate::exit::EXPOSED
+                undetermined = crate::util::exit::UNDETERMINED,
+                exposed = crate::util::exit::EXPOSED
             )?;
         }
         Ok(())
@@ -861,7 +865,7 @@ impl Report {
             "\nin the clear by choice: {} path(s) a `!` line in {} takes back out, \
              so they are stored unencrypted on purpose.",
             self.by_choice.len(),
-            crate::repo::CONFIG_FILE
+            crate::git::repo::CONFIG_FILE
         )?;
         for path in &self.by_choice {
             writeln!(f, "  {}", show(path))?;
@@ -893,7 +897,7 @@ pub fn run(repo: &Repo, fix: bool) -> Result<Report> {
     // ignores — the same resolution `init` had to be taught.
     let config = gitconfig::open_full(repo.git_dir(), repo.common_dir())?;
 
-    for key in gitattributes::driver_keys() {
+    for key in attributes::driver_keys() {
         match gitconfig::get(&config, &key) {
             None => report.setup.push(SetupGap::MissingKey(key)),
             Some(value) if key.ends_with(".required") && !gitconfig::is_true(&value) => {
@@ -912,7 +916,7 @@ pub fn run(repo: &Repo, fix: bool) -> Result<Report> {
     // The `?` would surface an unreadable `.gitattributes` as `Error::Io`, which
     // the frozen table gives code 1 — the same code a typo produces, and not
     // what this function's own contract promises. It is a state conflict.
-    let catch_all = gitattributes::catch_all_present(&repo.attributes_path()).map_err(|err| {
+    let catch_all = attributes::catch_all_present(&repo.attributes_path()).map_err(|err| {
         crate::Error::Config(format!(
             "{} could not be read ({err}), so whether git filters this repository \
              at all cannot be determined",
@@ -950,7 +954,7 @@ pub fn run(repo: &Repo, fix: bool) -> Result<Report> {
              nothing was checked. The check-in path refuses over the same state, \
              so nothing is being stored in the clear; make {} readable and ask \
              again",
-            crate::repo::CONFIG_FILE
+            crate::git::repo::CONFIG_FILE
         )),
         other => other,
     })?;
@@ -968,14 +972,14 @@ pub fn run(repo: &Repo, fix: bool) -> Result<Report> {
             "nothing below was checked: without {} there is no way to tell which \
              paths should be encrypted, so neither the index nor the history was \
              scanned. This says nothing about what is in this repository.",
-            crate::repo::CONFIG_FILE
+            crate::git::repo::CONFIG_FILE
         ));
         return Ok(report);
     }
     report.warnings.extend(declarations.pointless_eol.clone());
     report.notes.extend(stale_section_note(repo, &declarations));
 
-    let hash = gitindex::object_hash(gitconfig::get(&config, "extensions.objectformat").as_deref());
+    let hash = index::object_hash(gitconfig::get(&config, "extensions.objectformat").as_deref());
     let objects = history::objects(repo.common_dir(), hash)?;
 
     // Git's own attribute stack, not a search for suspicious lines: the question
@@ -991,7 +995,7 @@ pub fn run(repo: &Repo, fix: bool) -> Result<Report> {
     // resolver exists to detect.
     let ignore_case =
         gitconfig::get(&config, "core.ignorecase").is_some_and(|value| gitconfig::is_true(&value));
-    let mut filters = gitattributes::AttributeResolver::new(
+    let mut filters = attributes::AttributeResolver::new(
         repo.work_tree(),
         // The common directory: `info/` is shared by every checkout, so a linked
         // worktree resolves the *main* `info/attributes` — see the resolver.
@@ -1002,7 +1006,7 @@ pub fn run(repo: &Repo, fix: bool) -> Result<Report> {
         ignore_case,
         // The index copies git falls back to for a deleted `.gitattributes`:
         // check-in reads them, so the verdict has to as well.
-        gitattributes::staged_fallbacks(
+        attributes::staged_fallbacks(
             repo.work_tree(),
             &repo.git_dir().join("index"),
             repo.common_dir(),
@@ -1136,7 +1140,7 @@ fn inspect_index(
     declarations: &Config,
     objects: &gix_odb::Handle,
     hash: gix_hash::Kind,
-    filters: &mut gitattributes::AttributeResolver,
+    filters: &mut attributes::AttributeResolver,
     report: &mut Report,
 ) -> Result<()> {
     let index_path = repo.git_dir().join("index");
@@ -1148,12 +1152,11 @@ fn inspect_index(
     // was genuinely exposed: no verdict, no leaked section, exit 1, and the
     // message did not even name the file. A `.git` written by `sudo git` or a
     // read-only mount reaches it.
-    let listed = gitindex::list(&index_path, hash).unwrap_or_else(|err| {
-        gitindex::Listed::Unavailable(format!("it could not be read ({err})"))
-    });
+    let listed = index::list(&index_path, hash)
+        .unwrap_or_else(|err| index::Listed::Unavailable(format!("it could not be read ({err})")));
     let entries = match listed {
-        gitindex::Listed::Read(entries) => entries,
-        gitindex::Listed::Unavailable(why) => {
+        index::Listed::Read(entries) => entries,
+        index::Listed::Unavailable(why) => {
             // Refusing outright would withhold the history scan, which needs no
             // index at all and carries the finding that matters most. Failing
             // the gate over it keeps "could not tell" from reading as "fine".
@@ -1179,16 +1182,16 @@ fn inspect_index(
     if !entries.is_empty() {
         let mut tracked_bootstrap = [false, false];
         for entry in &entries {
-            if entry.path == crate::repo::ATTRIBUTES_FILE.as_bytes() {
+            if entry.path == crate::git::repo::ATTRIBUTES_FILE.as_bytes() {
                 tracked_bootstrap[0] = true;
-            } else if entry.path == crate::repo::CONFIG_FILE.as_bytes() {
+            } else if entry.path == crate::git::repo::CONFIG_FILE.as_bytes() {
                 tracked_bootstrap[1] = true;
             }
         }
-        for (present, name) in tracked_bootstrap
-            .iter()
-            .zip([crate::repo::ATTRIBUTES_FILE, crate::repo::CONFIG_FILE])
-        {
+        for (present, name) in tracked_bootstrap.iter().zip([
+            crate::git::repo::ATTRIBUTES_FILE,
+            crate::git::repo::CONFIG_FILE,
+        ]) {
             if !present {
                 report.setup.push(SetupGap::Untracked(name.to_string()));
             }
@@ -1218,7 +1221,7 @@ fn inspect_index(
         if !entry.holds_content() {
             continue;
         }
-        let gitindex::Tracked { path: name, id, .. } = entry;
+        let index::Tracked { path: name, id, .. } = entry;
 
         if declarations.negated(&name) {
             report.by_choice.push(name);
@@ -1250,7 +1253,7 @@ fn inspect_index(
         // The second question of the same stack. A path git filters correctly
         // and then converts is not half-protected: the ciphertext is destroyed,
         // which costs more than storing the plain text would have.
-        if let gitattributes::EolConversion::On(culprit) = resolved.conversion {
+        if let attributes::EolConversion::On(culprit) = resolved.conversion {
             converted.push((show(&name), display_culprit(repo, &culprit)));
         }
 
@@ -1318,12 +1321,12 @@ fn inspect_index(
 /// An absolute path out of a temporary directory tells a reader nothing they can
 /// act on, and `$GIT_DIR/info/attributes` has to keep enough of its path to be
 /// recognisable as the unversioned source it is.
-fn display_culprit(repo: &Repo, culprit: &gitattributes::Culprit) -> String {
+fn display_culprit(repo: &Repo, culprit: &attributes::Culprit) -> String {
     let Some(source) = &culprit.source else {
         return culprit.to_string();
     };
     let shown = repo.relative(source).unwrap_or(source);
-    gitattributes::Culprit {
+    attributes::Culprit {
         source: Some(shown.to_path_buf()),
         ..culprit.clone()
     }
@@ -1343,12 +1346,12 @@ fn display_culprit(repo: &Repo, culprit: &gitattributes::Culprit) -> String {
 /// the honest boundary of a check that resolves only the paths git is tracking.
 fn foreign_source_note(
     repo: &Repo,
-    filters: &gitattributes::AttributeResolver,
+    filters: &attributes::AttributeResolver,
     reached_a_declared_path: bool,
 ) -> Vec<String> {
     let mut notes = Vec::new();
     for source in filters.sources() {
-        let Ok(lines) = gitattributes::foreign_lines_touching(source, &["filter"]) else {
+        let Ok(lines) = attributes::foreign_lines_touching(source, &["filter"]) else {
             continue;
         };
         if lines.is_empty() {
@@ -1438,7 +1441,9 @@ fn restage(
     let mut kept: Vec<Vec<u8>> = Vec::new();
 
     for name in std::mem::take(&mut report.in_the_clear) {
-        let path = repo.work_tree().join(crate::repo::working_tree_path(&name));
+        let path = repo
+            .work_tree()
+            .join(crate::git::repo::working_tree_path(&name));
         // The working-tree twin of `holds_content`. The index entry says
         // regular file, but the disk decides what `fs::read` returns, and a
         // path replaced by a symlink since it was staged would be read through
@@ -1480,7 +1485,7 @@ fn restage(
         // history in the clear, so the gate read "the tool broke" and lost every
         // finding. The two failures either side of this one were already handled
         // this way; this one was the odd case out.
-        let outcome = match crate::decide::clean(Some(&key), declarations, &name, &content) {
+        let outcome = match crate::rules::decide::clean(Some(&key), declarations, &name, &content) {
             Ok(outcome) => outcome,
             Err(err) => {
                 report.warnings.push(format!(
@@ -1515,10 +1520,10 @@ fn restage(
     // beside a report that still has a history scan to deliver, not a reason to
     // print nothing and exit 1. Measured with `chmod a-w .git`: the whole report
     // vanished, exposures included.
-    let restaged = gitindex::restage(&repo.git_dir().join("index"), hash, &updates)
-        .unwrap_or_else(|err| gitindex::Restaged::Skipped(err.to_string()));
+    let restaged = index::restage(&repo.git_dir().join("index"), hash, &updates)
+        .unwrap_or_else(|err| index::Restaged::Skipped(err.to_string()));
     match restaged {
-        gitindex::Restaged::Done(patched) => {
+        index::Restaged::Done(patched) => {
             // Which, not how many. A path the index spells differently than the
             // directory does — case folding on macOS and Windows, NFD against
             // NFC — is simply not found, and subtracting counts would name the
@@ -1546,7 +1551,7 @@ fn restage(
             }
             report.fixed = patched;
         }
-        gitindex::Restaged::Skipped(why) => {
+        index::Restaged::Skipped(why) => {
             report.warnings.push(why);
             kept.extend(updates.into_iter().map(|(name, _)| name));
         }
@@ -1598,16 +1603,16 @@ fn stale_section_note(repo: &Repo, declarations: &Config) -> Option<String> {
     // declaration leaves behind.
     let path = repo.attributes_path();
     let matches = |rendering| {
-        let lines = gitattributes::render_lines(declarations, rendering);
-        gitattributes::desired(&path, &lines)
+        let lines = attributes::render_lines(declarations, rendering);
+        attributes::desired(&path, &lines)
             .map(|(existing, desired)| existing == desired)
             .unwrap_or(false)
     };
-    if gitattributes::ACCEPTED.into_iter().any(matches) {
+    if attributes::ACCEPTED.into_iter().any(matches) {
         return None;
     }
-    let lines = gitattributes::render_lines(declarations, gitattributes::Rendering::Global);
-    let (existing, desired) = gitattributes::desired(&path, &lines).ok()?;
+    let lines = attributes::render_lines(declarations, attributes::Rendering::Global);
+    let (existing, desired) = attributes::desired(&path, &lines).ok()?;
     (existing != desired).then(|| {
         format!(
             "{} no longer matches {} — the per-pattern lines are out of date. \
@@ -1617,15 +1622,15 @@ fn stale_section_note(repo: &Repo, declarations: &Config) -> Option<String> {
              silently and costs the file at checkout. A clone's `unlock` will \
              also rewrite the section and leave `git status` dirty. \
              `git-xcrypt sync` settles both.",
-            crate::repo::ATTRIBUTES_FILE,
-            crate::repo::CONFIG_FILE
+            crate::git::repo::ATTRIBUTES_FILE,
+            crate::git::repo::CONFIG_FILE
         )
     })
 }
 
 /// Mentions an absent diff driver, without letting it fail the gate.
 ///
-/// Deliberately outside [`gitattributes::driver_keys`] and outside the exit
+/// Deliberately outside [`attributes::driver_keys`] and outside the exit
 /// code. A missing `diff.git-xcrypt.textconv` costs a readable `git diff` and
 /// nothing else — no secret reaches the object database over it — and `lock`
 /// removes it **on purpose**, because with no key the driver drags a failing
@@ -1654,8 +1659,8 @@ mod tests {
     use super::*;
 
     /// One leak, spelled the way the history scan spells one.
-    fn a_leak() -> crate::history::Exposure {
-        crate::history::Exposure {
+    fn a_leak() -> crate::git::history::Exposure {
+        crate::git::history::Exposure {
             path: b"secrets/db.env".to_vec(),
             sightings: Vec::new(),
         }

@@ -6,8 +6,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::key::MasterKey;
-use crate::{Error, Result, keyfile};
+use crate::crypto::key::MasterKey;
+use crate::crypto::keyfile;
+use crate::{Error, Result};
 
 /// Name of the versioned configuration file listing what to encrypt.
 pub const CONFIG_FILE: &str = ".git-xcrypt";
@@ -197,15 +198,15 @@ impl Repo {
     /// is not called `.git`. Git finds the checkout through `core.worktree`
     /// there, so this does too.
     fn main_work_tree(&self) -> Option<PathBuf> {
-        let config = crate::gitconfig::open_local(&self.config_path()).ok()?;
-        if crate::gitconfig::get(&config, "core.bare")
+        let config = crate::git::config::open_local(&self.config_path()).ok()?;
+        if crate::git::config::get(&config, "core.bare")
             .as_deref()
-            .is_some_and(crate::gitconfig::is_true)
+            .is_some_and(crate::git::config::is_true)
         {
             return None;
         }
 
-        if let Some(declared) = crate::gitconfig::get(&config, "core.worktree")
+        if let Some(declared) = crate::git::config::get(&config, "core.worktree")
             && !declared.is_empty()
         {
             let path = Path::new(&declared);

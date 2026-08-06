@@ -25,9 +25,10 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::format::KEY_ID_LEN;
-use crate::repo::Repo;
-use crate::{Error, Result, keyfile};
+use crate::crypto::format::KEY_ID_LEN;
+use crate::crypto::keyfile;
+use crate::git::repo::Repo;
+use crate::{Error, Result};
 
 /// What `export-key` wrote, so the binary can say so without naming the key.
 #[derive(Debug)]
@@ -242,13 +243,13 @@ fn resolve(base: &Path, path: &Path) -> PathBuf {
             for name in tail.iter().rev() {
                 out.push(name);
             }
-            return crate::repo::lexically_normal(&out);
+            return crate::git::repo::lexically_normal(&out);
         }
 
         let (Some(parent), Some(name)) = (probe.parent(), probe.file_name()) else {
             // Nothing along the path exists, which on a sane system means the
             // root does not either. Lexical normalisation is all that is left.
-            return crate::repo::lexically_normal(&absolute);
+            return crate::git::repo::lexically_normal(&absolute);
         };
         tail.push(name);
         probe = parent;
@@ -299,7 +300,7 @@ mod tests {
         fs::write(&path, b"someone else's key").expect("writing");
 
         let error = run(&repo, &path, false).expect_err("a mistyped path must not destroy a key");
-        assert_eq!(error.exit_code(), crate::exit::CONFIG);
+        assert_eq!(error.exit_code(), crate::util::exit::CONFIG);
         assert_eq!(fs::read(&path).expect("reading"), b"someone else's key");
 
         run(&repo, &path, true).expect("--force must replace it");
@@ -333,7 +334,7 @@ mod tests {
         let mut to_a_terminal: Vec<u8> = Vec::new();
         let refused = to_writer(&repo, &mut to_a_terminal, true)
             .expect_err("a terminal destination must be refused");
-        assert_eq!(refused.exit_code(), crate::exit::CONFIG);
+        assert_eq!(refused.exit_code(), crate::util::exit::CONFIG);
         assert!(to_a_terminal.is_empty(), "the refusal still wrote the key");
         assert!(
             refused.to_string().contains("scrollback"),

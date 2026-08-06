@@ -23,8 +23,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::config::Config;
-use crate::repo::{ATTRIBUTES_FILE, CONFIG_FILE, DRIVER, KEY_ENVELOPE_DIR, git_spelling};
+use crate::git::repo::{ATTRIBUTES_FILE, CONFIG_FILE, DRIVER, KEY_ENVELOPE_DIR, git_spelling};
+use crate::rules::declaration::Config;
 use crate::{Error, Result};
 
 /// Opens the section this tool owns.
@@ -62,7 +62,7 @@ pub const CATCH_ALL: &str = "* filter=git-xcrypt";
 ///   patterns get a trailing `-diff` line: last, and naming only `diff`, so the
 ///   `-text` established above it survives.
 ///
-/// Finally, the files needed to bootstrap — see [`crate::config::is_never_encrypted`] —
+/// Finally, the files needed to bootstrap — see [`crate::rules::declaration::is_never_encrypted`] —
 /// get their defaults back if any pattern reached them, because they are stored
 /// in the clear whatever the patterns say.
 ///
@@ -122,7 +122,7 @@ pub fn render_lines(config: &Config, rendering: Rendering) -> Vec<String> {
 /// once S-05 registers one. The lines are emitted only when a pattern actually
 /// reaches them, so an ordinary configuration never carries them.
 ///
-/// Folded like every other line here, because [`crate::config::is_never_encrypted`]
+/// Folded like every other line here, because [`crate::rules::declaration::is_never_encrypted`]
 /// compares these three names with ASCII case folded too. A line narrower than
 /// the exclusion would put `-text` and a decrypting diff driver on a file that is
 /// stored in the clear; a line broader than it would take them off one that is
@@ -230,7 +230,7 @@ fn translate(pattern: &str, fold: bool) -> Vec<String> {
 /// Spells a pattern so it matches either case of every ASCII letter.
 ///
 /// The other half of open decision 13, settled on 2026-08-05, and it is not
-/// optional: [`crate::config::MATCHING`] folds ASCII case unconditionally, so a
+/// optional: [`crate::rules::declaration::MATCHING`] folds ASCII case unconditionally, so a
 /// rendered line that did not would be **narrower** than the filter — and the
 /// narrow direction is the one measured eating 34 `CR` bytes out of a 2 MB
 /// ciphertext and losing the file at checkout. Emitting the fold rather than
@@ -257,7 +257,7 @@ fn translate(pattern: &str, fold: bool) -> Vec<String> {
 ///   `unspecified` for it at `core.ignorecase=false`, the narrower-than-the-
 ///   filter direction that costs the file.
 /// * **anything outside ASCII**, which is copied byte for byte. That is the
-///   documented boundary — see [`crate::config::MATCHING`].
+///   documented boundary — see [`crate::rules::declaration::MATCHING`].
 ///
 /// Quoting is not this function's business. It runs before [`spell`], which puts
 /// the quotes back around a pattern that needs them, and `[`, `]` and `-` are
@@ -737,7 +737,7 @@ pub fn upsert(contents: &str, section: &str) -> Result<String> {
             return Err(Error::Config(format!(
                 "{ATTRIBUTES}: found the closing git-xcrypt marker without the opening one; \
                  fix it by hand so nothing of yours is lost",
-                ATTRIBUTES = crate::repo::ATTRIBUTES_FILE
+                ATTRIBUTES = crate::git::repo::ATTRIBUTES_FILE
             )));
         }
         let mut out = contents.to_string();
@@ -754,7 +754,7 @@ pub fn upsert(contents: &str, section: &str) -> Result<String> {
         return Err(Error::Config(format!(
             "{ATTRIBUTES}: the git-xcrypt section is opened but never closed; \
              fix it by hand so nothing of yours is lost",
-            ATTRIBUTES = crate::repo::ATTRIBUTES_FILE
+            ATTRIBUTES = crate::git::repo::ATTRIBUTES_FILE
         )));
     };
 
@@ -774,7 +774,7 @@ pub fn upsert(contents: &str, section: &str) -> Result<String> {
              would be kept up to date, and git takes the last matching line, so the \
              stale copy would win. Delete all but one by hand, then run \
              `git-xcrypt sync`.",
-            ATTRIBUTES = crate::repo::ATTRIBUTES_FILE
+            ATTRIBUTES = crate::git::repo::ATTRIBUTES_FILE
         )));
     }
 
@@ -838,7 +838,7 @@ pub fn write_section(path: &Path, extra_lines: &[String]) -> Result<bool> {
     }
     // Never `fs::write`: truncating this file is what turns encryption off, and
     // it also loses whatever the user keeps outside our markers.
-    crate::atomic::write(path, updated.as_bytes())?;
+    crate::util::atomic::write(path, updated.as_bytes())?;
     Ok(true)
 }
 
@@ -942,7 +942,7 @@ pub fn foreign_lines_touching(path: &Path, axes: &[&str]) -> Result<Vec<String>>
 fn collect_attribute_files(root: &Path, out: &mut Vec<PathBuf>) {
     let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {
-        let file = directory.join(crate::repo::ATTRIBUTES_FILE);
+        let file = directory.join(crate::git::repo::ATTRIBUTES_FILE);
         // Never followed: a symbolic link out of the working tree would walk
         // somewhere that is not this repository, and one pointing back into
         // it would loop.
@@ -1007,11 +1007,12 @@ pub fn staged_fallbacks(
     hash: gix_hash::Kind,
     ignore_case: bool,
 ) -> Vec<StagedAttributes> {
-    let Ok(crate::gitindex::Listed::Read(entries)) = crate::gitindex::list(index_path, hash) else {
+    let Ok(crate::git::index::Listed::Read(entries)) = crate::git::index::list(index_path, hash)
+    else {
         return Vec::new();
     };
 
-    let wanted = crate::repo::ATTRIBUTES_FILE.as_bytes();
+    let wanted = crate::git::repo::ATTRIBUTES_FILE.as_bytes();
     let named = |name: &[u8]| {
         if ignore_case {
             name.eq_ignore_ascii_case(wanted)
@@ -1022,7 +1023,7 @@ pub fn staged_fallbacks(
 
     use gix_object::Find as _;
 
-    let basename_of = |entry: &crate::gitindex::Tracked| -> Vec<u8> {
+    let basename_of = |entry: &crate::git::index::Tracked| -> Vec<u8> {
         entry
             .path
             .rsplit(|&byte| byte == b'/')
@@ -1031,7 +1032,7 @@ pub fn staged_fallbacks(
             .to_vec()
     };
 
-    let mut candidates: Vec<&crate::gitindex::Tracked> = entries
+    let mut candidates: Vec<&crate::git::index::Tracked> = entries
         .iter()
         .filter(|entry| entry.holds_content() && named(&basename_of(entry)))
         .collect();
@@ -1059,7 +1060,7 @@ pub fn staged_fallbacks(
         // The working-tree probe, by name, exactly as `collect_attribute_files`
         // probes: a file that is there — under any spelling the filesystem
         // resolves — is the one git reads, and the staged copy stays out of it.
-        let absolute = work_tree.join(crate::repo::working_tree_path(&entry.path));
+        let absolute = work_tree.join(crate::git::repo::working_tree_path(&entry.path));
         if fs::symlink_metadata(&absolute).is_ok_and(|metadata| metadata.is_file()) {
             continue;
         }
@@ -1067,7 +1068,7 @@ pub fn staged_fallbacks(
         // The object store is opened only when a fallback actually exists, so a
         // repository whose attribute files are all on disk never pays for it.
         if objects.is_none() {
-            objects = Some(crate::history::objects(common_dir, hash).ok());
+            objects = Some(crate::git::history::objects(common_dir, hash).ok());
         }
         let Some(Some(store)) = objects.as_ref() else {
             return Vec::new();
@@ -1242,7 +1243,7 @@ impl Resolution {
         let writes_crlf = match self.eol {
             DeclaredEol::Crlf => true,
             DeclaredEol::Lf => false,
-            DeclaredEol::Unspecified => crate::eol::git_writes_crlf(autocrlf, core_eol),
+            DeclaredEol::Unspecified => crate::rules::eol::git_writes_crlf(autocrlf, core_eol),
         };
         writes_crlf.then_some(culprit)
     }

@@ -9,23 +9,11 @@
 
 use thiserror::Error;
 
-pub mod atomic;
 pub mod commands;
-pub mod config;
 pub mod crypto;
-pub mod decide;
-pub mod eol;
-pub mod exit;
-pub mod filter;
-pub mod format;
-pub mod gitattributes;
-pub mod gitconfig;
-pub mod gitindex;
-pub mod history;
-pub mod key;
-pub mod keyfile;
-pub mod pktline;
-pub mod repo;
+pub mod git;
+pub mod rules;
+pub mod util;
 
 /// Errors returned by library operations.
 ///
@@ -53,9 +41,9 @@ pub enum Error {
     )]
     KeyMismatch {
         /// Fingerprint the file asks for.
-        wanted: [u8; format::KEY_ID_LEN],
+        wanted: [u8; crypto::format::KEY_ID_LEN],
         /// Fingerprint we actually hold.
-        have: [u8; format::KEY_ID_LEN],
+        have: [u8; crypto::format::KEY_ID_LEN],
     },
 
     /// Authentication failed, or the cipher refused the input.
@@ -83,10 +71,10 @@ impl Error {
     #[must_use]
     pub fn exit_code(&self) -> u8 {
         match self {
-            Self::Usage(_) | Self::Io(_) | Self::Entropy(_) => exit::USAGE,
-            Self::Config(_) => exit::CONFIG,
-            Self::NoKey => exit::NO_KEY,
-            Self::Format(_) | Self::KeyMismatch { .. } | Self::Crypto(_) => exit::FORMAT,
+            Self::Usage(_) | Self::Io(_) | Self::Entropy(_) => util::exit::USAGE,
+            Self::Config(_) => util::exit::CONFIG,
+            Self::NoKey => util::exit::NO_KEY,
+            Self::Format(_) | Self::KeyMismatch { .. } | Self::Crypto(_) => util::exit::FORMAT,
         }
     }
 }
@@ -101,6 +89,6 @@ fn hex(bytes: &[u8]) -> String {
 
 /// Formats a key fingerprint for display.
 #[must_use]
-pub fn format_key_id(key_id: &[u8; format::KEY_ID_LEN]) -> String {
+pub fn format_key_id(key_id: &[u8; crypto::format::KEY_ID_LEN]) -> String {
     hex(key_id)
 }

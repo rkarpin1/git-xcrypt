@@ -5,11 +5,11 @@
 //! bug here corrupts the whole project, not just the secrets — which is why
 //! `passthrough(x) == x` is a property test rather than a nicety.
 
-use crate::config::{self, Config, EolMode};
-use crate::crypto;
-use crate::eol;
-use crate::format::{FLAG_LF_NORMALIZED, Header, looks_encrypted};
-use crate::key::MasterKey;
+use crate::crypto::cipher;
+use crate::crypto::format::{FLAG_LF_NORMALIZED, Header, looks_encrypted};
+use crate::crypto::key::MasterKey;
+use crate::rules::declaration::{self, Config, EolMode};
+use crate::rules::eol;
 use crate::{Error, Result};
 
 use bstr::ByteSlice as _;
@@ -57,7 +57,7 @@ impl Outcome {
 ///
 /// A pure function of `(key, config, path, content)`, and kept that way. S-06
 /// wanted a warning here — "this path is already in `HEAD` in the clear" — and
-/// it lives in [`crate::filter`] instead, because answering it needs the object
+/// it lives in [`crate::commands::filter`] instead, because answering it needs the object
 /// database and a repository handle, which neither this signature nor `lock`,
 /// the other caller, has any business carrying. `lock` depends on this function
 /// producing exactly the bytes git stores; the fewer things it can reach, the
@@ -74,7 +74,7 @@ pub fn clean(
     path: &[u8],
     content: &[u8],
 ) -> Result<Outcome> {
-    if config::is_never_encrypted(path) {
+    if declaration::is_never_encrypted(path) {
         // Checked ahead of everything, including the refusal below: these are
         // the files a user needs in order to repair the very state that refusal
         // reports, so they must always be committable.
@@ -88,7 +88,7 @@ pub fn clean(
         return Err(Error::Config(format!(
             "{}: the file that says what to encrypt is missing, so nothing can be \
              added safely; restore it from the repository or run `git-xcrypt init`",
-            crate::repo::CONFIG_FILE
+            crate::git::repo::CONFIG_FILE
         )));
     }
 
@@ -110,7 +110,7 @@ pub fn clean(
         (0, content.to_vec())
     };
 
-    Ok(Outcome::plain(crypto::encrypt(key, flags, &plaintext)?))
+    Ok(Outcome::plain(cipher::encrypt(key, flags, &plaintext)?))
 }
 
 /// Content that is already encrypted, arriving on the check-in path.
@@ -146,7 +146,7 @@ fn already_encrypted(key: Option<&MasterKey>, path: &[u8], content: &[u8]) -> Re
 
     // The plaintext is dropped immediately; only the verdict matters. Wrapped
     // so the copy it makes does not outlive this line on the heap.
-    drop(zeroize::Zeroizing::new(crypto::decrypt(key, content)?.1));
+    drop(zeroize::Zeroizing::new(cipher::decrypt(key, content)?.1));
 
     Ok(Outcome::plain(content.to_vec()))
 }
@@ -161,7 +161,7 @@ fn already_encrypted(key: Option<&MasterKey>, path: &[u8], content: &[u8]) -> Re
 /// # Errors
 ///
 /// [`Error::NoKey`] for our content with no key loaded, plus the errors
-/// [`crypto::decrypt`] reports.
+/// [`cipher::decrypt`] reports.
 pub fn smudge(
     key: Option<&MasterKey>,
     path: &[u8],
@@ -196,7 +196,7 @@ pub fn smudge(
     }
 
     let key = key.ok_or(Error::NoKey)?;
-    let (flags, plaintext) = crypto::decrypt(key, content)?;
+    let (flags, plaintext) = cipher::decrypt(key, content)?;
 
     if flags & FLAG_LF_NORMALIZED == 0 {
         return Ok(Outcome::plain(plaintext));
@@ -209,7 +209,7 @@ pub fn smudge(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::key::MASTER_KEY_LEN;
+    use crate::crypto::key::MASTER_KEY_LEN;
 
     fn key() -> MasterKey {
         MasterKey::from_bytes([5u8; MASTER_KEY_LEN])

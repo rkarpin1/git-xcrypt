@@ -43,10 +43,13 @@ use std::path::{Path, PathBuf};
 
 use zeroize::Zeroizing;
 
-use crate::config::Config;
-use crate::format::{self, Header, KEY_ID_LEN, OVERHEAD};
-use crate::repo::{Repo, git_spelling};
-use crate::{Error, Result, decide, gitconfig, keyfile};
+use crate::crypto::format::{self, Header, KEY_ID_LEN, OVERHEAD};
+use crate::crypto::keyfile;
+use crate::git::config as gitconfig;
+use crate::git::repo::{Repo, git_spelling};
+use crate::rules::decide;
+use crate::rules::declaration::Config;
+use crate::{Error, Result};
 
 /// What `unlock` did.
 #[derive(Debug)]
@@ -151,11 +154,11 @@ pub fn run(repo: &Repo, key_source: Option<KeySource<'_>>, key_only: bool) -> Re
     // code 0 and no signal. Measured on git 2.55 in a clone whose origin never
     // committed `.gitattributes`.
     let config_written = super::init::register_driver(repo)?;
-    let attributes_written = crate::gitattributes::write_section(
+    let attributes_written = crate::git::attributes::write_section(
         &repo.attributes_path(),
         // Whichever spelling is already there: repairing this section must not
         // silently undo a `sync --ignorecase`.
-        &crate::gitattributes::render_lines_as_written(&repo.attributes_path(), &config),
+        &crate::git::attributes::render_lines_as_written(&repo.attributes_path(), &config),
     )?;
 
     let mut report = Report {
@@ -177,7 +180,7 @@ pub fn run(repo: &Repo, key_source: Option<KeySource<'_>>, key_only: bool) -> Re
         report.warnings.push(format!(
             "{} is missing, so every `git add` in this repository will refuse \
              until it is restored; run `git-xcrypt init` to create one",
-            crate::repo::CONFIG_FILE
+            crate::git::repo::CONFIG_FILE
         ));
     }
 
@@ -262,7 +265,7 @@ pub fn run(repo: &Repo, key_source: Option<KeySource<'_>>, key_only: bool) -> Re
         }
         // Atomic, and inheriting the file's own mode, so an interruption cannot
         // leave a half-written secret and an executable stays executable.
-        match crate::atomic::write(&file.path, &plaintext) {
+        match crate::util::atomic::write(&file.path, &plaintext) {
             Ok(()) => {}
             Err(Error::Io(err)) => {
                 stopped = Some(named_io(&relative, "replace", &err));
@@ -280,22 +283,22 @@ pub fn run(repo: &Repo, key_source: Option<KeySource<'_>>, key_only: bool) -> Re
     // Last, and not optional: without it git compares the new size against the
     // one it cached for the ciphertext, concludes the file changed and never
     // runs the filter to find out otherwise. `git status` would then report
-    // every unlocked secret as modified, for good. See `crate::gitindex`.
+    // every unlocked secret as modified, for good. See `crate::git::index`.
     //
     // Run even when the loop stopped, and that is the point: the files already
     // rewritten are the ones whose cached size is now wrong, and no later run
     // will come back for them — they are plain text by then, so the walk does
     // not select them at all.
-    let refreshed = crate::gitindex::forget_stat(
+    let refreshed = crate::git::index::forget_stat(
         &repo.git_dir().join("index"),
-        crate::gitindex::object_hash(
+        crate::git::index::object_hash(
             gitconfig::get(&git_config, "extensions.objectformat").as_deref(),
         ),
         &rewritten,
     );
     match refreshed {
-        Ok(crate::gitindex::Outcome::Cleared(_)) => {}
-        Ok(crate::gitindex::Outcome::Skipped(why)) => report.warnings.push(why),
+        Ok(crate::git::index::Outcome::Cleared(_)) => {}
+        Ok(crate::git::index::Outcome::Skipped(why)) => report.warnings.push(why),
         // A warning, not a return: the decryption already happened, and a bare
         // `Err` here threw the whole report away — the user was never told that
         // N files now sit in the clear, and a second run cannot say it either,
@@ -333,7 +336,7 @@ pub fn run(repo: &Repo, key_source: Option<KeySource<'_>>, key_only: bool) -> Re
 ///
 /// [`Error::Config`] for a different key, [`Error::Format`] when the key file
 /// already in the repository cannot be read.
-fn refuse_on_conflict(repo: &Repo, key: &crate::key::MasterKey) -> Result<()> {
+fn refuse_on_conflict(repo: &Repo, key: &crate::crypto::key::MasterKey) -> Result<()> {
     match repo.load_key() {
         Ok(existing) if existing.key_id() == key.key_id() => Ok(()),
         Ok(existing) => Err(Error::Config(format!(
@@ -363,7 +366,7 @@ fn refuse_on_conflict(repo: &Repo, key: &crate::key::MasterKey) -> Result<()> {
 /// # Errors
 ///
 /// [`Error::Io`] when the key file cannot be written.
-fn install(repo: &Repo, key: &crate::key::MasterKey) -> Result<bool> {
+fn install(repo: &Repo, key: &crate::crypto::key::MasterKey) -> Result<bool> {
     if repo.has_key() {
         return Ok(false);
     }

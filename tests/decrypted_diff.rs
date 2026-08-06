@@ -28,7 +28,7 @@
 
 mod harness;
 
-use git_xcrypt::format::MAGIC;
+use git_xcrypt::crypto::format::MAGIC;
 use harness::TestRepo;
 
 const FIRST: &[u8] = b"api_key = one\nshared line\n";

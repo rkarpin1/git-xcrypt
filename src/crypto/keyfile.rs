@@ -21,8 +21,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use zeroize::{Zeroize as _, Zeroizing};
 
-use crate::format::KEY_ID_LEN;
-use crate::key::{MASTER_KEY_LEN, MasterKey};
+use crate::crypto::format::KEY_ID_LEN;
+use crate::crypto::key::{MASTER_KEY_LEN, MasterKey};
 use crate::{Error, Result};
 
 /// Identifies a key file and keeps it from being mistaken for anything else.
@@ -154,7 +154,7 @@ pub fn read(path: &Path) -> Result<MasterKey> {
 ///
 /// [`Error::Io`] when the file cannot be created or written.
 pub fn write_owner_only(path: &Path, contents: &[u8]) -> Result<()> {
-    crate::atomic::write_owner_only(path, contents)
+    crate::util::atomic::write_owner_only(path, contents)
 }
 
 /// Name and version of the portable export format, as its first line begins.

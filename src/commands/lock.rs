@@ -41,11 +41,15 @@ use std::path::{Path, PathBuf};
 
 use zeroize::Zeroizing;
 
-use crate::config::Config;
-use crate::format::KEY_ID_LEN;
-use crate::key::MasterKey;
-use crate::repo::{Repo, git_spelling};
-use crate::{Error, Result, atomic, decide, gitconfig, gitindex};
+use crate::crypto::format::KEY_ID_LEN;
+use crate::crypto::key::MasterKey;
+use crate::git::config as gitconfig;
+use crate::git::index;
+use crate::git::repo::{Repo, git_spelling};
+use crate::rules::decide;
+use crate::rules::declaration::Config;
+use crate::util::atomic;
+use crate::{Error, Result};
 
 /// What `lock` did.
 #[derive(Debug)]
@@ -144,7 +148,7 @@ impl fmt::Display for Warning {
                 f,
                 "\nNothing in this working tree matches {}, so nothing will be encrypted.\n\
                  If you expected secrets to be closed here, abort and check the declaration.",
-                crate::repo::CONFIG_FILE
+                crate::git::repo::CONFIG_FILE
             )?;
         }
 
@@ -281,7 +285,7 @@ pub fn run(repo: &Repo, confirm: &mut dyn Confirm) -> Result<Outcome> {
             "{}: the file that says what to encrypt is missing, so lock cannot tell \
              which files to close. Restore it from the repository or run \
              `git-xcrypt init`. Nothing has been changed.",
-            crate::repo::CONFIG_FILE
+            crate::git::repo::CONFIG_FILE
         )));
     }
 
@@ -291,7 +295,7 @@ pub fn run(repo: &Repo, confirm: &mut dyn Confirm) -> Result<Outcome> {
 
     let git_config = gitconfig::open_full(repo.git_dir(), repo.common_dir())?;
     let hash =
-        gitindex::object_hash(gitconfig::get(&git_config, "extensions.objectformat").as_deref());
+        index::object_hash(gitconfig::get(&git_config, "extensions.objectformat").as_deref());
 
     let mut walk = Walk::default();
     let found = collect(repo, &config, &mut walk, NOTHING_CHANGED)?;
@@ -353,7 +357,7 @@ pub fn run(repo: &Repo, confirm: &mut dyn Confirm) -> Result<Outcome> {
             "no file in the working tree matches {}, so nothing was encrypted. \
              If you expected secrets to be closed here, check the declaration \
              before relying on this repository being safe.",
-            crate::repo::CONFIG_FILE
+            crate::git::repo::CONFIG_FILE
         ));
     }
 
@@ -423,10 +427,10 @@ pub fn run(repo: &Repo, confirm: &mut dyn Confirm) -> Result<Outcome> {
     // reports every locked secret as modified, for good. Passing only the
     // rewritten ones left a file encrypted by an *interrupted* earlier run
     // permanently modified, because the second run skipped it as already closed.
-    // Measured. See `crate::gitindex`.
+    // Measured. See `crate::git::index`.
     let names: Vec<Vec<u8>> = selected.iter().map(|file| file.name.clone()).collect();
-    match gitindex::forget_stat(&repo.git_dir().join("index"), hash, &names)? {
-        gitindex::Outcome::Cleared(cleared) if cleared < names.len() => {
+    match index::forget_stat(&repo.git_dir().join("index"), hash, &names)? {
+        index::Outcome::Cleared(cleared) if cleared < names.len() => {
             // Every selected file was proved tracked by the survey, so a name
             // the index did not match is a name spelled differently there than
             // on disk — case folding on macOS and Windows, or NFD against NFC.
@@ -439,8 +443,8 @@ pub fn run(repo: &Repo, confirm: &mut dyn Confirm) -> Result<Outcome> {
                 names.len()
             ));
         }
-        gitindex::Outcome::Cleared(_) => {}
-        gitindex::Outcome::Skipped(why) => report.warnings.push(why),
+        index::Outcome::Cleared(_) => {}
+        index::Outcome::Skipped(why) => report.warnings.push(why),
     }
 
     // The last thing asked before the irreversible step, and the only one asked
@@ -518,7 +522,7 @@ pub fn run(repo: &Repo, confirm: &mut dyn Confirm) -> Result<Outcome> {
 /// there answered "no repository key". The permission is only the cheapest
 /// trigger — an I/O error, an exhausted descriptor table or a stale network
 /// handle reach the same line, and every one of them is a question rather than
-/// an answer. Note the contrast with [`crate::repo::Repo::work_trees`], which
+/// an answer. Note the contrast with [`crate::git::repo::Repo::work_trees`], which
 /// swallows the identical failure on purpose: that list is only ever used to
 /// *widen* a refusal, so a short one costs nothing, while a short list here is
 /// what deletes the key.
@@ -706,7 +710,7 @@ fn refuse_if_a_declared_file_appeared(
 /// spellings already drifted apart, an earlier version of this gate skipped it,
 /// the key went, and the plain text was readable again the moment the mode was
 /// put back. Symlinks and gitlinks are skipped for the reason
-/// `gitindex::Tracked::holds_content` gives — their blob is not file content and
+/// `index::Tracked::holds_content` gives — their blob is not file content and
 /// no filter ever ran on them.
 ///
 /// An index that cannot be read is a refusal too, not a pass. This is the last
@@ -718,9 +722,9 @@ fn refuse_if_a_declared_file_is_still_open(
     hash: gix_hash::Kind,
 ) -> Result<()> {
     let index_path = repo.git_dir().join("index");
-    let entries = match gitindex::list(&index_path, hash)? {
-        gitindex::Listed::Read(entries) => entries,
-        gitindex::Listed::Unavailable(why) => {
+    let entries = match index::list(&index_path, hash)? {
+        index::Listed::Read(entries) => entries,
+        index::Listed::Unavailable(why) => {
             return Err(Error::Config(format!(
                 "{} could not be read ({why}), so lock cannot prove that every \
                  declared file here is closed. The key has been kept and every \
@@ -737,16 +741,16 @@ fn refuse_if_a_declared_file_is_still_open(
         }
         let path = repo
             .work_tree()
-            .join(crate::repo::working_tree_path(&entry.path));
+            .join(crate::git::repo::working_tree_path(&entry.path));
         // Only the header is needed, and reading the whole file would be a
         // pointless copy of a secret into this process for the large ones.
-        let mut head = [0u8; crate::format::MAGIC.len()];
+        let mut head = [0u8; crate::crypto::format::MAGIC.len()];
         let read = std::fs::File::open(&path).and_then(|mut file| {
             use std::io::Read as _;
             file.read(&mut head)
         });
         match read {
-            Ok(read) if head[..read] == crate::format::MAGIC => {}
+            Ok(read) if head[..read] == crate::crypto::format::MAGIC => {}
             // Nothing at that path: a staged deletion leaves the index naming a
             // file that is gone, and a file that does not exist holds no plain
             // text. The **only** failure that is an answer rather than a
@@ -797,12 +801,12 @@ fn refuse_if_a_declared_file_is_still_open(
 /// already deleted the key.
 fn write_catch_all_if_missing(repo: &Repo, config: &Config) -> Result<bool> {
     let path = repo.attributes_path();
-    if crate::gitattributes::catch_all_present(&path)? {
+    if crate::git::attributes::catch_all_present(&path)? {
         return Ok(false);
     }
-    crate::gitattributes::write_section(
+    crate::git::attributes::write_section(
         &path,
-        &crate::gitattributes::render_lines_as_written(&path, config),
+        &crate::git::attributes::render_lines_as_written(&path, config),
     )
 }
 
@@ -826,7 +830,7 @@ fn describe_worktree(repo: &Repo, registration: &Path) -> String {
     let absolute = if pointer.is_absolute() {
         pointer.to_path_buf()
     } else {
-        crate::repo::lexically_normal(&registration.join(pointer))
+        crate::git::repo::lexically_normal(&registration.join(pointer))
     };
     let checkout = absolute.parent().unwrap_or(&absolute);
     let _ = repo;
@@ -884,7 +888,7 @@ fn main_checkout(repo: &Repo) -> Option<String> {
         let absolute = if path.is_absolute() {
             path.to_path_buf()
         } else {
-            crate::repo::lexically_normal(&repo.common_dir().join(path))
+            crate::git::repo::lexically_normal(&repo.common_dir().join(path))
         };
         return Some(format!("the main checkout at {}", absolute.display()));
     }
@@ -1089,15 +1093,15 @@ fn stored_ids(
         .map(|file| file.name.clone())
         .collect();
 
-    match gitindex::staged_ids(&index_path, hash, &names)? {
-        gitindex::Staged::Read(mut ids) => {
+    match index::staged_ids(&index_path, hash, &names)? {
+        index::Staged::Read(mut ids) => {
             let tail = ids.split_off(selected.len());
             Ok(Stored {
                 selected: ids,
                 residue: tail,
             })
         }
-        gitindex::Staged::Unavailable(why) => Err(Error::Config(format!(
+        index::Staged::Unavailable(why) => Err(Error::Config(format!(
             "lock cannot tell whether your work is safe: {} could not be used because \
              {why}. Nothing has been changed.\n\
              For a split index, `git update-index --no-split-index` converts it back.",
@@ -1193,7 +1197,7 @@ fn survey(
 
 /// The blob id of `content`, or a refusal naming the file it belonged to.
 fn blob_id(hash: gix_hash::Kind, content: &[u8], relative: &Path) -> Result<Vec<u8>> {
-    gitindex::blob_id(hash, content).ok_or_else(|| {
+    index::blob_id(hash, content).ok_or_else(|| {
         Error::Config(format!(
             "{}: its object id could not be computed, so lock cannot tell whether it \
              is stored. Nothing has been changed.",
@@ -1612,7 +1616,7 @@ mod tests {
         let error = run(&repo, &mut Meddling(late.clone()))
             .expect_err("a secret that appeared must not be locked around");
 
-        assert_eq!(error.exit_code(), crate::exit::CONFIG);
+        assert_eq!(error.exit_code(), crate::util::exit::CONFIG);
         assert!(repo.has_key(), "the key went over a file nobody checked");
         assert_eq!(
             fs::read(&late).expect("reading"),
@@ -1646,7 +1650,9 @@ mod tests {
     ) -> std::thread::JoinHandle<bool> {
         std::thread::spawn(move || {
             for _ in 0..30_000 {
-                if fs::read(&path).is_ok_and(|bytes| bytes.starts_with(&crate::format::MAGIC)) {
+                if fs::read(&path)
+                    .is_ok_and(|bytes| bytes.starts_with(&crate::crypto::format::MAGIC))
+                {
                     meddle();
                     return true;
                 }
@@ -1695,7 +1701,7 @@ mod tests {
             meddling.join().expect("the meddling thread"),
             "the pass never encrypted anything, so this proves nothing about it"
         );
-        assert_eq!(error.exit_code(), crate::exit::CONFIG);
+        assert_eq!(error.exit_code(), crate::util::exit::CONFIG);
         assert!(
             repo.has_key(),
             "the key went while another checkout read it: {error}"
@@ -1710,7 +1716,7 @@ mod tests {
         assert!(
             fs::read(repo.work_tree().join("secrets/db.env"))
                 .expect("reading")
-                .starts_with(&crate::format::MAGIC),
+                .starts_with(&crate::crypto::format::MAGIC),
             "an earlier gate caught this, so the window after the pass is untested"
         );
     }
@@ -1747,7 +1753,7 @@ mod tests {
             meddling.join().expect("the meddling thread"),
             "the pass never encrypted anything, so this proves nothing about it"
         );
-        assert_eq!(error.exit_code(), crate::exit::CONFIG);
+        assert_eq!(error.exit_code(), crate::util::exit::CONFIG);
         assert!(
             repo.has_key(),
             "the key went over a file nobody checked: {error}"
@@ -1766,7 +1772,7 @@ mod tests {
         assert!(
             fs::read(repo.work_tree().join("secrets/db.env"))
                 .expect("reading")
-                .starts_with(&crate::format::MAGIC),
+                .starts_with(&crate::crypto::format::MAGIC),
             "an earlier gate caught this, so the window after the pass is untested"
         );
     }
@@ -1778,7 +1784,7 @@ mod tests {
 
         let error = run(&repo, &mut Scripted::new(true)).expect_err("lock must refuse");
 
-        assert_eq!(error.exit_code(), crate::exit::CONFIG);
+        assert_eq!(error.exit_code(), crate::util::exit::CONFIG);
         assert!(repo.has_key());
     }
 }

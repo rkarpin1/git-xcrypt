@@ -12,10 +12,13 @@
 
 use std::fs;
 
-use crate::config::Config;
-use crate::key::MasterKey;
-use crate::repo::{DRIVER, Repo};
-use crate::{Error, Result, gitattributes, gitconfig, keyfile};
+use crate::crypto::key::MasterKey;
+use crate::crypto::keyfile;
+use crate::git::attributes;
+use crate::git::config as gitconfig;
+use crate::git::repo::{DRIVER, Repo};
+use crate::rules::declaration::Config;
+use crate::{Error, Result};
 
 /// What `init` changed, so it can tell the user rather than work in silence.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -99,10 +102,10 @@ pub fn run(repo: &Repo) -> Result<Report> {
     // change it — see `render_lines_as_written`. A fresh repository has none, so
     // it gets the global line: correct with no `sync` in the flow at all, which
     // is the whole point of writing it here.
-    let lines = gitattributes::render_lines_as_written(&repo.attributes_path(), &config);
+    let lines = attributes::render_lines_as_written(&repo.attributes_path(), &config);
     report.warnings = config.pointless_eol;
     report.warnings.extend(textconv_cache_warning(repo));
-    report.attributes_written = gitattributes::write_section(&repo.attributes_path(), &lines)?;
+    report.attributes_written = attributes::write_section(&repo.attributes_path(), &lines)?;
 
     Ok(report)
 }
@@ -128,7 +131,7 @@ fn refuse_if_previously_configured(repo: &Repo) -> Result<()> {
             )));
         }
     };
-    let has_section = gitattributes::has_section(&attributes);
+    let has_section = attributes::has_section(&attributes);
     let has_config = repo.xcrypt_config_path().is_file();
 
     if !has_section && !has_config {
@@ -144,7 +147,7 @@ fn refuse_if_previously_configured(repo: &Repo) -> Result<()> {
          If this repository never used git-xcrypt and you wrote {} by hand, delete it \
          and run `init` again.\n\
          (found: {})",
-        crate::repo::CONFIG_FILE,
+        crate::git::repo::CONFIG_FILE,
         match (has_section, has_config) {
             (true, true) => "a managed .gitattributes section and .git-xcrypt",
             (true, false) => "a managed .gitattributes section",
@@ -351,14 +354,14 @@ fn create_config_file(repo: &Repo) -> Result<bool> {
 fn current_executable() -> Result<String> {
     Ok(shell_quoted(
         &std::env::current_exe()?,
-        crate::repo::NATIVE_SEPARATOR,
+        crate::git::repo::NATIVE_SEPARATOR,
     ))
 }
 
 /// The platform-independent core, so both spellings are testable from either
 /// platform.
 fn shell_quoted(path: &std::path::Path, separator: char) -> String {
-    let text = crate::repo::with_separator(&path.to_string_lossy(), separator);
+    let text = crate::git::repo::with_separator(&path.to_string_lossy(), separator);
     format!("'{}'", text.replace('\'', r"'\''"))
 }
 

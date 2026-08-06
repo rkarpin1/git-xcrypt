@@ -12,12 +12,12 @@ use std::io::{Read, Write};
 
 use bstr::ByteSlice as _;
 
-use crate::config::Config;
-use crate::decide;
-use crate::gitattributes;
-use crate::key::MasterKey;
-use crate::pktline::{self, Packet};
-use crate::repo::Repo;
+use crate::crypto::key::MasterKey;
+use crate::git::attributes;
+use crate::git::pktline::{self, Packet};
+use crate::git::repo::Repo;
+use crate::rules::decide;
+use crate::rules::declaration::Config;
 use crate::{Error, Result};
 
 /// What the repository can tell the filter, resolved once per process.
@@ -37,8 +37,8 @@ pub struct Context {
     /// in". Lazy on purpose: a repository that declares nothing must not pay for
     /// opening the object database on every git operation, and the question is
     /// only ever asked about a file that is actually being encrypted.
-    head: Option<Option<crate::history::HeadLookup>>,
-    /// What [`crate::history::HeadLookup::open`] needs, kept so it can be built
+    head: Option<Option<crate::git::history::HeadLookup>>,
+    /// What [`crate::git::history::HeadLookup::open`] needs, kept so it can be built
     /// later.
     location: Option<Location>,
     /// Git's own attribute stack, built on first use.
@@ -48,7 +48,7 @@ pub struct Context {
     /// encrypts nothing must never pay for that, so it is built only when a path
     /// is actually about to be encrypted — and then once, for the whole
     /// operation, which is what the long-running protocol is for.
-    attributes: Option<gitattributes::AttributeResolver>,
+    attributes: Option<attributes::AttributeResolver>,
     /// Whether the managed section has been checked for staleness yet.
     ///
     /// Once per process, and only once something is actually encrypted — a
@@ -114,31 +114,31 @@ impl Context {
         // checkout. Reading that one from the common directory handed a linked
         // worktree the main checkout's settings, and a `core.attributesFile` set
         // there cost a file at checkout.
-        let git_config = crate::gitconfig::open_full(repo.git_dir(), repo.common_dir())?;
+        let git_config = crate::git::config::open_full(repo.git_dir(), repo.common_dir())?;
         Ok(Self {
             config,
             config_path,
             key,
-            autocrlf: crate::gitconfig::get(&git_config, "core.autocrlf"),
-            core_eol: crate::gitconfig::get(&git_config, "core.eol"),
+            autocrlf: crate::git::config::get(&git_config, "core.autocrlf"),
+            core_eol: crate::git::config::get(&git_config, "core.eol"),
             head: None,
             attributes: None,
             location: Some(Location {
                 git_dir: repo.git_dir().to_path_buf(),
                 // The common directory, not this worktree's: `info/attributes`
-                // is shared by every checkout — see [`gitattributes::AttributeResolver::new`].
+                // is shared by every checkout — see [`attributes::AttributeResolver::new`].
                 common_dir: repo.common_dir().to_path_buf(),
                 work_tree: repo.work_tree().to_path_buf(),
-                hash: crate::gitindex::object_hash(
-                    crate::gitconfig::get(&git_config, "extensions.objectformat").as_deref(),
+                hash: crate::git::index::object_hash(
+                    crate::git::config::get(&git_config, "extensions.objectformat").as_deref(),
                 ),
                 // Resolved, not read verbatim — see
-                // [`crate::gitconfig::global_attributes_file`]. A `text` line in
+                // [`crate::git::config::global_attributes_file`]. A `text` line in
                 // the global file reached the ciphertext with `git add` exiting
                 // 0 and the file gone at checkout.
-                attributes_file: crate::gitconfig::global_attributes_file(&git_config),
-                ignore_case: crate::gitconfig::get(&git_config, "core.ignorecase")
-                    .is_some_and(|value| crate::gitconfig::is_true(&value)),
+                attributes_file: crate::git::config::global_attributes_file(&git_config),
+                ignore_case: crate::git::config::get(&git_config, "core.ignorecase")
+                    .is_some_and(|value| crate::git::config::is_true(&value)),
             }),
             section_checked: false,
             answered: std::collections::HashMap::new(),
@@ -174,10 +174,10 @@ impl Context {
         let Some(location) = self.location.as_ref() else {
             return;
         };
-        let path = location.work_tree.join(crate::repo::ATTRIBUTES_FILE);
-        let current = gitattributes::ACCEPTED.into_iter().any(|rendering| {
-            let lines = gitattributes::render_lines(&self.config, rendering);
-            gitattributes::desired(&path, &lines).is_ok_and(|(existing, wanted)| existing == wanted)
+        let path = location.work_tree.join(crate::git::repo::ATTRIBUTES_FILE);
+        let current = attributes::ACCEPTED.into_iter().any(|rendering| {
+            let lines = attributes::render_lines(&self.config, rendering);
+            attributes::desired(&path, &lines).is_ok_and(|(existing, wanted)| existing == wanted)
         });
         if !current {
             // An unreadable section answers "not current" above, and that is the
@@ -188,8 +188,8 @@ impl Context {
                  Nothing is stored in the clear over this, but the missing \
                  `-text` lets git convert the ciphertext of any path another \
                  attribute calls `text`, which costs the file at checkout.",
-                crate::repo::ATTRIBUTES_FILE,
-                crate::repo::CONFIG_FILE
+                crate::git::repo::ATTRIBUTES_FILE,
+                crate::git::repo::CONFIG_FILE
             );
         }
     }
@@ -211,7 +211,7 @@ impl Context {
         }
         if self.head.is_none() {
             let opened = self.location.as_ref().and_then(|location| {
-                crate::history::HeadLookup::open(
+                crate::git::history::HeadLookup::open(
                     &location.git_dir,
                     &location.common_dir,
                     location.hash,
@@ -242,10 +242,10 @@ impl Context {
     /// Asked of git's own attribute stack, never of the managed section alone:
     /// the managed `-text` is one line among many and git takes the last match,
     /// so the only thing that answers this is a full resolution.
-    fn ciphertext_would_be_converted(&mut self, path: &[u8]) -> Option<gitattributes::Culprit> {
+    fn ciphertext_would_be_converted(&mut self, path: &[u8]) -> Option<attributes::Culprit> {
         match self.attribute_stack()?.resolve(path).conversion {
-            gitattributes::EolConversion::On(culprit) => Some(culprit),
-            gitattributes::EolConversion::Off => None,
+            attributes::EolConversion::On(culprit) => Some(culprit),
+            attributes::EolConversion::Off => None,
         }
     }
 
@@ -253,21 +253,21 @@ impl Context {
     ///
     /// `None` only when there is no repository behind this process, which is the
     /// unit-test shape; every caller then skips its check rather than guessing.
-    fn attribute_stack(&mut self) -> Option<&mut gitattributes::AttributeResolver> {
+    fn attribute_stack(&mut self) -> Option<&mut attributes::AttributeResolver> {
         if self.attributes.is_none() {
             let location = self.location.as_ref()?;
             // The index copies git falls back to for a deleted `.gitattributes`
             // — without them the refusal went blind the moment the user deleted
             // the file the refusal itself told them to edit, and git converted
             // the ciphertext with exit 0. Measured; see `staged_fallbacks`.
-            let staged = gitattributes::staged_fallbacks(
+            let staged = attributes::staged_fallbacks(
                 &location.work_tree,
                 &location.git_dir.join("index"),
                 &location.common_dir,
                 location.hash,
                 location.ignore_case,
             );
-            let resolver = gitattributes::AttributeResolver::new(
+            let resolver = attributes::AttributeResolver::new(
                 &location.work_tree,
                 &location.common_dir,
                 location.attributes_file.as_deref(),
@@ -319,7 +319,7 @@ impl Context {
         &mut self,
         path: &[u8],
         content: &[u8],
-    ) -> Option<gitattributes::Culprit> {
+    ) -> Option<attributes::Culprit> {
         if !bears_the_mark_of_an_expansion(content) {
             return None;
         }
@@ -353,7 +353,7 @@ impl Context {
     /// reader is missing: that nothing was lost, which line did it, and what to
     /// do. The first is the load-bearing one — everything the user can see says
     /// the opposite.
-    fn report_conversion_at_checkout(&self, culprit: &gitattributes::Culprit) -> Error {
+    fn report_conversion_at_checkout(&self, culprit: &attributes::Culprit) -> Error {
         Error::Config(format!(
             "git rewrote this file's line endings on the way out of the object \
              database, before this filter saw a byte of it, because this line \
@@ -379,7 +379,7 @@ impl Context {
     /// is not versioned and cannot be seen in a pull request at all. So the
     /// message names the file, the line, the pattern and the assignment, spelled
     /// relative to the working tree where there is one.
-    fn refuse_conversion(&self, culprit: &gitattributes::Culprit) -> Error {
+    fn refuse_conversion(&self, culprit: &attributes::Culprit) -> Error {
         let shown = self.spell(culprit);
 
         Error::Config(format!(
@@ -401,9 +401,9 @@ impl Context {
     /// outranks the rest — `$GIT_DIR/info/attributes` — is not versioned and
     /// cannot be seen in a pull request at all. Both directions print it the same
     /// way on purpose: the reader is looking for one line, not for two dialects.
-    fn spell(&self, culprit: &gitattributes::Culprit) -> String {
+    fn spell(&self, culprit: &attributes::Culprit) -> String {
         match (&culprit.source, self.location.as_ref()) {
-            (Some(source), Some(location)) => gitattributes::Culprit {
+            (Some(source), Some(location)) => attributes::Culprit {
                 source: Some(
                     source
                         .strip_prefix(&location.work_tree)
@@ -600,8 +600,9 @@ fn serve(context: &mut Context, request: &Request, output: &mut impl Write) -> R
             // shape of mistake that once turned a 301-file checkout into 301
             // warnings. Content that already carries our magic is not a first
             // encryption either: that is a re-add of something already stored.
-            let stored_as_ciphertext = !crate::config::is_never_encrypted(&request.pathname)
-                && context.config.decide(&request.pathname).encrypt;
+            let stored_as_ciphertext =
+                !crate::rules::declaration::is_never_encrypted(&request.pathname)
+                    && context.config.decide(&request.pathname).encrypt;
 
             // Before the encryption, not after it, and unlike the warning below
             // this one *does* refuse. Git converts the filter's output, so what
@@ -623,7 +624,7 @@ fn serve(context: &mut Context, request: &Request, output: &mut impl Write) -> R
                 // nothing must not pay for an answer it cannot act on.
                 context.warn_if_the_section_is_stale();
             }
-            if stored_as_ciphertext && !crate::format::looks_encrypted(&request.content) {
+            if stored_as_ciphertext && !crate::crypto::format::looks_encrypted(&request.content) {
                 first_encryption = Some(request.pathname.clone());
             }
             decide::clean(
@@ -697,8 +698,8 @@ fn serve(context: &mut Context, request: &Request, output: &mut impl Write) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::key::MASTER_KEY_LEN;
-    use crate::pktline::{write_data, write_flush};
+    use crate::crypto::key::MASTER_KEY_LEN;
+    use crate::git::pktline::{write_data, write_flush};
 
     fn context() -> Context {
         Context {
