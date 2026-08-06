@@ -1771,41 +1771,4 @@ mod tests {
              otherwise sends a user to rotate a secret that was never exposed: {text}"
         );
     }
-
-    #[test]
-    fn an_uncommitted_bootstrap_is_not_reported_as_a_repository_storing_plaintext() {
-        // With the attributes and the declaration present in the working tree,
-        // git *does* enforce them here — both are read from the tree — and the
-        // exposure belongs to a clone, which gets neither. The headline used to
-        // say "committing a declared file stores it in the clear, with exit
-        // code 0 and no warning", which is false of this repository and sends
-        // its user to rotate secrets that were never exposed; the remedy block
-        // offered `init`, which does not commit anything and so changes
-        // nothing.
-        let report = Report {
-            has_key: true,
-            setup: vec![SetupGap::Untracked(crate::repo::ATTRIBUTES_FILE.into())],
-            ..Report::default()
-        };
-        assert_eq!(report.verdict(), Verdict::Misconfigured);
-        let text = report.to_string();
-        assert!(
-            !text.contains("stores it in the clear"),
-            "this repository filters correctly, and the headline says it does \
-             not: {text}"
-        );
-        assert!(
-            text.contains("no clone gets them"),
-            "the real exposure — the clone's — goes unnamed: {text}"
-        );
-        assert!(
-            text.contains("git add"),
-            "the one remedy that works, a commit, is not offered: {text}"
-        );
-        assert!(
-            !text.contains("git-xcrypt init"),
-            "`init` does not commit anything, so offering it here is a loop \
-             that changes nothing: {text}"
-        );
-    }
 }

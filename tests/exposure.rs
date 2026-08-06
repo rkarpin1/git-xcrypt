@@ -245,3 +245,62 @@ fn a_secret_left_on_a_branch_nobody_has_checked_out_is_still_found() {
         "the report must name the path:\n{text}"
     );
 }
+
+/// A repository that filters correctly but has not committed its bootstrap.
+///
+/// `init` writes `.gitattributes` and `.git-xcrypt` into the working tree, and
+/// git reads both from there — so *this* checkout enforces the declarations
+/// exactly as a committed pair would. The exposure belongs to a clone, which
+/// gets neither file and stores every secret in the clear with exit code 0.
+///
+/// The gap is real (exit 2), and the words carry the remedy: the headline used
+/// to say "committing a declared file stores it in the clear", false of this
+/// repository and pointing at secrets that were never exposed, while the remedy
+/// block offered `init` — which does not commit anything, so following it
+/// changed nothing and the report came back identical.
+#[test]
+fn an_uncommitted_bootstrap_names_the_clones_exposure_not_this_checkouts() {
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.xcrypt_ok(["sync"]);
+    // The secret committed, the bootstrap not: `git add <path>` instead of
+    // `-A` is all it takes, and it is the state the gap exists for — a wholly
+    // untracked repository is deliberately left alone, because between
+    // `git init` and the first `git add` there is nothing published to warn
+    // about.
+    repo.write_file("secrets/db.env", SECRET);
+    repo.git_ok(["add", "secrets/db.env"]);
+    repo.git_ok(["commit", "-q", "-m", "the secret, without its bootstrap"]);
+    assert!(
+        repo.blob_bytes("secrets/db.env").starts_with(MAGIC),
+        "the premise is a correctly filtering checkout; without it this test \
+         proves nothing"
+    );
+
+    let output = repo.xcrypt(["status"]);
+    let text = report(&output);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "an uncommitted bootstrap is a setup gap, and the gate must say so:\n{text}"
+    );
+    assert!(
+        !text.contains("stores it in the clear"),
+        "this repository filters correctly, and the headline says it does not:\n{text}"
+    );
+    assert!(
+        text.contains("no clone gets them"),
+        "the real exposure — the clone's — goes unnamed:\n{text}"
+    );
+    assert!(
+        text.contains("git add"),
+        "the one remedy that works, a commit, is not offered:\n{text}"
+    );
+    assert!(
+        !text.contains("git-xcrypt init"),
+        "`init` does not commit anything, so offering it here is a loop that \
+         changes nothing:\n{text}"
+    );
+}
