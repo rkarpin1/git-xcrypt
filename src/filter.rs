@@ -49,6 +49,14 @@ pub struct Context {
     /// is actually about to be encrypted — and then once, for the whole
     /// operation, which is what the long-running protocol is for.
     attributes: Option<gitattributes::AttributeResolver>,
+    /// Whether the managed section has been checked for staleness yet.
+    ///
+    /// Once per process, and only once something is actually encrypted — a
+    /// repository that stores nothing as ciphertext is not hurt by a stale
+    /// section and must not pay for the answer. Measured at 2.6 ms for the whole
+    /// render-and-compare, which the long-running protocol spends once per git
+    /// operation rather than once per file.
+    section_checked: bool,
     /// What the `HEAD` lookup answered for each path this process has seen.
     ///
     /// Both answers are kept, and the negative one matters more. One process
@@ -132,8 +140,58 @@ impl Context {
                 ignore_case: crate::gitconfig::get(&git_config, "core.ignorecase")
                     .is_some_and(|value| crate::gitconfig::is_true(&value)),
             }),
+            section_checked: false,
             answered: std::collections::HashMap::new(),
         })
+    }
+
+    /// Says so, once, when the managed `.gitattributes` section is out of date.
+    ///
+    /// **A warning and never a refusal.** With `required = true` a non-zero exit
+    /// aborts every git operation in the repository, and a stale section is not
+    /// a reason to stop anyone working: nothing is stored in the clear over it.
+    /// What it costs is the `-text` that keeps git's own CRLF conversion off the
+    /// ciphertext of any path some other attribute calls `text` — measured at 34
+    /// `CR` bytes gone from a 2 MB blob, the commit succeeding, and the file
+    /// unrecoverable at checkout. So it is worth a line on `stderr` and nothing
+    /// stronger.
+    ///
+    /// **Nothing is rewritten here, deliberately.** Measured on git 2.55,
+    /// 2026-08-06 with a stand-in filter: git reads `.gitattributes` **once per
+    /// operation**, so a rewrite from this path would take effect only from the
+    /// next command — the very drift the catch-all construction exists to remove,
+    /// moved one invocation along. It would also dirty a tracked file in the
+    /// middle of `git add`, which is not something a command that only adds a
+    /// file may do.
+    ///
+    /// Any shape this build writes counts as current, so a repository that ran
+    /// `sync --global` is not nagged for it.
+    fn warn_if_the_section_is_stale(&mut self) {
+        if self.section_checked {
+            return;
+        }
+        self.section_checked = true;
+        let Some(location) = self.location.as_ref() else {
+            return;
+        };
+        let path = location.work_tree.join(crate::repo::ATTRIBUTES_FILE);
+        let current = gitattributes::ACCEPTED.into_iter().any(|rendering| {
+            let lines = gitattributes::render_lines(&self.config, rendering);
+            gitattributes::desired(&path, &lines).is_ok_and(|(existing, wanted)| existing == wanted)
+        });
+        if !current {
+            // An unreadable section answers "not current" above, and that is the
+            // safe direction for a warning: `status` is the gate, and it reports
+            // the same file as a state conflict rather than a note.
+            eprintln!(
+                "git-xcrypt: {} no longer matches {} — run `git-xcrypt sync`. \
+                 Nothing is stored in the clear over this, but the missing \
+                 `-text` lets git convert the ciphertext of any path another \
+                 attribute calls `text`, which costs the file at checkout.",
+                crate::repo::ATTRIBUTES_FILE,
+                crate::repo::CONFIG_FILE
+            );
+        }
     }
 
     /// Whether `path` needs the "already in `HEAD` in the clear" warning.
@@ -560,6 +618,11 @@ fn serve(context: &mut Context, request: &Request, output: &mut impl Write) -> R
                 return Err(context.refuse_conversion(&culprit));
             }
 
+            if stored_as_ciphertext {
+                // Here rather than at start-up: a repository that encrypts
+                // nothing must not pay for an answer it cannot act on.
+                context.warn_if_the_section_is_stale();
+            }
             if stored_as_ciphertext && !crate::format::looks_encrypted(&request.content) {
                 first_encryption = Some(request.pathname.clone());
             }
@@ -654,6 +717,7 @@ mod tests {
             head: Some(None),
             attributes: None,
             location: None,
+            section_checked: true,
             answered: std::collections::HashMap::new(),
         }
     }

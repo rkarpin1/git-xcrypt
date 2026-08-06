@@ -75,8 +75,9 @@ pattern —
 
 — which confines the diff driver to declared paths and lets git go on
 normalising line endings everywhere else. The trade is that these lines *can*
-go stale, so run `sync` after every change to `.git-xcrypt`. `sync --global`
-goes back to the single line. `sync --check` exits 1 on a section that matches
+go stale, so run `sync` after every change to `.git-xcrypt` — and if you forget,
+the filter says so on `stderr` the next time it encrypts something, without
+refusing the operation. `sync --global` goes back to the single line. `sync --check` exits 1 on a section that matches
 no shape this build writes, which makes it usable as a CI gate.
 
 ### On a second machine

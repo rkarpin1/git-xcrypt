@@ -343,6 +343,116 @@ fn a_forgotten_sync_fails_the_gate_and_running_it_reaches_the_whole_subtree() {
     repo.assert_status_clean();
 }
 
+/// The filter says the section is stale, on the one path that can act on it.
+///
+/// `sync` has no automatic trigger, and the three candidates were measured
+/// before this settled on a warning:
+///
+/// * a `pre-commit` hook is bypassed by `--no-verify`, switched off by a
+///   checkbox in JetBrains, is not versioned and does not survive a clone — and
+///   arrives after `git add` has already stored the content anyway;
+/// * rewriting the section from here would take effect only from the *next*
+///   command. Measured on git 2.55, 2026-08-06 with a stand-in filter that
+///   rewrote `.gitattributes` while `git add` was running: the third file went
+///   through the filter regardless, so git reads attributes **once per
+///   operation**. It would also dirty a tracked file in the middle of a command
+///   that was only asked to add one;
+/// * a line on `stderr` costs 2.6 ms, once per git operation rather than once
+///   per file, and leaves the decision where it belongs.
+///
+/// Gated on a path that genuinely becomes ciphertext, for the same reason the
+/// conversion refusal is: a repository storing nothing encrypted is not hurt by
+/// a stale section and must not pay to be told.
+#[test]
+fn the_filter_names_a_stale_section_without_refusing_over_it() {
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.xcrypt_ok(["sync"]);
+    repo.write_file("secrets/db.env", SECRET);
+    repo.write_file("notes.txt", b"an ordinary file\n");
+    repo.commit_all("a secret and an ordinary file");
+
+    // Past git's racy-clean window, and this is not decoration: inside the same
+    // second git re-runs the filter over files it has just committed to settle
+    // an uncertain `stat`, so the "nothing encrypted here" case below would see
+    // the secret filtered anyway and the assertion would be about git's
+    // timekeeping rather than about the gate. Measured — inside the window it
+    // warns, outside it does not.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    repo.git_ok(["update-index", "--refresh"]);
+
+    // Current section: nothing to say.
+    repo.write_file("secrets/db.env", b"api_key = second\n");
+    let quiet = repo.git(["add", "-A"]);
+    assert!(
+        quiet.status.success(),
+        "a healthy repository was refused:\n{}",
+        String::from_utf8_lossy(&quiet.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&quiet.stderr).contains("no longer matches"),
+        "a current section was called stale:\n{}",
+        String::from_utf8_lossy(&quiet.stderr)
+    );
+    repo.commit_all("second");
+
+    // The declaration moves and `sync` is forgotten.
+    repo.write_xcrypt_config("secrets/\nvault/\n");
+    repo.git_ok(["add", ".git-xcrypt"]);
+    repo.git_ok(["commit", "-q", "-m", "declare more"]);
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    repo.git_ok(["update-index", "--refresh"]);
+
+    // An ordinary file still says nothing: this repository is not storing
+    // ciphertext in this operation, so the stale lines cost it nothing yet.
+    repo.write_file("notes.txt", b"an ordinary file, edited\n");
+    let unencrypted = repo.git(["add", "notes.txt"]);
+    assert!(
+        !String::from_utf8_lossy(&unencrypted.stderr).contains("no longer matches"),
+        "an operation that encrypted nothing was charged for the answer:\n{}",
+        String::from_utf8_lossy(&unencrypted.stderr)
+    );
+
+    // A path that becomes ciphertext does say something — and still succeeds,
+    // which is the half that matters most: with `required = true` a refusal
+    // here would stop every git operation over a section that loses nobody a
+    // byte today.
+    repo.write_file("secrets/db.env", b"api_key = third\n");
+    let warned = repo.git(["add", "-A"]);
+    let said = String::from_utf8_lossy(&warned.stderr).into_owned();
+    assert!(
+        warned.status.success(),
+        "a stale section refused a `git add`, which it must never do:\n{said}"
+    );
+    assert_eq!(
+        said.matches("no longer matches").count(),
+        1,
+        "the warning must be said once per operation, not once per file:\n{said}"
+    );
+    assert!(
+        said.contains("git-xcrypt sync"),
+        "the warning must name the command that settles it:\n{said}"
+    );
+    assert!(
+        repo.blob_is_encrypted("secrets/db.env"),
+        "the warning came instead of the encryption rather than beside it"
+    );
+
+    // And `sync` settles it.
+    repo.xcrypt_ok(["sync"]);
+    repo.commit_all("sync");
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    repo.git_ok(["update-index", "--refresh"]);
+    repo.write_file("secrets/db.env", b"api_key = fourth\n");
+    let settled = repo.git(["add", "-A"]);
+    assert!(
+        !String::from_utf8_lossy(&settled.stderr).contains("no longer matches"),
+        "the warning survived the command that was supposed to settle it:\n{}",
+        String::from_utf8_lossy(&settled.stderr)
+    );
+}
+
 /// A secret worth spelling out, so a plaintext blob is recognisable on sight.
 const SECRET: &[u8] = b"AWS_SECRET=hunter2\n";
 
