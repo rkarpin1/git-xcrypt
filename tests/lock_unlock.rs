@@ -520,6 +520,80 @@ fn the_sweep_takes_residue_and_leaves_the_users_tracked_file_alone() {
     repo.assert_status_clean();
 }
 
+/// The false-refusal side of the worktree gate, on the shape that provoked it.
+///
+/// A bare store whose only checkout is a linked worktree is how a hosting-style
+/// layout looks locally, and git spells booleans four ways: `1`, `yes` and `on`
+/// are `true` to it. Measured on git 2.55 before the fix: with `core.bare = 1`
+/// the main-checkout probe read the store as *not* bare, went looking for a
+/// main checkout that does not exist, and `lock` refused with exit 2 over "the
+/// main checkout, whose location this build could not determine" — while the
+/// identical repository spelled `core.bare = true` locked at 0. A refusal is
+/// this command's safe direction, but a refusal over a checkout that cannot
+/// exist is an outage with no way out.
+#[test]
+fn a_bare_stores_sole_worktree_locks_whatever_spelling_bare_uses() {
+    let store = TestRepo::init_with(&["--bare"]);
+    store.git_ok(["config", "core.bare", "1"]);
+
+    let elsewhere = TempDir::new().expect("could not create a temporary directory");
+    let work = elsewhere.path().join("work");
+    store.git_ok(["worktree", "add", "-q", &work.to_string_lossy()]);
+
+    let xcrypt = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_git-xcrypt"))
+            .current_dir(&work)
+            .args(args)
+            .output()
+            .expect("could not run git-xcrypt")
+    };
+    let ok = |args: &[&str]| {
+        let output = xcrypt(args);
+        assert!(
+            output.status.success(),
+            "`git-xcrypt {}` failed with {:?}:\n{}",
+            args.join(" "),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    ok(&["init"]);
+    fs::write(work.join(".git-xcrypt"), b"secrets/\n").expect("declaring");
+    ok(&["sync"]);
+    fs::create_dir_all(work.join("secrets")).expect("the secrets directory");
+    fs::write(work.join("secrets/db.env"), PASSWORD).expect("the secret");
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .current_dir(&work)
+            .args(args)
+            .output()
+            .expect("could not run git");
+        assert!(
+            output.status.success(),
+            "`git {}` failed:\n{}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "a secret in the only checkout"]);
+
+    // The assertion: `core.bare = 1` is bare to git, so there is no main
+    // checkout to refuse over and the lock must go through.
+    ok(&["lock", "--yes"]);
+    assert!(
+        fs::read(work.join("secrets/db.env"))
+            .expect("reading")
+            .starts_with(MAGIC),
+        "lock reported success and left the secret in the clear"
+    );
+    assert!(
+        !store.path().join("git-xcrypt/keys/default").exists(),
+        "lock reported success and kept the key"
+    );
+}
+
 /// Reads `stream` until `marker` shows up, and returns everything read.
 ///
 /// The prompt carries no newline, so a line-oriented read would block on it
