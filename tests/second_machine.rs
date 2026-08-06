@@ -91,12 +91,12 @@ fn a_clone_becomes_a_working_second_machine_and_its_edits_come_home() {
     // a password manager or an email is exactly where a paste picks up stray
     // characters, and a key file is user input: the convention is a named
     // refusal, never a panic. Measured before the fix: this header's sixteen
-    // bytes are six characters, a slice landed inside one, and `import-key`
+    // bytes are six characters, a slice landed inside one, and reading it
     // aborted with `byte index 2 is not a char boundary` — exit 101, no file
     // named. The exit code is the assertion: a panic cannot say `4`.
     let mangled = courier.path().join("mangled.key");
     fs::write(&mangled, "git-xcrypt-key-v1 a€€€€€\nAAAA\n").expect("writing");
-    let refused = second.xcrypt(["import-key", &mangled.to_string_lossy()]);
+    let refused = second.xcrypt(["unlock", "--key-only", &mangled.to_string_lossy()]);
     assert_eq!(
         refused.status.code(),
         Some(4),
@@ -142,16 +142,16 @@ fn a_clone_becomes_a_working_second_machine_and_its_edits_come_home() {
     );
     second.assert_status_clean();
 
-    // `import-key` must refuse the same evidence the same way. It used to look
-    // only for a key already in place — a fresh clone has none, so the wrong
-    // key installed cleanly, and from then on every honest answer pointed
-    // around the mistake: `unlock` refused over the first file, and importing
-    // the *right* key hit the different-key refusal, whose "replacing it would
-    // make every file unreadable" warning is false when the key in place has
-    // encrypted nothing. The way out was a by-hand deletion the user had no
-    // reason to understand. Refusing here is what keeps that state from ever
-    // forming.
-    let imported = second.xcrypt(["import-key", &wrong_key.to_string_lossy()]);
+    // `--key-only` must refuse the same evidence the same way, and this is the
+    // half that used to be a separate command. It looked only for a key already
+    // in place — a fresh clone has none, so the wrong key installed cleanly, and
+    // from then on every honest answer pointed around the mistake: `unlock`
+    // refused over the first file, and offering the *right* key hit the
+    // different-key refusal, whose "replacing it would make every file
+    // unreadable" warning is false when the key in place has encrypted nothing.
+    // The way out was a by-hand deletion the user had no reason to understand.
+    // Refusing here is what keeps that state from ever forming.
+    let imported = second.xcrypt(["unlock", "--key-only", &wrong_key.to_string_lossy()]);
     let complaint = String::from_utf8_lossy(&imported.stderr).into_owned();
     assert_eq!(
         imported.status.code(),
@@ -166,9 +166,20 @@ fn a_clone_becomes_a_working_second_machine_and_its_edits_come_home() {
         !second.path().join(".git/git-xcrypt/keys/default").exists(),
         "a refused import installed the wrong key anyway"
     );
-    // And the right key still imports: the evidence agrees with it, so the
-    // refusal above cannot be one shape too wide.
-    second.xcrypt_ok(["import-key", &key_file.to_string_lossy()]);
+    // And the right key still goes in: the evidence agrees with it, so the
+    // refusal above cannot be one shape too wide. `--key-only` really does
+    // leave the tree alone, which is the whole reason the flag exists.
+    let before = second.worktree_bytes("secrets/db.env");
+    second.xcrypt_ok(["unlock", "--key-only", &key_file.to_string_lossy()]);
+    assert_eq!(
+        second.worktree_bytes("secrets/db.env"),
+        before,
+        "`--key-only` decrypted the working tree anyway"
+    );
+    assert!(
+        second.path().join(".git/git-xcrypt/keys/default").is_file(),
+        "`--key-only` did not put the key in place"
+    );
 
     second.xcrypt_ok(["unlock", &key_file.to_string_lossy()]);
 

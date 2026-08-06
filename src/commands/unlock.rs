@@ -71,7 +71,15 @@ pub struct Report {
     pub warnings: Vec<String>,
 }
 
-/// Unlocks `repo`, optionally importing the key at `key_source` first.
+/// Unlocks `repo`, optionally installing the key at `key_source` first.
+///
+/// With `key_only` the working tree is left exactly as it is: the key goes in,
+/// the filter and the managed section are repaired, and nothing is decrypted.
+/// That was a command of its own until 2026-08-06 — `import-key` — and it is a
+/// flag now because the two differed by this one step and by nothing else,
+/// while `unlock <key-file>` was already the path every message pointed at.
+/// The evidence check still runs, so a key the working tree's own headers
+/// contradict is refused here exactly as it is on the full path.
 ///
 /// # Errors
 ///
@@ -82,13 +90,13 @@ pub struct Report {
 /// from the repository's own key file and not from anything a header said.
 /// [`Error::Format`] when a file in the working tree belongs to another key.
 /// [`Error::Io`] on a read or write failure.
-pub fn run(repo: &Repo, key_source: Option<&Path>) -> Result<Report> {
+pub fn run(repo: &Repo, key_source: Option<&Path>, key_only: bool) -> Result<Report> {
     let key = match key_source {
         Some(path) => {
             let key = keyfile::read_portable(path)?;
             // Asked before anything is written: a refusal that has already
             // installed a key has not refused.
-            super::import_key::refuse_on_conflict(repo, &key)?;
+            refuse_on_conflict(repo, &key)?;
             key
         }
         None => repo.load_key()?,
@@ -109,7 +117,7 @@ pub fn run(repo: &Repo, key_source: Option<&Path>) -> Result<Report> {
     let encrypted = collect_encrypted(repo, &mut walk)?;
     refuse_foreign_keys(repo, &encrypted, &key_id)?;
 
-    let key_imported = super::import_key::install(repo, &key)?;
+    let key_imported = install(repo, &key)?;
     // Both before the decryption, never after — see the module comment. The
     // attributes section matters as much as the registration: a driver with no
     // `* filter=git-xcrypt` above it is never invoked, so git would store the
@@ -158,6 +166,16 @@ pub fn run(repo: &Repo, key_source: Option<&Path>) -> Result<Report> {
             crate::format_key_id(&key_id)
         ));
     }
+    if key_only {
+        // Everything above is "put this repository in a state where git filters
+        // it"; everything below is "and now write the plain text out". Stopping
+        // here is the whole difference, and it is deliberately *after* the
+        // evidence check and both repairs: a key handed to a repository whose
+        // filter is not registered is not a safe place to leave anyone, whether
+        // or not the tree was decrypted on the way.
+        return Ok(report);
+    }
+
     // The same paths, spelled the way the index stores them.
     let mut rewritten: Vec<Vec<u8>> = Vec::new();
 
@@ -277,6 +295,54 @@ pub fn run(repo: &Repo, key_source: Option<&Path>) -> Result<Report> {
     Ok(report)
 }
 
+/// Refuses when the repository already holds a key that is not this one.
+///
+/// Separate from [`install`] because this question has to be asked before
+/// anything at all is written: a refusal that has already installed a key has
+/// not refused.
+///
+/// # Errors
+///
+/// [`Error::Config`] for a different key, [`Error::Format`] when the key file
+/// already in the repository cannot be read.
+fn refuse_on_conflict(repo: &Repo, key: &crate::key::MasterKey) -> Result<()> {
+    match repo.load_key() {
+        Ok(existing) if existing.key_id() == key.key_id() => Ok(()),
+        Ok(existing) => Err(Error::Config(format!(
+            "this repository already holds key {}, and that file offers key {}.\n\
+             Replacing it would make every file encrypted so far impossible to read, for good.\n\
+             If you really mean to change keys, remove {} deliberately first.",
+            crate::format_key_id(&existing.key_id()),
+            crate::format_key_id(&key.key_id()),
+            repo.key_path().display()
+        ))),
+        Err(Error::NoKey) => Ok(()),
+        // A key file we cannot parse is not evidence of absence. Naming it is
+        // the whole repair the user needs.
+        Err(Error::Format(message)) => Err(Error::Format(format!(
+            "{}: {message}",
+            repo.key_path().display()
+        ))),
+        Err(other) => Err(other),
+    }
+}
+
+/// Writes `key` into the repository, reporting whether it had to.
+///
+/// Only correct after [`refuse_on_conflict`] has passed: on its own it would
+/// treat a *different* key already in place as "nothing to do".
+///
+/// # Errors
+///
+/// [`Error::Io`] when the key file cannot be written.
+fn install(repo: &Repo, key: &crate::key::MasterKey) -> Result<bool> {
+    if repo.has_key() {
+        return Ok(false);
+    }
+    keyfile::write(&repo.key_path(), key)?;
+    Ok(true)
+}
+
 /// Puts a path and the operation in front of a bare I/O failure.
 ///
 /// `Permission denied (os error 13)` names neither the file nor what was being
@@ -315,11 +381,6 @@ fn interrupted(report: &Report, encrypted: &[Encrypted], err: Error) -> Error {
 }
 
 /// A working-tree file that carries our magic, and the header it carries.
-///
-/// `pub(super)` because `import-key` runs the same evidence pass before it
-/// installs anything: the headers name the key they want, and a key they
-/// contradict must be refused *before* it is on disk — see
-/// [`super::import_key`].
 #[derive(Debug)]
 pub(super) struct Encrypted {
     path: PathBuf,

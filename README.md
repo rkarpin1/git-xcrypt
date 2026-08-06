@@ -113,8 +113,7 @@ Those are speed bumps in front of the cliff. They are not a backup.
 | `sync` | Regenerate the per-pattern `.gitattributes` lines. `--check` reports staleness through exit code 1 instead of writing. |
 | `status` | Report whether your declarations are actually enforced, scanning the whole reachable history. `--fix` re-stages declared files the index holds in the clear. Exits `2` when the setup does not enforce anything, `5` on a finding, `6` when it could not tell. |
 | `export-key` | Write the repository key to a file outside the working tree. This is also how you make the backup nothing else makes — see above. |
-| `import-key` | Put a key carried from another machine into this repository. |
-| `unlock` | Decrypt the working tree and register the filter, importing a key file first if one is given. |
+| `unlock` | Decrypt the working tree and register the filter, installing a key file first if one is given. `--key-only` puts the key in place and repairs the setup without decrypting anything. |
 | `lock` | Encrypt the working tree and delete the key. Interactive by default; `--yes` skips the question but not the refusal on uncommitted changes. |
 | `diff`, `process` | Registered by `init` for git to call. Not meant to be run by hand. |
 

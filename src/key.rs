@@ -68,7 +68,7 @@ impl MasterKey {
     /// The fingerprint stored in every encrypted file's header.
     ///
     /// Identifies the *key*, not the suite, so it survives a future change of
-    /// cipher and keeps `unlock`, `export-key` and `import-key` working across
+    /// cipher and keeps `unlock` and `export-key` working across
     /// one.
     ///
     /// # Panics

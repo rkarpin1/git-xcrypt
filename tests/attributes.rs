@@ -1361,8 +1361,7 @@ fn a_name_with_a_space_is_declared_in_quotes_and_lives_the_whole_cycle() {
          deleted the key"
     );
 
-    repo.xcrypt_ok(["import-key", &key_file.to_string_lossy()]);
-    repo.xcrypt_ok(["unlock"]);
+    repo.xcrypt_ok(["unlock", &key_file.to_string_lossy()]);
     repo.assert_worktree_eq("my secrets/db.env", SPACED);
     repo.assert_worktree_eq("my secrets/deploy.sh", LF);
     repo.assert_worktree_eq("app/my secrets/nested.env", SPACED);
@@ -1488,7 +1487,7 @@ fn repository_with_one_intact_secret() -> (TestRepo, Vec<u8>, Vec<u8>) {
          ERERERERERERERERERERERERERERERERERERERERERE=\n",
     )
     .expect("could not write the fixed key");
-    repo.xcrypt_ok(["import-key", &key_file.to_string_lossy()]);
+    repo.xcrypt_ok(["unlock", "--key-only", &key_file.to_string_lossy()]);
     repo.init_xcrypt();
     repo.write_xcrypt_config("secrets/\n");
     repo.xcrypt_ok(["sync"]);

@@ -48,23 +48,21 @@ enum Command {
         force: bool,
     },
 
-    /// Put a key carried from another machine into this repository.
-    ///
-    /// Refuses when the repository already holds a different key; importing the
-    /// same one again does nothing.
-    ImportKey {
-        /// A file written by `export-key`.
-        path: PathBuf,
-    },
-
     /// Decrypt this repository's working tree, and register the filter.
     ///
-    /// With a key file it imports the key first, which is what a fresh clone
+    /// With a key file it installs the key first, which is what a fresh clone
     /// needs. Without one it uses the key already here. Safe to run twice: a
     /// file that is already in the clear is left alone.
     Unlock {
         /// A file written by `export-key`. Omit to use the key already here.
         key: Option<PathBuf>,
+
+        /// Put the key in place and repair the setup, but decrypt nothing.
+        ///
+        /// The working tree is left exactly as it is. A key the files here
+        /// contradict is still refused.
+        #[arg(long)]
+        key_only: bool,
     },
 
     /// Encrypt this repository's working tree and delete its key.
@@ -153,8 +151,7 @@ fn main() -> ExitCode {
         Command::Init => report(run_init()),
         Command::Sync { check } => run_sync(check),
         Command::ExportKey { path, force } => report(run_export_key(&path, force)),
-        Command::ImportKey { path } => report(run_import_key(&path)),
-        Command::Unlock { key } => report(run_unlock(key.as_deref())),
+        Command::Unlock { key, key_only } => report(run_unlock(key.as_deref(), key_only)),
         Command::Lock { yes } => run_lock(yes),
         Command::Status { fix } => run_status(fix),
         Command::Process => report(commands::process::run()),
@@ -252,41 +249,13 @@ fn run_export_key(path: &std::path::Path, force: bool) -> Result<()> {
     Ok(())
 }
 
-/// Runs `import-key`, saying which key is now in place — never what it is.
-fn run_import_key(path: &std::path::Path) -> Result<()> {
-    let repo = Repo::discover_from_cwd()?;
-    let report = commands::import_key::run(&repo, path)?;
-
-    let key_id = git_xcrypt::format_key_id(&report.key_id);
-    // First, so "skipped" is read before the conclusion it qualifies: a file
-    // the evidence walk could not read might still name another key.
-    for warning in &report.warnings {
-        eprintln!("git-xcrypt: {warning}");
-    }
-    if report.imported {
-        eprintln!("git-xcrypt: imported key {key_id}");
-    } else {
-        eprintln!("git-xcrypt: key {key_id} was already here; nothing to import");
-    }
-    if report.config_written {
-        eprintln!(
-            "git-xcrypt: registered the filter in {}",
-            repo.config_path().display()
-        );
-    }
-    if report.attributes_written {
-        eprintln!("git-xcrypt: updated {}", repo.attributes_path().display());
-    }
-    Ok(())
-}
-
 /// Runs `unlock` and reports what changed.
 ///
 /// The file list goes to `stderr` like everything else. It names paths, which
 /// are not secret — the contents never appear.
-fn run_unlock(key: Option<&std::path::Path>) -> Result<()> {
+fn run_unlock(key: Option<&std::path::Path>, key_only: bool) -> Result<()> {
     let repo = Repo::discover_from_cwd()?;
-    let report = commands::unlock::run(&repo, key)?;
+    let report = commands::unlock::run(&repo, key, key_only)?;
 
     let key_id = git_xcrypt::format_key_id(&report.key_id);
     if report.key_imported {
@@ -317,7 +286,15 @@ fn run_unlock(key: Option<&std::path::Path>) -> Result<()> {
         0 => String::new(),
         count => format!(", {count} could not be read and may still be encrypted"),
     };
-    if report.decrypted.is_empty() {
+    if key_only {
+        // Never "unlocked": the working tree is untouched, and saying otherwise
+        // over a directory still full of ciphertext is the one sentence a user
+        // would act on wrongly.
+        eprintln!(
+            "git-xcrypt: key {key_id} is in place and this repository filters; \
+             nothing was decrypted. `git-xcrypt unlock` opens the working tree."
+        );
+    } else if report.decrypted.is_empty() {
         eprintln!("git-xcrypt: unlocked with key {key_id}; nothing was encrypted{unreadable}");
     } else {
         eprintln!(

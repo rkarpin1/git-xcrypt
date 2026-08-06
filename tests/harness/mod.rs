@@ -476,7 +476,7 @@ impl TestRepo {
     /// in place before `init` looks for one, or `init` mints a second one and
     /// every `key_id` in the headers stops matching.
     pub fn init_xcrypt_with(&self, key: &SharedKey) {
-        self.xcrypt_ok(["import-key", &key.as_arg()]);
+        self.xcrypt_ok(["unlock", "--key-only", &key.as_arg()]);
         self.init_xcrypt();
     }
 

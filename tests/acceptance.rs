@@ -249,7 +249,7 @@ fn a_clone_without_the_key_reports_it_readably_rather_than_panicking() {
         "the message must at least name what is missing:\n{stderr}"
     );
     assert!(
-        stderr.contains("unlock") || stderr.contains("import-key") || stderr.contains("export-key"),
+        stderr.contains("unlock") || stderr.contains("export-key"),
         "the message must point at the command that fixes it, or it is a \
          diagnosis with no cure:\n{stderr}"
     );

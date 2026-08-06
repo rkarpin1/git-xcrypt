@@ -498,7 +498,6 @@ impl fmt::Display for Report {
                     writeln!(f, "    git-xcrypt init      # the key here is kept")?;
                 } else {
                     writeln!(f, "    git-xcrypt unlock <key-file>")?;
-                    writeln!(f, "    git-xcrypt import-key <key-file>")?;
                 }
             } else if self.only_the_bootstrap_is_untracked() {
                 // Neither `init` nor `unlock` commits anything, so offering

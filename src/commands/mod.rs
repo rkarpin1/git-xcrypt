@@ -6,7 +6,6 @@
 
 pub mod diff;
 pub mod export_key;
-pub mod import_key;
 pub mod init;
 pub mod lock;
 pub mod process;

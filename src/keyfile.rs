@@ -6,7 +6,7 @@
 //! * the binary file in `.git/git-xcrypt/keys/`, which the tool reads on every
 //!   filter run and no human ever looks at;
 //! * the portable text file [`encode_portable`] produces, which is what
-//!   `export-key` writes and `import-key` and `unlock` read. It is text so it
+//!   `export-key` writes and `unlock` reads. It is text so it
 //!   survives a password manager, an email body and a copy-paste, and it names
 //!   its `key_id` in the clear so a user can tell two exports apart without
 //!   decrypting anything.
@@ -277,7 +277,7 @@ fn parse_export_header(header: &str) -> Result<[u8; KEY_ID_LEN]> {
 fn parse_key_id(text: &str) -> Result<[u8; KEY_ID_LEN]> {
     // Refused before the slicing below, not only for the message: the length
     // gate counts bytes, and `&text[0..2]` on a header holding multi-byte
-    // characters lands inside one and panics — measured, `import-key` on a
+    // characters lands inside one and panics — measured, reading a key file on a
     // file whose header read `git-xcrypt-key-v1 a\u{20ac}\u{20ac}\u{20ac}\u{20ac}\u{20ac}` (sixteen bytes,
     // six characters) aborted with `byte index 2 is not a char boundary`
     // instead of naming the file. A key file is user input, and the convention

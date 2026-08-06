@@ -136,7 +136,7 @@ fn refuse_if_previously_configured(repo: &Repo) -> Result<()> {
          Generating a new one would make every file encrypted so far impossible to \
          read, for good.\n\
          If this is a clone, run `git-xcrypt unlock <key-file>`.\n\
-         If you have the key elsewhere, run `git-xcrypt import-key <key-file>`.\n\
+         To put the key in place without decrypting anything, add `--key-only`.\n\
          If this repository never used git-xcrypt and you wrote {} by hand, delete it \
          and run `init` again.\n\
          (found: {})",
@@ -172,7 +172,7 @@ fn refuse_if_previously_configured(repo: &Repo) -> Result<()> {
 /// and only a local `false` overrides it. The key is namespaced under our own
 /// driver name, so nothing a user configured for anything else is touched.
 ///
-/// Shared with `import-key` and `unlock` rather than copied: a clone has the
+/// Shared with `unlock` rather than copied: a clone has the
 /// catch-all line in `.gitattributes` and no driver behind it, and every command
 /// that puts a key into such a repository has to close that gap the same way.
 ///
@@ -220,7 +220,7 @@ pub(crate) fn register_driver(repo: &Repo) -> Result<bool> {
 /// into `fatal: smudge filter git-xcrypt failed`, and `git log -p` over any
 /// declared path stops working entirely. Without the driver git falls back to
 /// `Binary files differ`, which is the honest answer for a repository nobody can
-/// read. `unlock` and `import-key` put it back, through
+/// read. `unlock` puts it back, through
 /// [`register_driver`].
 ///
 /// For `lock`, which is the one command after which the user has no key left to

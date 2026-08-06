@@ -131,9 +131,10 @@ fn the_key_survives_every_route_out_of_the_repository_that_ordinary_work_takes()
 
     // And the same key wearing the annotation it picks up on the way through a
     // password manager or an email body: a comment line, a blank line, an
-    // indent. `import-key` accepts all three, so a refusal that looked at the
-    // first byte instead of the first line answered "not a key file" and
-    // `git-xcrypt diff` printed the master key in base64 with exit code 0.
+    // indent. Every command that reads a key file accepts all three, so a
+    // refusal that looked at the first byte instead of the first line answered
+    // "not a key file" and `git-xcrypt diff` printed the master key in base64
+    // with exit code 0.
     let annotated = format!(
         "# my laptop\n\n  {}\n",
         String::from_utf8(raw.clone())
@@ -148,7 +149,7 @@ fn the_key_survives_every_route_out_of_the_repository_that_ordinary_work_takes()
     let adopter = TestRepo::init();
     let carried = vault.path().join("annotated.key");
     fs::write(&carried, annotated.as_bytes()).expect("writing");
-    adopter.xcrypt_ok(["import-key", &carried.to_string_lossy()]);
+    adopter.xcrypt_ok(["unlock", "--key-only", &carried.to_string_lossy()]);
 
     repo.commit_all("a key nobody meant to commit");
 

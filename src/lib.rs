@@ -67,7 +67,7 @@ pub enum Error {
     Config(String),
 
     /// No repository key is present.
-    #[error("no repository key; run `git-xcrypt init`, `unlock` or `import-key`")]
+    #[error("no repository key; run `git-xcrypt init` or `git-xcrypt unlock <key-file>`")]
     NoKey,
 
     /// The command line asked for something impossible.

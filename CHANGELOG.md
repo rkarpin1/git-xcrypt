@@ -30,8 +30,8 @@ changed anything from.
   line-ending attributes `text`, `-text`, `binary`, `text=auto` and
   `eol=lf|crlf|native`, with the meanings they have in `.gitattributes`. Names
   containing whitespace are closed with quotes, as in `.gitattributes`.
-- **Commands** `init`, `sync`, `status`, `export-key`, `import-key`, `unlock`,
-  `lock`, plus `diff` and `process`, which `init` registers for git to call.
+- **Commands** `init`, `sync`, `status`, `export-key`, `unlock`, `lock`, plus
+  `diff` and `process`, which `init` registers for git to call.
   See the table in `README.md`.
 - **`status` as a CI gate.** It scans the whole reachable history for
   declared paths stored in the clear, resolves git's own `filter` and

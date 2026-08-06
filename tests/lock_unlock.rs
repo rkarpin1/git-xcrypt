@@ -163,8 +163,7 @@ fn a_repository_opened_worked_in_closed_and_opened_again_gives_every_byte_back()
     fs::remove_file(repo.path().join("secrets/forgotten.txt")).expect("could not remove");
 
     // --- The carried copy opens it again, byte for byte. --------------------
-    repo.xcrypt_ok(["import-key", &key_file.to_string_lossy()]);
-    repo.xcrypt_ok(["unlock"]);
+    repo.xcrypt_ok(["unlock", &key_file.to_string_lossy()]);
 
     repo.assert_worktree_eq("secrets/password.txt", PASSWORD);
     repo.assert_worktree_eq("db.env", EDITED);
