@@ -351,18 +351,60 @@ fn create_config_file(repo: &Repo) -> Result<bool> {
 /// Git wants forward slashes in a value it hands to a shell on Windows, but on
 /// Unix a backslash is an ordinary character in a file name — rewriting one
 /// there names a different file, exactly as `repo::git_spelling` says.
+///
+/// # Errors
+///
+/// [`Error::Config`] when this binary's own path is not text — see
+/// [`shell_quoted`].
 fn current_executable() -> Result<String> {
-    Ok(shell_quoted(
+    shell_quoted(
         &std::env::current_exe()?,
         crate::git::repo::NATIVE_SEPARATOR,
-    ))
+    )
 }
 
 /// The platform-independent core, so both spellings are testable from either
 /// platform.
-fn shell_quoted(path: &std::path::Path, separator: char) -> String {
-    let text = crate::git::repo::with_separator(&path.to_string_lossy(), separator);
-    format!("'{}'", text.replace('\'', r"'\''"))
+///
+/// **A path that is not text is refused rather than approximated**, and that is
+/// the second way this function once named a binary that does not exist. The
+/// first was the separator, fixed in `33e30c2` and pinned by the test below; the
+/// decode beside it stayed lossy until 2026-08-06. On Unix a path is an
+/// arbitrary byte string, so a binary installed under `/opt/wersja-\xb3/` — a
+/// perfectly legal ext4 directory — came through `to_string_lossy` as
+/// `/opt/wersja-\u{fffd}/`, and *that* is what `init` wrote into
+/// `filter.git-xcrypt.process`. The outcome is the one the separator bug had:
+/// `init` reports success, and because it also sets `required = true`, every
+/// later `git add`, `git checkout` and `git status` in the repository aborts
+/// with `fatal: cannot run …` and nothing points at the config value. A second
+/// `init` cannot repair it either — [`register_driver`] compares the same lossy
+/// string, finds it equal to what is stored and reports nothing to do.
+///
+/// Refusing is the whole fix, deliberately, rather than carrying bytes through
+/// `.git/config`: the value has to survive being handed to a shell by git, the
+/// configuration layer here is `&str` end to end, and widening it for this would
+/// touch the one write that decides whether git filters at all. A named refusal
+/// at `init` costs a user with such an install path a move of the binary; the
+/// silent version cost them every git command in the repository, with no way to
+/// see why.
+///
+/// # Errors
+///
+/// [`Error::Config`] when `path` is not valid UTF-8.
+fn shell_quoted(path: &std::path::Path, separator: char) -> Result<String> {
+    let text = path.to_str().ok_or_else(|| {
+        Error::Config(format!(
+            "{}: this binary's own path is not valid UTF-8, so it cannot be \
+             written into .git/config as a command git could run. Approximating \
+             it would register a path that does not exist, and with \
+             `filter.{DRIVER}.required` set every later git operation in this \
+             repository would abort. Move or reinstall git-xcrypt somewhere \
+             whose name is text, then run this again.",
+            path.display()
+        ))
+    })?;
+    let text = crate::git::repo::with_separator(text, separator);
+    Ok(format!("'{}'", text.replace('\'', r"'\''")))
 }
 
 #[cfg(test)]
@@ -399,22 +441,24 @@ mod tests {
     fn the_registered_command_rewrites_a_separator_and_never_a_file_name() {
         use std::path::Path;
 
+        let quoted = |path: &Path, separator| shell_quoted(path, separator).expect("a text path");
+
         // Windows: the separator is a separator, and git gets slashes.
         assert_eq!(
-            shell_quoted(Path::new(r"C:\Program Files\xc\git-xcrypt.exe"), '\\'),
+            quoted(Path::new(r"C:\Program Files\xc\git-xcrypt.exe"), '\\'),
             "'C:/Program Files/xc/git-xcrypt.exe'"
         );
 
         // Unix: a backslash is part of the name and must survive untouched.
         assert_eq!(
-            shell_quoted(Path::new(r"/opt/a\b/git-xcrypt"), '/'),
+            quoted(Path::new(r"/opt/a\b/git-xcrypt"), '/'),
             r"'/opt/a\b/git-xcrypt'",
             "the registered command named a binary that does not exist"
         );
 
         // A quote is still closed, escaped and reopened, on both.
         assert_eq!(
-            shell_quoted(Path::new("/opt/it's/git-xcrypt"), '/'),
+            quoted(Path::new("/opt/it's/git-xcrypt"), '/'),
             r"'/opt/it'\''s/git-xcrypt'"
         );
 
@@ -422,6 +466,49 @@ mod tests {
         // writes has to name the binary that is running.
         let registered = current_executable().expect("the running binary has a path");
         assert!(registered.starts_with('\'') && registered.ends_with('\''));
+    }
+
+    /// The other way this function named a binary that does not exist.
+    ///
+    /// The separator above was one; a lossy decode is the other, and it stayed
+    /// until 2026-08-06. A path that is not text must be **refused**, because
+    /// `to_string_lossy` turns it into a path that exists nowhere, `init`
+    /// reports success over it, and `required = true` then aborts every git
+    /// operation in the repository with nothing pointing at the cause.
+    ///
+    /// Built in memory rather than on disk, which is what lets this run
+    /// anywhere: APFS rejects a non-UTF-8 name at `open` and a Windows name is
+    /// UTF-16, so neither platform can *create* the case — but both can be asked
+    /// what this function does with it. The Windows arm uses an unpaired
+    /// surrogate, which is the only shape a `PathBuf` there can hold that
+    /// `to_str` refuses.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_path_that_is_not_text_is_refused_rather_than_approximated() {
+        #[cfg(unix)]
+        let not_text = {
+            use std::os::unix::ffi::OsStrExt as _;
+            std::ffi::OsStr::from_bytes(b"/opt/wersja-\xb3/git-xcrypt").to_os_string()
+        };
+        #[cfg(windows)]
+        let not_text = {
+            use std::os::windows::ffi::OsStringExt as _;
+            std::ffi::OsString::from_wide(&[0x43, 0x3a, 0x5c, 0xd800, 0x5c, 0x78, 0x63])
+        };
+
+        let path = std::path::PathBuf::from(&not_text);
+        assert!(
+            path.to_str().is_none(),
+            "the fixture decodes cleanly, so this test asks nothing"
+        );
+
+        let error = shell_quoted(&path, crate::git::repo::NATIVE_SEPARATOR)
+            .expect_err("a path that is not text must not be approximated");
+        assert_eq!(error.exit_code(), crate::util::exit::CONFIG);
+        assert!(
+            error.to_string().contains("not valid UTF-8"),
+            "the refusal must name what is wrong with the path: {error}"
+        );
     }
 
     #[test]
