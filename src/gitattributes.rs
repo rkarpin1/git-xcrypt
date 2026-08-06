@@ -69,12 +69,12 @@ pub const CATCH_ALL: &str = "* filter=git-xcrypt";
 /// Within each group the order is the input's, so the section is a pure function
 /// of the configuration and two runs produce the same file.
 #[must_use]
-pub fn render_lines(config: &Config) -> Vec<String> {
+pub fn render_lines(config: &Config, fold: bool) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
     let mut suppressed: Vec<String> = Vec::new();
 
     for pattern in config.patterns() {
-        for spelling in translate(pattern.source) {
+        for spelling in translate(pattern.source, fold) {
             if pattern.negated {
                 lines.push(format!("{spelling} !text !diff"));
             } else {
@@ -103,7 +103,7 @@ pub fn render_lines(config: &Config) -> Vec<String> {
             .into_iter()
             .map(|pattern| format!("{pattern} -diff")),
     );
-    deduplicated.extend(bootstrap_exclusions(config));
+    deduplicated.extend(bootstrap_exclusions(config, fold));
     deduplicated
 }
 
@@ -137,7 +137,7 @@ pub fn render_lines(config: &Config) -> Vec<String> {
 /// pure function of the configuration on purpose — and emitting the exclusion
 /// unconditionally would rewrite every generated file to cover a state with no
 /// measured cost.
-fn bootstrap_exclusions(config: &Config) -> Vec<String> {
+fn bootstrap_exclusions(config: &Config, fold: bool) -> Vec<String> {
     let mut lines = Vec::new();
 
     // `.gitattributes` is excluded by basename at any depth, the other two only
@@ -145,13 +145,16 @@ fn bootstrap_exclusions(config: &Config) -> Vec<String> {
     let reached = |path: &str| config.decide_ignoring_exclusions(path.as_bytes()).encrypt;
 
     if reached(ATTRIBUTES_FILE) || reached(&format!("sub/{ATTRIBUTES_FILE}")) {
-        lines.push(format!("**/{} !text !diff", fold_case(ATTRIBUTES_FILE)));
+        lines.push(format!("**/{} !text !diff", folded(ATTRIBUTES_FILE, fold)));
     }
     if reached(CONFIG_FILE) {
-        lines.push(format!("/{} !text !diff", fold_case(CONFIG_FILE)));
+        lines.push(format!("/{} !text !diff", folded(CONFIG_FILE, fold)));
     }
     if reached(&format!("{KEY_ENVELOPE_DIR}/recipient")) {
-        lines.push(format!("/{}/** !text !diff", fold_case(KEY_ENVELOPE_DIR)));
+        lines.push(format!(
+            "/{}/** !text !diff",
+            folded(KEY_ENVELOPE_DIR, fold)
+        ));
     }
     lines
 }
@@ -189,7 +192,7 @@ fn bootstrap_exclusions(config: &Config) -> Vec<String> {
 /// ignored in git attributes`). Both are given a leading `**/` or `/` by
 /// [`guard`] instead, which means exactly what the unprefixed spelling meant in
 /// a root `.gitattributes`.
-fn translate(pattern: &str) -> Vec<String> {
+fn translate(pattern: &str, fold: bool) -> Vec<String> {
     let directory_only = pattern.ends_with('/');
     let core = pattern.strip_suffix('/').unwrap_or(pattern);
     if core.trim_matches('/').is_empty() {
@@ -202,16 +205,19 @@ fn translate(pattern: &str) -> Vec<String> {
 
     let mut spellings = Vec::with_capacity(2);
     if !directory_only {
-        spellings.push(spell(&fold_case(&guard(core.to_string(), anchored))));
+        spellings.push(spell(&folded(&guard(core.to_string(), anchored), fold)));
     }
-    spellings.push(spell(&fold_case(&guard(
-        if anchored {
-            format!("{core}/**")
-        } else {
-            format!("**/{core}/**")
-        },
-        anchored,
-    ))));
+    spellings.push(spell(&folded(
+        &guard(
+            if anchored {
+                format!("{core}/**")
+            } else {
+                format!("**/{core}/**")
+            },
+            anchored,
+        ),
+        fold,
+    )));
     spellings
 }
 
@@ -252,6 +258,40 @@ fn translate(pattern: &str) -> Vec<String> {
 /// ordinary characters to git's C-unquoting. It runs *after* [`guard`] for the
 /// opposite reason: `guard` recognises a literal `[attr]` opening, and folding
 /// first would turn it into `[attrATTR]` and hide it.
+/// [`render_lines`] in whichever spelling the file already uses.
+///
+/// For the three commands that repair this section without being asked to
+/// change it — `init`, `unlock`, `lock`. Only `sync` decides the spelling, and
+/// a repair that silently picked the other one would undo that decision:
+/// measured before this existed, an ordinary `unlock` rewrote a section written
+/// by `sync --ignorecase` back to the literal form and left `git status` dirty.
+///
+/// A file that matches neither spelling is out of date either way, and gets the
+/// literal one — the same default `sync` uses when nothing asks otherwise.
+#[must_use]
+pub fn render_lines_as_written(path: &std::path::Path, config: &Config) -> Vec<String> {
+    let folded = render_lines(config, true);
+    if desired(path, &folded).is_ok_and(|(existing, wanted)| existing == wanted) {
+        return folded;
+    }
+    render_lines(config, false)
+}
+
+/// [`fold_case`] when asked, the pattern untouched when not.
+///
+/// The choice belongs to `sync --ignorecase` and is threaded through every
+/// renderer rather than read from anywhere, because four other commands write
+/// this same section and a setting only one of them knew would be undone by the
+/// next one — measured: a hand-written literal section was rewritten folded by
+/// an ordinary `unlock`, leaving `git status` dirty.
+fn folded(pattern: &str, fold: bool) -> String {
+    if fold {
+        fold_case(pattern)
+    } else {
+        pattern.to_string()
+    }
+}
+
 fn fold_case(pattern: &str) -> String {
     let mut out = String::with_capacity(pattern.len() * 4);
     let mut index = 0;
@@ -1510,7 +1550,10 @@ mod tests {
 
     /// Parses a `.git-xcrypt` body and renders the cosmetic lines from it.
     fn lines(config: &str) -> Vec<String> {
-        render_lines(&Config::parse(config).expect("the test configuration must parse"))
+        render_lines(
+            &Config::parse(config).expect("the test configuration must parse"),
+            true,
+        )
     }
 
     #[test]

@@ -1591,8 +1591,23 @@ fn named(name: &[u8], err: crate::Error) -> crate::Error {
 /// so `text=auto` and `core.autocrlf` alone see binary and leave it be — which
 /// is why this stays a note rather than a gap. It is not, however, cosmetic.
 fn stale_section_note(repo: &Repo, declarations: &Config) -> Option<String> {
-    let lines = gitattributes::render_lines(declarations);
-    let (existing, desired) = gitattributes::desired(&repo.attributes_path(), &lines).ok()?;
+    // Either rendering counts as current. `sync --ignorecase` writes the folded
+    // form deliberately, and a note that called it stale would send its user to
+    // run the very command that produced it — a loop with no exit. What this
+    // note is for is a section that matches *neither*, which is what a changed
+    // declaration leaves behind.
+    let path = repo.attributes_path();
+    let matches = |fold: bool| {
+        let lines = gitattributes::render_lines(declarations, fold);
+        gitattributes::desired(&path, &lines)
+            .map(|(existing, desired)| existing == desired)
+            .unwrap_or(false)
+    };
+    if matches(false) || matches(true) {
+        return None;
+    }
+    let lines = gitattributes::render_lines(declarations, false);
+    let (existing, desired) = gitattributes::desired(&path, &lines).ok()?;
     (existing != desired).then(|| {
         format!(
             "{} no longer matches {} — the per-pattern lines are out of date. \

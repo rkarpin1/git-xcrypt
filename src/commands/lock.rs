@@ -800,7 +800,10 @@ fn write_catch_all_if_missing(repo: &Repo, config: &Config) -> Result<bool> {
     if crate::gitattributes::catch_all_present(&path)? {
         return Ok(false);
     }
-    crate::gitattributes::write_section(&path, &crate::gitattributes::render_lines(config))
+    crate::gitattributes::write_section(
+        &path,
+        &crate::gitattributes::render_lines_as_written(&path, config),
+    )
 }
 
 /// Names a linked checkout for the refusal, however little can be read.

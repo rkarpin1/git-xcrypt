@@ -82,7 +82,11 @@ future change goes in a new `suite` byte, not in a new version of these:
 - **ASCII case folding in pattern matching** — `secrets/` reaches
   `Secrets/db.env`, unconditionally and without reading `core.ignorecase`, so
   the same repository encrypts the same set of files on every machine. Folding
-  stops at ASCII, exactly where git's does.
+  stops at ASCII, exactly where git's does. The generated `.gitattributes`
+  lines spell the pattern as written unless `sync --ignorecase` asks for the
+  folded form; the two halves then differ for a path spelled in another case,
+  which costs that path its `diff` driver and its `-text` but stores nothing in
+  the clear.
 - **Exit codes** — `0` success, `1` usage or unclassified failure, `2`
   configuration or state conflict, `3` no key, `4` bad format, `5` `status`
   found an exposure, `6` `status` could not tell.

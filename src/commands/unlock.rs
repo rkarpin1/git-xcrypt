@@ -153,7 +153,9 @@ pub fn run(repo: &Repo, key_source: Option<KeySource<'_>>, key_only: bool) -> Re
     let config_written = super::init::register_driver(repo)?;
     let attributes_written = crate::gitattributes::write_section(
         &repo.attributes_path(),
-        &crate::gitattributes::render_lines(&config),
+        // Whichever spelling is already there: repairing this section must not
+        // silently undo a `sync --ignorecase`.
+        &crate::gitattributes::render_lines_as_written(&repo.attributes_path(), &config),
     )?;
 
     let mut report = Report {

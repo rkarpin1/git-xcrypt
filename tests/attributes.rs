@@ -410,6 +410,15 @@ fn a_pattern_reaches_every_ascii_spelling_of_a_name_and_the_rendered_line_keeps_
     // encrypts a path the managed `-text` does not reach — measured elsewhere in
     // this file as 34 `CR` bytes eaten out of a ciphertext and the file
     // unrecoverable at checkout.
+    //
+    // **Since 2026-08-06 the rendered half is `sync --ignorecase`, not the
+    // default.** Owner's call, with the cost measured and accepted: in practice
+    // a project spells its paths one way, so the folded line buys coverage for a
+    // mistake that in most repositories never happens, at the price of a section
+    // no human can read. Selection still folds unconditionally — that half is
+    // what keeps a plaintext secret out of the object database, and it is not
+    // negotiable. The default rendering is checked at the bottom of this test,
+    // where the same paths are asked again without the flag.
     let repo = TestRepo::init();
     repo.init_xcrypt();
     repo.write_xcrypt_config(
@@ -418,7 +427,7 @@ fn a_pattern_reaches_every_ascii_spelling_of_a_name_and_the_rendered_line_keeps_
          !secrets/README.md\n\
          \u{142}\u{105}ka/\n",
     );
-    repo.xcrypt_ok(["sync"]);
+    repo.xcrypt_ok(["sync", "--ignorecase"]);
 
     for path in OTHER_SPELLINGS {
         repo.write_file(path, SECRET);
@@ -529,6 +538,79 @@ fn a_pattern_reaches_every_ascii_spelling_of_a_name_and_the_rendered_line_keeps_
         repo.recheckout(path);
         repo.assert_worktree_eq(path, SECRET);
     }
+    repo.assert_status_clean();
+}
+
+/// What the default rendering does, and what it costs — measured, not assumed.
+///
+/// `sync --ignorecase` is opt-in since 2026-08-06, so the plain form is what
+/// almost every repository will hold. Selection still folds unconditionally,
+/// which means the two halves genuinely disagree for a path spelled in another
+/// case, and this is where that disagreement is written down rather than
+/// discovered later.
+///
+/// The good news is the part worth pinning: **nothing is stored in the clear
+/// and nothing is destroyed.** The filter still encrypts the oddly-spelled
+/// path, `text` resolves to `unspecified` rather than `set`, and the measured
+/// table says `unspecified` with no `eol` is one of the shapes git leaves
+/// alone. What is lost is the `diff` driver on that path — `git diff` shows it
+/// as binary — and the `-text` that would have made a foreign `text` line
+/// harmless. On a case-*insensitive* filesystem, where the odd spelling is the
+/// same file, none of this arises at all.
+#[test]
+fn the_default_rendering_covers_the_spelling_as_written_and_says_so() {
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("*.env\n");
+    repo.xcrypt_ok(["sync"]);
+
+    let section = String::from_utf8(repo.worktree_bytes(".gitattributes")).expect("text");
+    assert!(
+        section.contains("*.env -text diff=git-xcrypt"),
+        "the default rendering must spell the pattern the way `.git-xcrypt` \
+         does:\n{section}"
+    );
+    assert!(
+        !section.contains("[eE]"),
+        "the default rendering folded case without being asked:\n{section}"
+    );
+
+    // `core.ignorecase=false` is what makes this mean anything: with it true git
+    // folds the rendered pattern itself and the two halves cannot disagree.
+    repo.set_config("core.ignorecase", "false");
+    repo.write_file("top.ENV", SECRET);
+    repo.commit_all("a declared path, spelled the other way");
+
+    // Selection folds whatever the rendering says, and that is the half that
+    // keeps the secret out of the object database.
+    assert!(
+        repo.blob_is_encrypted("top.ENV"),
+        "selection stopped folding, which is the failure decision 13 closed"
+    );
+    assert!(
+        !repo.object_exists_for(SECRET),
+        "the plaintext of a declared secret reached the object database"
+    );
+
+    // And the cost, named exactly. `unspecified` — not `set` — is why this is a
+    // readability loss and not a data loss: the measured table has git leaving
+    // that shape alone.
+    assert_eq!(
+        repo.check_attr("text", "top.ENV"),
+        "unspecified",
+        "the default rendering reached a spelling it does not contain, so this \
+         test no longer describes what it costs"
+    );
+    assert_eq!(
+        repo.check_attr("diff", "top.ENV"),
+        "unspecified",
+        "`git diff` coverage changed without this test being told"
+    );
+
+    // The round trip still holds, which is the assertion that separates "less
+    // readable" from "broken".
+    repo.recheckout("top.ENV");
+    repo.assert_worktree_eq("top.ENV", SECRET);
     repo.assert_status_clean();
 }
 

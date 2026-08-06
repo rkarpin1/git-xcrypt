@@ -67,6 +67,16 @@ enum Command {
         /// Exits 0 when it is current and 1 when it is not, for use as a CI gate.
         #[arg(long)]
         check: bool,
+
+        /// Spell every ASCII letter as a class, so `*.env` becomes `*.[eE][nN][vV]`.
+        ///
+        /// Pattern matching in `.git-xcrypt` folds case whatever this says, so
+        /// on a case-insensitive filesystem — APFS, NTFS — a file called
+        /// `TOP.ENV` is encrypted either way. What the folded line adds is the
+        /// `-text` and `diff` that go with it on a case-*sensitive* one, where
+        /// a plain `*.env` leaves those spellings unspecified.
+        #[arg(long)]
+        ignorecase: bool,
     },
 
     /// Write the repository key to a file, to carry it to another machine.
@@ -206,7 +216,7 @@ fn main() -> ExitCode {
 
     match cli.command {
         Command::Init => report(run_init()),
-        Command::Sync { check } => run_sync(check),
+        Command::Sync { check, ignorecase } => run_sync(check, ignorecase),
         Command::ExportKey {
             path,
             stdout,
@@ -563,8 +573,8 @@ fn status_and_describe(fix: bool) -> Result<ExitCode> {
 /// table, so a CI gate cannot tell a stale section from an unreadable file by
 /// the code alone; the message says which it is. The table has no spare code and
 /// `5` means an exposure, which a cosmetic section is not.
-fn run_sync(check: bool) -> ExitCode {
-    match sync_and_describe(check) {
+fn run_sync(check: bool, ignorecase: bool) -> ExitCode {
+    match sync_and_describe(check, ignorecase) {
         Ok(code) => code,
         Err(err) => {
             eprintln!("git-xcrypt: {err}");
@@ -573,9 +583,9 @@ fn run_sync(check: bool) -> ExitCode {
     }
 }
 
-fn sync_and_describe(check: bool) -> Result<ExitCode> {
+fn sync_and_describe(check: bool, ignorecase: bool) -> Result<ExitCode> {
     let repo = Repo::discover_from_cwd()?;
-    let report = commands::sync::run(&repo, check)?;
+    let report = commands::sync::run(&repo, check, ignorecase)?;
 
     for warning in &report.warnings {
         eprintln!("git-xcrypt: {warning}");

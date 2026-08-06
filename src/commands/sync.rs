@@ -42,7 +42,7 @@ pub struct Report {
 /// [`Error::Config`] when `.git-xcrypt` is absent or cannot be understood, or
 /// when the managed section in `.gitattributes` has unbalanced markers;
 /// [`Error::Io`] on a read or write failure.
-pub fn run(repo: &Repo, check: bool) -> Result<Report> {
+pub fn run(repo: &Repo, check: bool, ignore_case: bool) -> Result<Report> {
     let config = Config::load(&repo.xcrypt_config_path())?;
     if config.missing {
         return Err(Error::Config(format!(
@@ -51,7 +51,7 @@ pub fn run(repo: &Repo, check: bool) -> Result<Report> {
         )));
     }
 
-    let lines = gitattributes::render_lines(&config);
+    let lines = gitattributes::render_lines(&config, ignore_case);
     let path = repo.attributes_path();
 
     let outcome = if check {
@@ -107,7 +107,7 @@ mod tests {
         let (_dir, repo) = prepared("secrets/\n");
         let before = fs::read_to_string(repo.attributes_path()).expect("attributes");
 
-        let report = run(&repo, true).expect("check must succeed");
+        let report = run(&repo, true, false).expect("check must succeed");
 
         assert_eq!(report.outcome, Outcome::Stale);
         assert_eq!(
@@ -116,9 +116,9 @@ mod tests {
             "--check must never touch the working tree"
         );
 
-        run(&repo, false).expect("sync");
+        run(&repo, false, false).expect("sync");
         assert_eq!(
-            run(&repo, true).expect("check").outcome,
+            run(&repo, true, false).expect("check").outcome,
             Outcome::UpToDate,
             "the check and the write must not disagree"
         );

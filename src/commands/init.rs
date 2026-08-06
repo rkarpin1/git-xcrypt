@@ -95,7 +95,10 @@ pub fn run(repo: &Repo) -> Result<Report> {
     // above has already been saved, so the repair still lands and the message
     // names the offending line.
     let config = Config::load(&repo.xcrypt_config_path())?;
-    let lines = gitattributes::render_lines(&config);
+    // Whichever spelling is already there, because this command was not asked
+    // to change it — see `render_lines_as_written`. A fresh repository has no
+    // section, so it gets the literal form `sync` writes by default.
+    let lines = gitattributes::render_lines_as_written(&repo.attributes_path(), &config);
     report.warnings = config.pointless_eol;
     report.warnings.extend(textconv_cache_warning(repo));
     report.attributes_written = gitattributes::write_section(&repo.attributes_path(), &lines)?;
