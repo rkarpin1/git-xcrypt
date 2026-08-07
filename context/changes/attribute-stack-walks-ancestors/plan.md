@@ -380,17 +380,17 @@ zachowanie `resolve` bajt w bajt zachowane. Jedyna widoczna różnica to czas.
 
 #### Manual
 
-- [ ] 1.5 Sanity na tym repozytorium (`git add`, `git status`, `git-xcrypt status`)
+- [x] 1.5 Sanity na tym repozytorium (`git add`, `git status`, `git-xcrypt status`)
 
 ### Phase 2: Fourth performance budget and the record of the decision
 
 #### Automated
 
-- [x] 2.1 Cztery przypadki `performance.rs` zielone w `--release`
-- [x] 2.2 Mutacja (przywrócony spacer) czerwieni nowy przypadek; wycofana
-- [x] 2.3 Pełny zestaw, clippy, fmt zielone
+- [x] 2.1 Cztery przypadki `performance.rs` zielone w `--release` — 576b05e
+- [x] 2.2 Mutacja (przywrócony spacer) czerwieni nowy przypadek; wycofana — 576b05e
+- [x] 2.3 Pełny zestaw, clippy, fmt zielone — 576b05e
 
 #### Manual
 
-- [ ] 2.4 Pomiar przed/po wykonany i wpisany do `prd.md`/`zalozenia.md`
-- [ ] 2.5 `git add` zadeklarowanego pliku na drzewie syntetycznym w rzędzie 10 ms
+- [x] 2.4 Pomiar przed/po wykonany i wpisany do `prd.md`/`zalozenia.md`
+- [x] 2.5 `git add` zadeklarowanego pliku na drzewie syntetycznym w rzędzie 10 ms
