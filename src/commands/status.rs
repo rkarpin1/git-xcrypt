@@ -1020,7 +1020,18 @@ pub fn run(repo: &Repo, fix: bool) -> Result<Report> {
         return Ok(report);
     }
     report.warnings.extend(declarations.pointless_eol.clone());
-    report.setup.extend(stale_section_gap(repo, &declarations));
+    match section_verdict(repo, &declarations) {
+        SectionVerdict::Current => {}
+        SectionVerdict::Stale => report.setup.push(SetupGap::SectionStale),
+        // Said out loud rather than rounded down to "current". The reason
+        // carries `upsert`'s own message, which already names the file and the
+        // repair — every command that writes this file prints the same one.
+        SectionVerdict::Unanswerable(why) => report.undetermined.push(format!(
+            "{why} — so whether the managed section still covers every declared \
+             path could not be determined. Nothing above rules it out: every \
+             command that writes this file refuses over the same state."
+        )),
+    }
 
     let hash = index::object_hash(gitconfig::get(&config, "extensions.objectformat").as_deref());
     let objects = history::objects(repo.common_dir(), hash)?;
@@ -1620,29 +1631,59 @@ fn named(name: &[u8], err: crate::Error) -> crate::Error {
     }
 }
 
-/// Reports a `.gitattributes` section that no longer matches `.git-xcrypt`.
+/// What this run could make of the managed `.gitattributes` section.
+enum SectionVerdict {
+    /// It matches one of the shapes this build writes.
+    Current,
+    /// It matches none of them, which is what a changed declaration leaves.
+    Stale,
+    /// It could not be compared at all, and why.
+    Unanswerable(String),
+}
+
+/// Compares the managed `.gitattributes` section against `.git-xcrypt`.
 ///
 /// A [`SetupGap::SectionStale`] since 2026-08-06, where the reasoning lives; it
 /// was a note until then, and `sync --check` disagreed with it.
-fn stale_section_gap(repo: &Repo, declarations: &Config) -> Option<SetupGap> {
-    // Either rendering counts as current. `sync --ignorecase` writes the folded
-    // form deliberately, and a note that called it stale would send its user to
-    // run the very command that produced it — a loop with no exit. What this
-    // note is for is a section that matches *neither*, which is what a changed
-    // declaration leaves behind.
+///
+/// **A refusal is a third answer, not a second "matches".** [`attributes::upsert`]
+/// declines to say what the file should hold when the markers are doubled or
+/// unbalanced — a merge conflict resolved by keeping both sides produces exactly
+/// that — and this function used to take the refusal as "does not match" and then
+/// ask again for the reason with `.ok()?`, which threw it away and returned "no
+/// gap". Measured on git 2.55: over a doubled section `sync --check`, `sync`,
+/// `init` and `unlock` all exit `2`, `unlock` cannot open such a clone at all,
+/// and `status` printed `VERDICT: no findings.` and exited `0`. That is the one
+/// answer this command may never give.
+///
+/// It is reported as **undetermined** rather than as a setup gap, and the
+/// difference is not a technicality. Two identical sections enforce exactly what
+/// one does — `git check-attr` gives the same answers — so a gap would over-claim,
+/// and [`Report::stores_in_the_clear`] would then print "committing a declared
+/// file stores it in the clear", sending a user to rotate secrets that were never
+/// exposed. What is provably true is that this run could not compare the section.
+fn section_verdict(repo: &Repo, declarations: &Config) -> SectionVerdict {
+    // Every rendering counts as current. `sync --ignorecase` writes the folded
+    // form deliberately, and calling it stale would send its user to run the very
+    // command that produced it — a loop with no exit.
     let path = repo.attributes_path();
-    let matches = |rendering| {
+    let mut refusal = None;
+    for rendering in attributes::ACCEPTED {
         let lines = attributes::render_lines(declarations, rendering);
-        attributes::desired(&path, &lines)
-            .map(|(existing, desired)| existing == desired)
-            .unwrap_or(false)
-    };
-    if attributes::ACCEPTED.into_iter().any(matches) {
-        return None;
+        match attributes::desired(&path, &lines) {
+            Ok((existing, desired)) if existing == desired => return SectionVerdict::Current,
+            Ok(_) => {}
+            // The renderings differ only in what goes *inside* the markers, so
+            // they all ask `upsert` the same structural question and the first
+            // refusal is the whole answer; keeping it is about naming the reason.
+            Err(err) => {
+                if refusal.is_none() {
+                    refusal = Some(err.to_string());
+                }
+            }
+        }
     }
-    let lines = attributes::render_lines(declarations, attributes::Rendering::Global);
-    let (existing, desired) = attributes::desired(&path, &lines).ok()?;
-    (existing != desired).then_some(SetupGap::SectionStale)
+    refusal.map_or(SectionVerdict::Stale, SectionVerdict::Unanswerable)
 }
 
 /// Mentions an absent diff driver, without letting it fail the gate.

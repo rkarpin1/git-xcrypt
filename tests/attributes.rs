@@ -363,6 +363,106 @@ fn a_forgotten_sync_fails_the_gate_and_running_it_reaches_the_whole_subtree() {
     repo.assert_status_clean();
 }
 
+/// A section this build cannot compare is not a section it may call current.
+///
+/// Two shapes reach it, and the first is ordinary: a merge conflict on
+/// `.gitattributes` resolved by keeping both sides leaves two managed sections,
+/// and an interrupted hand-edit leaves an opening marker with no closing one.
+/// `attributes::upsert` refuses both — git takes the **last** matching line, so
+/// the copy nobody maintains is the one that decides — and every command that
+/// writes the file says so: measured on git 2.55, `sync --check`, `sync`, `init`
+/// and `unlock` all exit `2` over a doubled section, and `unlock` cannot open
+/// such a clone at all.
+///
+/// `status` was the one command that said nothing. `stale_section_gap` compared
+/// the file against each rendering, took a refusal as "does not match", then
+/// asked for the reason with `.ok()?` — which threw the refusal away and
+/// returned "no gap". Measured before this test: `VERDICT: no findings.`, exit
+/// `0`, on the repository `unlock` had just refused to open. That is the one
+/// answer `AGENTS.md` says this command may never give: "I could not tell" must
+/// never be reported as "nothing is wrong."
+///
+/// **`undetermined`, not a setup gap**, and the distinction is not a technicality.
+/// Two identical sections enforce exactly what one does — `git check-attr` gives
+/// the same answers — so claiming git is not enforcing the declarations would be
+/// an over-claim, and `Report::stores_in_the_clear` would then print "committing
+/// a declared file stores it in the clear", which is false and is the sentence
+/// the 2026-08-05 precedence change exists to prevent. What is provably true is
+/// that this run could not compare the section, which is exit `6` and fails the
+/// gate.
+#[test]
+fn a_section_that_cannot_be_compared_is_never_reported_as_current() {
+    for (label, break_it) in [
+        (
+            "a merge that kept both sides",
+            &(|section: &[u8]| [section, section].concat()) as &dyn Fn(&[u8]) -> Vec<u8>,
+        ),
+        (
+            "an opening marker with no closing one",
+            &|section: &[u8]| {
+                let text = String::from_utf8(section.to_vec()).expect("the section is text");
+                text.replace("# <<< git-xcrypt <<<\n", "").into_bytes()
+            },
+        ),
+    ] {
+        let repo = TestRepo::init();
+        repo.init_xcrypt();
+        repo.write_xcrypt_config("secrets/\n");
+        repo.xcrypt_ok(["sync"]);
+        repo.write_file("secrets/db.env", SECRET);
+        repo.commit_all("a secret");
+
+        // The baseline, so everything below is about the section and nothing
+        // else. A run that started red would prove nothing.
+        assert_eq!(
+            repo.xcrypt(["status"]).status.code(),
+            Some(0),
+            "{label}: the repository was not clean before the section was broken"
+        );
+
+        let section = repo.worktree_bytes(".gitattributes");
+        repo.write_file(".gitattributes", &break_it(&section));
+
+        // The writing side's verdict, which is what `status` has to stop
+        // contradicting. `2` is a state conflict, and the message names the
+        // repair by hand.
+        let checked = repo.xcrypt(["sync", "--check"]);
+        assert_eq!(
+            checked.status.code(),
+            Some(2),
+            "{label}: `sync --check` stopped calling this a state conflict, so \
+             this test no longer asks anything"
+        );
+
+        let seen = repo.xcrypt(["status"]);
+        let said = String::from_utf8_lossy(&seen.stdout).into_owned();
+        assert_ne!(
+            seen.status.code(),
+            Some(0),
+            "{label}: `status` passed the gate over a section it could not \
+             compare, while every command that writes the file refuses over \
+             it:\n{said}"
+        );
+        assert!(
+            said.contains("undetermined"),
+            "{label}: a check that could not run has to be said out loud, or \
+             the report reads as a clean bill of health it did not earn:\n{said}"
+        );
+        assert!(
+            said.contains("git-xcrypt"),
+            "{label}: the reason has to name the section, or a reader has \
+             nothing to act on:\n{said}"
+        );
+        // And it must not over-claim: git *is* running the filter here, so the
+        // sentence that sends a user to rotate secrets must stay off the page.
+        assert!(
+            !said.contains("stores it in the clear"),
+            "{label}: a section this build cannot read is not evidence that \
+             anything was stored in the clear:\n{said}"
+        );
+    }
+}
+
 /// The filter says the section is stale, on the one path that can act on it.
 ///
 /// `sync` has no automatic trigger, and the three candidates were measured
