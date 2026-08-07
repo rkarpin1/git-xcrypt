@@ -11,7 +11,7 @@ exist in someone's history — so those are listed under their own heading, and 
 release that changed any of them without a new `suite` byte would be a bug, not
 a minor version.
 
-## [0.1.0] — unreleased
+## [0.1.0] — 2026-08-07
 
 First release. Everything below is new; there is no earlier version to have
 changed anything from.

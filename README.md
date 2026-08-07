@@ -4,11 +4,14 @@ Transparent encryption of selected files in a git repository: plaintext in your
 working tree, ciphertext in the remote. A self-contained Rust binary — no
 system `gpg`, no helper scripts, no external processes on the filter path.
 
-**Status: v0.1 in development, not yet released.** Every command listed below
-works and is covered by tests that drive a real git. There is no published
-release or package yet, so today the only way in is `cargo install --path .`.
-[`CHANGELOG.md`](CHANGELOG.md) lists what the first release contains, what is
-frozen with it, and what it deliberately leaves out.
+**Status: v0.1.0, the first release.** Every command listed below works and is
+covered by tests that drive a real git, on Linux, macOS and Windows.
+Ready-made binaries for five targets are on the
+[releases page](https://github.com/rkarpin1/git-xcrypt/releases), each with a
+SHA-256 sum and a build provenance attestation — see §Verifying a downloaded
+release. The crate is not on crates.io yet, so from source it is
+`cargo install --path .`. [`CHANGELOG.md`](CHANGELOG.md) lists what this
+release contains, what is frozen with it, and what it deliberately leaves out.
 
 ## Quick start
 
@@ -606,7 +609,7 @@ Every published archive carries a GitHub build provenance attestation. To check
 one before you trust it:
 
 ```sh
-gh attestation verify git-xcrypt-<version>-<target>.tar.gz --repo <owner>/<repo>
+gh attestation verify git-xcrypt-v0.1.0-<target>.tar.gz --repo rkarpin1/git-xcrypt
 ```
 
 That answers *which commit and which workflow run produced this file*, which is

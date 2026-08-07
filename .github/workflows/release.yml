@@ -27,7 +27,11 @@
 # an attestation be read as a claim it is closed.
 #
 # To verify a downloaded archive:
-#     gh attestation verify <archive> --repo <owner>/<repo>
+#     gh attestation verify <archive> --repo rkarpin1/git-xcrypt
+#
+# Rehearsed rather than assumed: run 31190705997 (2026-08-07, a dispatch)
+# attested five archives, and the `aarch64-apple-darwin` one verifies with the
+# command above — the attestation binds it to commit b6c4a5e and to this file.
 name: Release
 
 on:
@@ -36,7 +40,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to build (for a dry run)"
+        description: "Version to name the archives with, e.g. v0.1.0 (dry run)"
         required: true
 
 # `contents: write` publishes the release. The other two are what an attestation
@@ -126,9 +130,24 @@ jobs:
 
       - name: Package
         shell: bash
+        # Through the environment, never interpolated into the script body:
+        # `${{ }}` is substituted before bash sees the line, so a dispatch
+        # input carrying a quote or `$(…)` would run as code. The value is a
+        # version string from someone who can already dispatch this workflow,
+        # but the shape is the injection shape and this file should not teach
+        # it.
+        env:
+          DISPATCH_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME:-dev}"
+          # On a tag `GITHUB_REF_NAME` is the tag; on a dispatch it is the
+          # *branch*, which named the dry run's archives `git-xcrypt-master-…`
+          # and quietly meant the rehearsal never exercised the naming a
+          # release depends on. The dispatch input decides there instead — it
+          # was declared `required` from the start and read nowhere, which is
+          # worse than not offering it: a required field implies the run uses
+          # it. Measured 2026-08-07, run 31190705997.
+          version="${DISPATCH_TAG:-${GITHUB_REF_NAME:-dev}}"
           name="git-xcrypt-${version}-${{ matrix.target }}"
           mkdir -p "dist/$name"
           if [ "${{ runner.os }}" = "Windows" ]; then
