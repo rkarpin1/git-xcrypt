@@ -19,13 +19,21 @@
 # and the exit code is the whole interface:
 #
 #   0  everything was checked, nothing found
-#   5  a finding — a setup gap, a declared file staged in the clear, or a
-#      plaintext version still in history. Rotate the secret before anything
-#      else; rewriting history does not undo a leak.
+#   2  the setup enforces nothing — the filter is unregistered, the catch-all
+#      line or `.git-xcrypt` is missing, or an attribute line outranks the
+#      managed `-text`. This is what a clone that never ran `unlock` answers.
+#      Fix the setup and ask again; the rest of the report still prints, so a
+#      `2` does not mean nothing else was found.
+#   5  an exposure — a declared file staged in the clear, or a plaintext
+#      version still in history. Rotate the secret before anything else;
+#      rewriting history does not undo a leak.
 #   6  the run could not answer: a shallow or partial clone, an unreadable
-#      index, a reference store that will not enumerate, a missing
-#      `.git-xcrypt`. Nothing was found and nothing is ruled out.
-#   1-4 the tool itself failed.
+#      index, a reference store that will not enumerate. Nothing was found
+#      and nothing is ruled out.
+#   1, 3, 4  the tool itself failed.
+#
+# Treat 2, 5 and 6 alike as a failure — they ask for three different repairs,
+# and only 0 means the question was answered.
 #
 # `fetch-depth: 0` is what separates 0 from 6. `actions/checkout` clones with
 # `--depth 1` by default, and history that was never fetched cannot be scanned,
