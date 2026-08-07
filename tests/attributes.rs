@@ -415,9 +415,21 @@ fn a_section_that_cannot_be_compared_is_never_reported_as_current() {
         ),
         (
             "an opening marker with no closing one",
+            // By line rather than by `replace`, because the terminator is the
+            // file's own: `line_ending_of` reproduces CRLF where the file
+            // already uses it, so a substring ending in `\n` would match
+            // nothing on a checkout that spells them `\r\n` — and the test
+            // would pass having changed no byte. `str::lines` takes both.
             &|section: &[u8]| {
                 let text = String::from_utf8(section.to_vec()).expect("the section is text");
-                text.replace("# <<< git-xcrypt <<<\n", "").into_bytes()
+                text.lines()
+                    .filter(|line| line.trim_end() != "# <<< git-xcrypt <<<")
+                    .fold(String::new(), |mut out, line| {
+                        out.push_str(line);
+                        out.push('\n');
+                        out
+                    })
+                    .into_bytes()
             },
         ),
     ] {
@@ -437,7 +449,17 @@ fn a_section_that_cannot_be_compared_is_never_reported_as_current() {
         );
 
         let section = repo.worktree_bytes(".gitattributes");
-        repo.write_file(".gitattributes", &break_it(&section));
+        let broken = break_it(&section);
+        // The premise, asserted rather than assumed. A shape built by editing
+        // text is only a shape while the edit lands, and an edit that quietly
+        // matched nothing would leave the rest of this run asserting that a
+        // healthy repository is healthy — a test passing for the wrong reason
+        // on whichever platform the premise does not hold.
+        assert_ne!(
+            broken, section,
+            "{label}: the section came back unchanged, so this run asks nothing"
+        );
+        repo.write_file(".gitattributes", &broken);
 
         // The writing side's verdict, which is what `status` has to stop
         // contradicting. `2` is a state conflict, and the message names the
