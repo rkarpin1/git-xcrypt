@@ -27,9 +27,16 @@
 //! cargo test --release --test performance -- --ignored --nocapture
 //! ```
 //!
-//! Run it before and after a change to `commands/filter.rs`, `rules/decide.rs`
-//! or `crypto/`. It prints what it measured, so a run that passes still tells
-//! you which way the number moved.
+//! Run it before and after a change to `commands/filter.rs`, `rules/decide.rs`,
+//! `crypto/` or `git/attributes.rs`. It prints what it measured, so a run that
+//! passes still tells you which way the number moved.
+//!
+//! **A third trap, recorded 2026-08-07 with the fourth budget:** the attribute
+//! stack test builds a tree of tens of thousands of files, and creating that
+//! tree costs seconds — orders of magnitude more than the thing being
+//! measured. The tree is built once, outside the timed window, and only the
+//! resolver's work is inside it. A version that timed from `TestRepo::init`
+//! would measure the filesystem, not the stack.
 
 mod harness;
 
@@ -251,5 +258,85 @@ fn the_cipher_stays_within_its_per_byte_budget() {
          budget in PRD §Non-Functional Requirements. Check that `--cfg \
          aes_armv8` still reaches the `aes` crate on this target.",
         1000.0 / per_byte
+    );
+}
+
+/// What building the attribute stack costs, measured where the tree's bulk
+/// would dominate if anyone walked it.
+///
+/// The regression this exists for is the one measured on 2026-08-06 and
+/// removed on 2026-08-07: `AttributeResolver` used to walk the **whole**
+/// working tree looking for `.gitattributes` — one `read_dir` per directory,
+/// one `file_type()` per entry — which put a build directory's worth of
+/// entries on the hot path of every `git add`. 220 ms instead of 10 ms on a
+/// tree with 5281 directories and 480 000 ignored files, the only measured
+/// cost in the product that scaled with *untracked* files. Discovery is lazy
+/// now: the resolver probes only the ancestor chain of each resolved path, so
+/// its cost is the number of ancestors, not the number of entries.
+///
+/// No git in the loop, like the cipher test: the resolver is built and asked
+/// directly, so the walk — if someone brings it back — is the measurement,
+/// not a fraction of it. Verified to bite: restoring the walk in
+/// `AttributeResolver::new` fails this assertion on this same tree.
+///
+/// Budget: **10 ms** for construction plus the first resolve, against 0.02 ms
+/// measured 2026-08-07 on this tree (3000 directories × 10 files). Headroom
+/// is deliberately wider than the 2–4× the other budgets carry: this number
+/// is almost pure filesystem I/O, where a cold cache spikes harder than a
+/// scheduler does, and the failure it guards sat at 43.6 ms on this same
+/// tree when the walk was put back — 4× above the budget, growing linearly
+/// with entries while the lazy cost does not grow at all.
+#[test]
+#[ignore = "timing; run deliberately with --release, see the module comment"]
+fn the_attribute_stack_pays_for_ancestors_not_for_the_tree() {
+    use git_xcrypt::git::attributes::AttributeResolver;
+
+    let repo = TestRepo::init();
+    repo.write_file(".gitattributes", b"* filter=git-xcrypt\n");
+    repo.write_file("secrets/db.env", b"api_key = value\n");
+
+    // The bulk: entries the resolver has no business visiting. Built once,
+    // outside the timed window — see the module comment's third trap.
+    for directory in 0..3000 {
+        let path = repo.path().join(format!("bulk/d{directory:04}"));
+        std::fs::create_dir_all(&path).expect("bulk directories");
+        for file in 0..10 {
+            std::fs::write(path.join(format!("f{file}.o")), b"x").expect("bulk files");
+        }
+    }
+
+    let elapsed = (0..RUNS)
+        .map(|_| {
+            // A fresh resolver each run: probes are cached per instance, and a
+            // warm one would measure the cache instead of the discovery.
+            let started = Instant::now();
+            let mut resolver = AttributeResolver::new(
+                repo.path(),
+                &repo.path().join(".git"),
+                None,
+                false,
+                Vec::new(),
+            );
+            let resolution = resolver.resolve(b"secrets/db.env");
+            let taken = started.elapsed();
+            assert!(
+                resolution.filter.is_ours(),
+                "the stack no longer resolves the catch-all, so this would time \
+                 a resolver that reads nothing"
+            );
+            taken
+        })
+        .min()
+        .expect("RUNS is not zero");
+
+    let ms = elapsed.as_secs_f64() * 1000.0;
+    println!("attribute stack: {ms:.2} ms to build and answer once (budget 10.00)");
+
+    assert!(
+        ms <= 10.0,
+        "building the attribute stack took {ms:.2} ms on a tree whose bulk is \
+         not on the resolved path's ancestor chain — over the 10 ms budget in \
+         PRD §Non-Functional Requirements. The walk of the whole working tree \
+         is probably back in `AttributeResolver`."
     );
 }

@@ -373,10 +373,10 @@ zachowanie `resolve` bajt w bajt zachowane. Jedyna widoczna różnica to czas.
 
 #### Automated
 
-- [x] 1.1 Pełny zestaw zielony (`cargo test --all-targets --locked --no-fail-fast`)
-- [x] 1.2 Clippy i fmt zielone
-- [x] 1.3 Strażnik kolejności odkrywania zielony; mutacje (a) i (b) zweryfikowane na czerwono i wycofane
-- [x] 1.4 Scenariusz noty `status` dla nieśledzonego katalogu zielony; mutacja na `sources()` czerwona
+- [x] 1.1 Pełny zestaw zielony (`cargo test --all-targets --locked --no-fail-fast`) — 7843271
+- [x] 1.2 Clippy i fmt zielone — 7843271
+- [x] 1.3 Strażnik kolejności odkrywania zielony; mutacje (a) i (b) zweryfikowane na czerwono i wycofane — 7843271
+- [x] 1.4 Scenariusz noty `status` dla nieśledzonego katalogu zielony; mutacja na `sources()` czerwona — 7843271
 
 #### Manual
 
@@ -386,9 +386,9 @@ zachowanie `resolve` bajt w bajt zachowane. Jedyna widoczna różnica to czas.
 
 #### Automated
 
-- [ ] 2.1 Cztery przypadki `performance.rs` zielone w `--release`
-- [ ] 2.2 Mutacja (przywrócony spacer) czerwieni nowy przypadek; wycofana
-- [ ] 2.3 Pełny zestaw, clippy, fmt zielone
+- [x] 2.1 Cztery przypadki `performance.rs` zielone w `--release`
+- [x] 2.2 Mutacja (przywrócony spacer) czerwieni nowy przypadek; wycofana
+- [x] 2.3 Pełny zestaw, clippy, fmt zielone
 
 #### Manual
 
