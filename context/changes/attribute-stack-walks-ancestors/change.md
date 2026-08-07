@@ -1,9 +1,9 @@
 ---
 change_id: attribute-stack-walks-ancestors
 title: Read .gitattributes from the path's ancestors, not the whole working tree
-status: new
+status: implementing
 created: 2026-08-06
-updated: 2026-08-06
+updated: 2026-08-07
 archived_at: null
 ---
 

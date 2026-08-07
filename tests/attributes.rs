@@ -2185,3 +2185,45 @@ fn sync_says_when_a_line_outside_its_section_might_outrank_it() {
         }
     }
 }
+
+/// The note about foreign `filter` lines still sees the whole tree.
+///
+/// The resolver's discovery went lazy on 2026-08-07 — it probes
+/// `.gitattributes` only on the ancestor chains of the paths it resolves — and
+/// this note is the one consumer that must not narrow with it. It exists to
+/// name an attributes file that reaches paths the index does not hold yet, and
+/// such a file can sit in a directory with no tracked path at all: exactly the
+/// directory no ancestor probe ever visits. `status` therefore walks the tree
+/// for the note deliberately, and this scenario is what keeps that walk from
+/// being "simplified" back to the resolver's consulted sources.
+#[test]
+fn the_note_about_foreign_filter_lines_sees_a_directory_the_index_does_not_hold() {
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.xcrypt_ok(["sync"]);
+    repo.write_file("secrets/db.env", b"api_key = value\n");
+    repo.commit_all("a secret");
+
+    // A `filter` line in a directory git tracks nothing under. The lazy
+    // resolver never probes `vendor/`: no declared path leads through it.
+    repo.write_file("vendor/.gitattributes", b"*.blob filter=lfs\n");
+
+    let output = repo.xcrypt(["status"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "an untracked foreign line reaching no declared path is a note, \
+         never a finding:\n{text}"
+    );
+    assert!(
+        text.contains("vendor/.gitattributes"),
+        "the note lost sight of an attributes file outside every tracked \
+         chain:\n{text}"
+    );
+}

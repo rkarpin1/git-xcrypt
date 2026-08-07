@@ -923,6 +923,14 @@ pub fn foreign_lines_touching(path: &Path, axes: &[&str]) -> Result<Vec<String>>
 
 /// Every `.gitattributes` under `root`, `.git` excluded.
 ///
+/// **Not the resolver's discovery any more — since 2026-08-07 only
+/// [`attribute_files_under`] calls this.** [`AttributeResolver`] probes the
+/// ancestor chain of each resolved path instead, because this walk costs a
+/// `read_dir` per directory and a `file_type()` per entry and everything off
+/// the ancestors is inert for a resolution — measured at 220 ms per `git add`
+/// on a tree with a large build directory. The walk stays for the one question
+/// that genuinely is about the whole tree.
+///
 /// Iterative rather than recursive, for the same reason the history walk is: a
 /// working tree may be arbitrarily deep and a diagnostic command must not be the
 /// thing that crashes on it. Directories that will not open are skipped, exactly
@@ -965,6 +973,23 @@ fn collect_attribute_files(root: &Path, out: &mut Vec<PathBuf>) {
             }
         }
     }
+}
+
+/// Every `.gitattributes` in the working tree under `work_tree`, sorted
+/// shallowest first, ties by path.
+///
+/// For questions about the **whole tree**, which a lazy resolver can no longer
+/// answer: the `status` note about foreign `filter` lines exists precisely to
+/// name an attributes file that reaches paths the index does not hold yet —
+/// a file that may sit in a directory with no tracked path, which is exactly
+/// the file no ancestor probe would ever visit. The sort mirrors the order the
+/// resolver reports sources in, so the note reads the same as it always did.
+#[must_use]
+pub fn attribute_files_under(work_tree: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    collect_attribute_files(work_tree, &mut files);
+    files.sort_by_key(|path| (path.components().count(), path.clone()));
+    files
 }
 
 /// A `.gitattributes` whose working-tree file is gone but whose staged copy
@@ -1399,11 +1424,47 @@ fn converts(
 /// subdirectory is not a macro definition to git and is not one here.
 ///
 /// A source that cannot be read is skipped, exactly as git skips it.
+///
+/// **Discovery is lazy since 2026-08-07; assembly is not.** The tree's
+/// `.gitattributes` are probed only in the directories on the ancestor chain of
+/// each path [`Self::resolve`] is asked about — git reads the file from nowhere
+/// else, so everything beyond the ancestors was inert for the answer and cost a
+/// `read_dir` per directory and a `file_type()` per entry. Measured on a tree
+/// with 5281 directories and 480 000 ignored files (a build directory): `git
+/// add` of one declared file took 220 ms instead of 10 ms, scaling linearly
+/// with the number of directory entries — the only measured cost in the product
+/// that grew with *untracked* files. When a probe finds a file the whole
+/// [`gix_attributes::Search`] is rebuilt from scratch by [`Self::assemble`],
+/// the same code that built it at construction, so precedence is decided by one
+/// sort in one place and lazy discovery cannot reorder anything: patterns from
+/// `<dir>/.gitattributes` reach only paths under `<dir>`, which makes the order
+/// of discovery across disjoint branches irrelevant, and the order *within* a
+/// chain is re-sorted on every rebuild. Rebuilds are bounded by the number of
+/// attribute files on the queried chains — typically zero to two — never by the
+/// number of directories.
 pub struct AttributeResolver {
     search: gix_attributes::Search,
     outcome: gix_attributes::search::Outcome,
     case: gix_glob::pattern::Case,
     sources: Vec<PathBuf>,
+    /// The working tree the ancestor probes are anchored to.
+    work_tree: PathBuf,
+    /// `$GIT_COMMON_DIR/info/attributes`, re-added last on every rebuild.
+    info: PathBuf,
+    /// `core.attributesFile`, re-added first on every rebuild.
+    global: Option<PathBuf>,
+    /// The index copies of deleted attribute files, all of them, kept from
+    /// construction: the index was already read to find them and the patterns
+    /// in each reach only paths under its own directory, so carrying one for a
+    /// chain never queried is inert.
+    staged: Vec<StagedAttributes>,
+    /// Every on-disk `.gitattributes` a probe has found so far.
+    on_disk: Vec<PathBuf>,
+    /// Repository-relative directories already probed, `b""` being the root.
+    /// Keyed by the bytes as given: under `core.ignorecase` a second spelling
+    /// of the same directory costs at most a second probe, which the
+    /// filesystem resolves exactly as it resolved the first.
+    probed: std::collections::HashSet<Vec<u8>>,
 }
 
 impl AttributeResolver {
@@ -1434,6 +1495,45 @@ impl AttributeResolver {
         ignore_case: bool,
         staged: Vec<StagedAttributes>,
     ) -> Self {
+        let info = common_dir.join("info").join("attributes");
+        // No walk: the tree's files enter through the probes in [`Self::resolve`].
+        let (search, outcome, sources) = Self::assemble(work_tree, global, &staged, &[], &info);
+        Self {
+            search,
+            outcome,
+            case: if ignore_case {
+                gix_glob::pattern::Case::Fold
+            } else {
+                gix_glob::pattern::Case::Sensitive
+            },
+            sources,
+            work_tree: work_tree.to_path_buf(),
+            info,
+            global: global.map(Path::to_path_buf),
+            staged,
+            on_disk: Vec::new(),
+            probed: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Builds the whole search from what is known, in git's precedence order.
+    ///
+    /// The one place precedence is decided — construction and every
+    /// rebuild-on-discovery go through it, so the two cannot answer
+    /// differently. That is the entire safety argument for lazy discovery:
+    /// nothing is ever *inserted into* an existing search, where the order of
+    /// discovery could leak into the order of matching.
+    fn assemble(
+        work_tree: &Path,
+        global: Option<&Path>,
+        staged: &[StagedAttributes],
+        on_disk: &[PathBuf],
+        info: &Path,
+    ) -> (
+        gix_attributes::Search,
+        gix_attributes::search::Outcome,
+        Vec<PathBuf>,
+    ) {
         let mut collection = gix_attributes::search::MetadataCollection::default();
         let mut buf: Vec<u8> = Vec::new();
         let mut search = gix_attributes::Search::new_globals(
@@ -1446,24 +1546,22 @@ impl AttributeResolver {
         )
         .unwrap_or_default();
 
-        let mut on_disk: Vec<PathBuf> = Vec::new();
-        collect_attribute_files(work_tree, &mut on_disk);
         // The staged copies join the on-disk files in one list, so the sort
         // below is the only thing deciding precedence for both.
-        let mut tree_sources: Vec<(PathBuf, Option<Vec<u8>>)> = on_disk
-            .into_iter()
-            .map(|path| (path, None))
+        let mut tree_sources: Vec<(&Path, Option<&[u8]>)> = on_disk
+            .iter()
+            .map(|path| (path.as_path(), None))
             .chain(
                 staged
-                    .into_iter()
-                    .map(|fallback| (fallback.path, Some(fallback.contents))),
+                    .iter()
+                    .map(|fallback| (fallback.path.as_path(), Some(&fallback.contents[..]))),
             )
             .collect();
         // Shallowest first: git gives the file closest to the path the higher
         // precedence, and `Search` matches its lists last-added-first. Depth
         // before name, because a plain string sort does not order `a/x/.g`
         // against `a/.g` by depth in every alphabet.
-        tree_sources.sort_by_key(|(path, _)| (path.components().count(), path.clone()));
+        tree_sources.sort_by_key(|(path, _)| (path.components().count(), path.to_path_buf()));
 
         let mut sources: Vec<PathBuf> = Vec::new();
         for (source, contents) in tree_sources {
@@ -1473,7 +1571,7 @@ impl AttributeResolver {
             match contents {
                 None => {
                     let _ = search.add_patterns_file(
-                        source.clone(),
+                        source.to_path_buf(),
                         true,
                         Some(work_tree),
                         &mut buf,
@@ -1482,21 +1580,27 @@ impl AttributeResolver {
                     );
                 }
                 Some(contents) => search.add_patterns_buffer(
-                    &contents,
-                    source.clone(),
+                    contents,
+                    source.to_path_buf(),
                     Some(work_tree),
                     &mut collection,
                     is_root,
                 ),
             }
-            sources.push(source);
+            sources.push(source.to_path_buf());
         }
 
         // Last, so it outranks every file in the working tree — which is exactly
         // what makes it the source an audit is least likely to look at.
-        let info = common_dir.join("info").join("attributes");
-        let _ = search.add_patterns_file(info.clone(), true, None, &mut buf, &mut collection, true);
-        sources.push(info);
+        let _ = search.add_patterns_file(
+            info.to_path_buf(),
+            true,
+            None,
+            &mut buf,
+            &mut collection,
+            true,
+        );
+        sources.push(info.to_path_buf());
         // Reported alongside the rest even though it was loaded first: a global
         // file that silently unsets `filter` is a source a reader has to be told
         // about, whatever its precedence.
@@ -1510,15 +1614,57 @@ impl AttributeResolver {
         // crlf` line converted a ciphertext with no gate firing anywhere.
         outcome.initialize_with_selection(&collection, ["filter", "text", "eol", "crlf"]);
 
-        Self {
-            search,
-            outcome,
-            case: if ignore_case {
-                gix_glob::pattern::Case::Fold
-            } else {
-                gix_glob::pattern::Case::Sensitive
-            },
-            sources,
+        (search, outcome, sources)
+    }
+
+    /// Probes `.gitattributes` in every not-yet-probed ancestor of the path.
+    ///
+    /// The probe is per file and by name — `symlink_metadata(...).is_file()`,
+    /// a symlinked file excluded — exactly the probe the eager walk used, so on
+    /// APFS and NTFS a file *stored* as `.GITATTRIBUTES` is still found the way
+    /// git finds it. What the walk had and this does not is the exclusion of
+    /// symlinked *directories*: git itself opens `<dir>/.gitattributes` through
+    /// whatever path it was asked about, and the paths git asks about do not
+    /// run through directory symlinks (content under one is not tracked as
+    /// paths under it), so the difference is theoretical — and in git's
+    /// direction.
+    fn probe_ancestors(&mut self, relative_path: &[u8]) {
+        let mut discovered = false;
+        let root: &[u8] = b"";
+        let ancestors = std::iter::once(root).chain(
+            relative_path
+                .iter()
+                .enumerate()
+                .filter(|&(_, &byte)| byte == b'/')
+                .map(|(at, _)| &relative_path[..at]),
+        );
+        for directory in ancestors {
+            if self.probed.contains(directory) {
+                continue;
+            }
+            self.probed.insert(directory.to_vec());
+            let file = self
+                .work_tree
+                .join(crate::git::repo::working_tree_path(directory))
+                .join(ATTRIBUTES_FILE);
+            // Never followed: a symbolic link out of the working tree would
+            // walk somewhere that is not this repository.
+            if fs::symlink_metadata(&file).is_ok_and(|metadata| metadata.is_file()) {
+                self.on_disk.push(file);
+                discovered = true;
+            }
+        }
+        if discovered {
+            let (search, outcome, sources) = Self::assemble(
+                &self.work_tree,
+                self.global.as_deref(),
+                &self.staged,
+                &self.on_disk,
+                &self.info,
+            );
+            self.search = search;
+            self.outcome = outcome;
+            self.sources = sources;
         }
     }
 
@@ -1526,6 +1672,7 @@ impl AttributeResolver {
     pub fn resolve(&mut self, relative_path: &[u8]) -> Resolution {
         use gix_attributes::State;
 
+        self.probe_ancestors(relative_path);
         self.outcome.reset();
         self.search.pattern_matching_relative_path(
             bstr::BStr::new(relative_path),
@@ -1598,7 +1745,15 @@ impl AttributeResolver {
         }
     }
 
-    /// Every attributes file this resolver read, in the order it read them.
+    /// Every attributes file this resolver has **consulted**, in precedence
+    /// order.
+    ///
+    /// Consulted, not "present in the tree" — since discovery went lazy this
+    /// lists the files on the ancestor chains of resolved paths, plus the
+    /// staged fallbacks, `info/attributes` and the global file. A question
+    /// about every attributes file the tree holds — the `status` note about
+    /// foreign `filter` lines asks exactly that — belongs to
+    /// [`attribute_files_under`], which still walks.
     #[must_use]
     pub fn sources(&self) -> &[PathBuf] {
         &self.sources
@@ -2043,5 +2198,197 @@ mod tests {
 
         // …and it decides when nothing in the repository speaks.
         agrees_with_git(&[], "secrets/db.env", Some("* filter=git-xcrypt\n"));
+    }
+
+    /// The one dimension only lazy discovery can get wrong: the order paths are
+    /// resolved in. Every `.gitattributes` here enters the search at a moment
+    /// decided by which path was asked about first, so a resolver that let the
+    /// discovery order leak into the matching order would answer differently
+    /// per permutation — and differently from git, which has no such order at
+    /// all.
+    ///
+    /// Guards the rebuild-on-discovery design (see [`AttributeResolver`]):
+    /// mutating [`AttributeResolver::probe_ancestors`] to skip directories
+    /// below the root turns every `a/…` answer into the root's and goes red
+    /// against git.
+    #[test]
+    fn the_order_paths_are_resolved_in_never_changes_an_answer() {
+        use std::process::Command;
+
+        let sources = [
+            Source {
+                path: ".gitattributes",
+                body: "* filter=git-xcrypt\n*.env text\n",
+            },
+            Source {
+                path: "a/.gitattributes",
+                body: "*.env -text\n",
+            },
+            Source {
+                path: "a/b/.gitattributes",
+                body: "*.env text\n",
+            },
+            Source {
+                path: ".git/info/attributes",
+                body: "a/b/deep.env -text\n",
+            },
+        ];
+        let paths = ["a/b/deep.env", "top.env", "a/mid.env", "a/c/side.env"];
+        // Deepest first, shallowest first, and a sibling chain in between: the
+        // three ways a chain can be discovered relative to its neighbours.
+        let permutations: [[usize; 4]; 3] = [[0, 1, 2, 3], [1, 2, 3, 0], [3, 0, 2, 1]];
+
+        let dir = tempfile::TempDir::new().expect("temporary directory");
+        let root = dir.path();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(root)
+                .status()
+                .expect("git must be on PATH")
+                .success(),
+            "git init failed"
+        );
+        for source in &sources {
+            let target = root.join(source.path);
+            fs::create_dir_all(target.parent().expect("a parent")).expect("directories");
+            fs::write(&target, source.body).expect("writing an attributes file");
+        }
+        let global = root.join("global-attributes");
+        fs::write(&global, "*.env -filter\n").expect("writing the global attributes file");
+        for path in paths {
+            let target = root.join(path);
+            fs::create_dir_all(target.parent().expect("a parent")).expect("directories");
+            fs::write(&target, b"content\n").expect("writing a subject file");
+        }
+
+        // Git's answer per path, asked the way `agrees_with_git` asks — git
+        // resolves from a stack with no discovery order, so it is the fixed
+        // point every permutation must land on.
+        assert!(
+            Command::new("git")
+                .args(["config", "core.attributesFile"])
+                .arg(&global)
+                .current_dir(root)
+                .status()
+                .expect("git")
+                .success()
+        );
+        let ask = |attribute: &str, path: &str| -> String {
+            let output = Command::new("git")
+                .args(["check-attr", attribute, "--", path])
+                .current_dir(root)
+                .output()
+                .expect("git check-attr");
+            String::from_utf8(output.stdout)
+                .expect("check-attr prints text")
+                .rsplit(": ")
+                .next()
+                .expect("check-attr always prints a value")
+                .trim()
+                .to_string()
+        };
+
+        for ignore_case in [false, true] {
+            assert!(
+                Command::new("git")
+                    .args([
+                        "config",
+                        "core.ignorecase",
+                        if ignore_case { "true" } else { "false" }
+                    ])
+                    .current_dir(root)
+                    .status()
+                    .expect("git")
+                    .success()
+            );
+            for permutation in permutations {
+                let mut resolver = AttributeResolver::new(
+                    root,
+                    &root.join(".git"),
+                    Some(&global),
+                    ignore_case,
+                    Vec::new(),
+                );
+                for at in permutation {
+                    let path = paths[at];
+                    let ours = resolver.resolve(path.as_bytes());
+                    assert_eq!(
+                        ours.filter.as_check_attr(),
+                        ask("filter", path),
+                        "`filter` for {path} depends on the discovery order \
+                         {permutation:?} (core.ignorecase={ignore_case})"
+                    );
+                    let converts = matches!(ask("text", path).as_str(), "set");
+                    assert_eq!(
+                        matches!(ours.conversion, EolConversion::On(_)),
+                        converts,
+                        "`text` for {path} depends on the discovery order \
+                         {permutation:?} (core.ignorecase={ignore_case})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The shape that makes the re-sort in [`AttributeResolver::assemble`]
+    /// load-bearing. On-disk probing always meets an ancestor before its
+    /// descendant, so tree files alone happen to arrive pre-sorted whatever
+    /// the resolve order — a staged fallback does not: it is known from
+    /// construction, joins the list before any on-disk discovery, and only the
+    /// sort puts it back between its neighbours. Drop the sort and the staged
+    /// `a/` copy outranks the on-disk `a/b/` file for paths under `a/b/`.
+    ///
+    /// The expectations are git's check-in semantics — the staged copy of a
+    /// deleted `.gitattributes` decides, measured in `tests/attributes.rs::
+    /// a_dangerous_line_kept_only_in_the_index_still_refuses_after_the_file_is_deleted`
+    /// — hard-coded here because `git check-attr` without `--cached` reads
+    /// only the working tree.
+    #[test]
+    fn a_staged_fallback_keeps_its_place_whatever_the_discovery_order() {
+        use std::process::Command;
+
+        let dir = tempfile::TempDir::new().expect("temporary directory");
+        let root = dir.path();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(root)
+                .status()
+                .expect("git must be on PATH")
+                .success(),
+            "git init failed"
+        );
+        fs::write(root.join(".gitattributes"), "*.env text\n").expect("root attributes");
+        fs::create_dir_all(root.join("a/b")).expect("directories");
+        fs::write(root.join("a/b/.gitattributes"), "*.env text\n").expect("deep attributes");
+        // `a/.gitattributes` exists only as the index copy of a deleted file.
+        let staged = vec![StagedAttributes {
+            path: root.join("a/.gitattributes"),
+            contents: b"*.env -text\n".to_vec(),
+        }];
+
+        // Deep path first and shallow path first: the staged copy's position
+        // must survive both.
+        for order in [["a/b/deep.env", "a/mid.env"], ["a/mid.env", "a/b/deep.env"]] {
+            let mut resolver =
+                AttributeResolver::new(root, &root.join(".git"), None, false, staged.clone());
+            for path in order {
+                let ours = resolver.resolve(path.as_bytes());
+                let expected_conversion = match path {
+                    // The on-disk `a/b/` file is closest and says `text`.
+                    "a/b/deep.env" => true,
+                    // The staged `a/` copy is closest and says `-text`.
+                    "a/mid.env" => false,
+                    _ => unreachable!(),
+                };
+                assert_eq!(
+                    matches!(ours.conversion, EolConversion::On(_)),
+                    expected_conversion,
+                    "the staged fallback lost its place for {path} when paths \
+                     were resolved in the order {order:?}"
+                );
+            }
+        }
     }
 }

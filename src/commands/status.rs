@@ -51,6 +51,7 @@
 //! leak and still prints the rotate-first procedure. See [`Verdict`].
 
 use std::fmt;
+use std::path::PathBuf;
 
 use crate::git::repo::{DRIVER, Repo, git_spelling};
 use crate::rules::declaration::Config;
@@ -1038,9 +1039,10 @@ pub fn run(repo: &Repo, fix: bool) -> Result<Report> {
 
     // Git's own attribute stack, not a search for suspicious lines: the question
     // is what `git check-attr filter` answers for each declared path, and only a
-    // resolution answers it. Built once for the whole run — it reads every
-    // `.gitattributes` in the working tree, and doing that per path would turn a
-    // diagnostic into a walk of the tree squared.
+    // resolution answers it. Built once for the whole run; discovery is lazy —
+    // the resolver probes `.gitattributes` on the ancestor chain of each path it
+    // is asked about, so this command no longer pays for a build directory's
+    // worth of entries it was never going to consult.
     //
     // `core.ignorecase` belongs here and **only** here. This resolver reproduces
     // what git does, so it has to obey the setting git obeys; selection folds
@@ -1049,14 +1051,15 @@ pub fn run(repo: &Repo, fix: bool) -> Result<Report> {
     // resolver exists to detect.
     let ignore_case =
         gitconfig::get(&config, "core.ignorecase").is_some_and(|value| gitconfig::is_true(&value));
+    // Resolved, not read verbatim: `~/` and the XDG default are sources git
+    // honours, and a `text` line in one of them converts the ciphertext.
+    let global_attributes = gitconfig::global_attributes_file(&config);
     let mut filters = attributes::AttributeResolver::new(
         repo.work_tree(),
         // The common directory: `info/` is shared by every checkout, so a linked
         // worktree resolves the *main* `info/attributes` — see the resolver.
         repo.common_dir(),
-        // Resolved, not read verbatim: `~/` and the XDG default are sources git
-        // honours, and a `text` line in one of them converts the ciphertext.
-        gitconfig::global_attributes_file(&config).as_deref(),
+        global_attributes.as_deref(),
         ignore_case,
         // The index copies git falls back to for a deleted `.gitattributes`:
         // check-in reads them, so the verdict has to as well.
@@ -1077,9 +1080,18 @@ pub fn run(repo: &Repo, fix: bool) -> Result<Report> {
         &mut filters,
         &mut report,
     )?;
+    // The note's list is the whole tree, walked deliberately — not the
+    // resolver's consulted sources. The note exists to name an attributes file
+    // that reaches paths the index does not hold yet, and such a file can sit
+    // in a directory with no tracked path — exactly the file a lazy resolver
+    // never visits. The walk's cost lands on this diagnostic command alone;
+    // the filter's hot path never runs it.
+    let mut note_sources = attributes::attribute_files_under(repo.work_tree());
+    note_sources.push(repo.common_dir().join("info").join("attributes"));
+    note_sources.extend(global_attributes.clone());
     report.notes.extend(foreign_source_note(
         repo,
-        &filters,
+        &note_sources,
         report
             .setup
             .iter()
@@ -1400,11 +1412,11 @@ fn display_culprit(repo: &Repo, culprit: &attributes::Culprit) -> String {
 /// the honest boundary of a check that resolves only the paths git is tracking.
 fn foreign_source_note(
     repo: &Repo,
-    filters: &attributes::AttributeResolver,
+    sources: &[PathBuf],
     reached_a_declared_path: bool,
 ) -> Vec<String> {
     let mut notes = Vec::new();
-    for source in filters.sources() {
+    for source in sources {
         let Ok(lines) = attributes::foreign_lines_touching(source, &["filter"]) else {
             continue;
         };
