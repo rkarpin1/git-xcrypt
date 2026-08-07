@@ -3,7 +3,7 @@ project: "git-xcrypt"
 version: 1
 status: active
 created: 2026-08-03
-updated: 2026-08-04
+updated: 2026-08-07
 prd_version: 1
 main_goal: learn
 top_blocker: decisions
@@ -39,7 +39,7 @@ Produkt rozstrzyga na podstawie wzorców ścieżek, które pliki opuszczają mas
 | S-04  | lock-repository              | zamknąć odblokowane repozytorium z powrotem                              | S-03          | FR-009                 | done     |
 | S-05  | decrypted-diff               | oglądać różnice na treści jawnej                                         | S-01          | FR-006                 | done     |
 | S-06  | encryption-status-check      | sprawdzić, co jest szyfrowane, a co powinno być                          | S-02          | FR-010                 | done     |
-| S-07  | cross-platform-binaries      | pobrać gotową binarkę dla swojej platformy                               | S-01, S-08    | FR-011                 | proposed |
+| S-07  | cross-platform-binaries      | pobrać gotową binarkę dla swojej platformy                               | S-01, S-08    | FR-011                 | done     |
 | S-08  | binary-detection-parity      | dostać ten sam werdykt tekst/binarny co git, także na pliku z `SUB`     | S-01          | §NFR (trzy platformy)  | done     |
 
 ## Streams
@@ -51,7 +51,7 @@ Pomoc nawigacyjna — grupuje elementy dzielące łańcuch wymagań wstępnych. 
 | A      | Rdzeń szyfrowania        | `F-01` → `S-01` → `S-03` → `S-04`    | Ścieżka gwiazdy przewodniej; niosła całe ryzyko techniczne celu `learn`. **Zamknięta 2026-08-04** — cały łańcuch zrobiony i przejrzany. |
 | B      | Konfiguracja i widoczność | `S-02` → `S-06`                      | Dołącza do Strumienia A w `S-01`. **Zamknięta 2026-08-04** — obie decyzje (rozjazd konfiguracji, głębokość skanu) zapadły i są zaimplementowane. |
 | C      | Narzędzia pracy          | `S-05`                               | Dołącza do A w `S-01`. **Zamknięta 2026-08-04**; jedyny element bez własnej niewiadomej — ale plan i tak trafił w błędne założenie o `textconv`, sprostowane pomiarem. |
-| D      | Dystrybucja              | `S-08` → `S-07`                      | Dołącza do A w `S-01`. **Jedyny otwarty strumień**, i został w nim wyłącznie `S-07`. `S-08` zamknięty 2026-08-04, czyli w wymaganej kolejności: `looks_binary` zamraża się z pierwszym publicznym wydaniem. Nazwa i licencja rozstrzygnięte 2026-08-04. |
+| D      | Dystrybucja              | `S-08` → `S-07`                      | **Zamknięta 2026-08-07** wydaniem `v0.1.0`. `S-08` wszedł 2026-08-04, czyli w wymaganej kolejności: `looks_binary` zamraża się z pierwszym publicznym wydaniem. Nazwa i licencja rozstrzygnięte 2026-08-04. Poza tagiem zostają świadomie crates.io i tap Homebrew — kanały dystrybucji, nie warunki wydania. |
 
 ## Baseline
 
@@ -189,7 +189,9 @@ Fundament poniżej zakłada ten stan i nie tworzy ponownie niczego, co jest zgł
   - ~~Jaka nazwa crate'a i binarki wobec kolizji z oryginalnym `git-crypt` w menedżerach pakietów?~~ Rozstrzygnięte 2026-08-04: `git-xcrypt`. — Właściciel: użytkownik. Blokuje: nie.
   - ~~Jaka licencja projektu wobec GPL-3.0 projektów inspirujących?~~ Rozstrzygnięte 2026-08-04: `MIT OR Apache-2.0`, teksty licencji w repozytorium. — Właściciel: użytkownik. Blokuje: nie.
 - **Risk:** publikacja pod kolidującą nazwą albo bez rozstrzygniętej licencji jest trudna do wycofania — obie decyzje musiały zapaść przed pierwszym publicznym wydaniem i zapadły 2026-08-04. Sama technika jest tu najprostsza w całej roadmapie; pozostaje pilnować, by `cargo deny check licenses` w CI nie wpuściło zależności copyleft, która unieważniłaby wybór.
-- **Status:** proposed
+- **Wydane 2026-08-07: tag `v0.1.0`, przebieg `31211254819`.** Wszystkie siedem zadań zielone, w tym `verify-version` (tag zgodny z `Cargo.toml`), którego próba `workflow_dispatch` nie ćwiczy. Opublikowane dziesięć artefaktów: pięć archiwów (`aarch64`/`x86_64` macOS, `aarch64`/`x86_64` Linux musl, `x86_64` Windows MSVC) i pięć sum SHA-256. Sprawdzone jako odbiorca, nie założone: pobrane archiwum przechodzi `shasum -a 256 -c` i `gh attestation verify … --repo rkarpin1/git-xcrypt` kodem `0`, atestacja wiąże je z `refs/tags/v0.1.0` i commitem `56e130b`, a binarka z archiwum uruchamia się i podaje `git-xcrypt 0.1.0`.
+- **Co z tego elementu zostaje otwarte, świadomie:** publikacja na crates.io (nazwa `git-xcrypt` nadal wolna; `cargo publish --dry-run` przechodzi — 60 plików, 320,6 KiB) oraz tap Homebrew (wymaga własnego repozytorium tapa). Żadne z nich nie było warunkiem wydania binarek, czyli tego, co obiecuje FR-011; obie są rozszerzeniem kanałów dystrybucji i mogą wejść bez tagu. Otwarta zostaje też odtwarzalność builda — zapisana w `zalozenia.md` §Otwarte decyzje poz. 14 i w `README.md`, celowo nie jako warunek wydania.
+- **Status:** done
 
 ### S-08: Zgodność wykrywania plików binarnych z gitem
 
@@ -222,12 +224,12 @@ Fundament poniżej zakłada ten stan i nie tworzy ponownie niczego, co jest zgł
 
 ## Backlog Handoff
 
-Do wzięcia został jeden element: `S-07`. `S-08` zamknięty 2026-08-04, w wymaganej kolejności — reguła tekst/binarny zamraża się z pierwszym publicznym wydaniem, więc musiał wejść wcześniej.
+Backlog v0.1 jest **pusty** — `S-07` zamknięty 2026-08-07 wydaniem `v0.1.0`, jako ostatni. `S-08` wszedł przed nim 2026-08-04, w wymaganej kolejności: reguła tekst/binarny zamraża się z pierwszym publicznym wydaniem. Co zostało poza roadmapą v0.1: publikacja na crates.io i tap Homebrew (kanały dystrybucji), plus pozycje z `## Parked`.
 
 | Roadmap ID | Change ID                    | Sugerowany tytuł zadania                            | Gotowe do `/10x-plan` | Uwagi                                       |
 | ---------- | ---------------------------- | --------------------------------------------------- | --------------------- | ------------------------------------------- |
 | S-08       | binary-detection-parity      | Zgodność wykrywania plików binarnych z gitem        | zrobione              | Zamknięte 2026-08-04, przed `S-07` — termin dotrzymany |
-| S-07       | cross-platform-binaries      | Binarki dla Windows, macOS i Linuksa                | tak                   | **Jedyny otwarty element** — `S-08` zamknięty, więc nic go już nie blokuje. CI, pipeline wydania i metadane publikacyjne powstały przy przeglądzie końcowym, podpisywanie rozstrzygnięte 2026-08-05 na atestacje GitHuba; zostaje tap Homebrew, crates.io i pierwszy tag |
+| S-07       | cross-platform-binaries      | Binarki dla Windows, macOS i Linuksa                | zrobione              | Wydane 2026-08-07 tagiem `v0.1.0` (przebieg `31211254819`): pięć archiwów z sumami i atestacją, weryfikacja odbiorcy sprawdzona. Otwarte świadomie i poza wydaniem: crates.io, tap Homebrew |
 | F-01       | git-integration-test-harness | Harness testów na prawdziwym repozytorium git       | zrobione              | Zarchiwizowane 2026-08-04                   |
 | S-01       | transparent-encrypt-decrypt  | Przezroczyste szyfrowanie w jednym repozytorium     | zrobione              | Zaimplementowane i przejrzane dwukrotnie 2026-08-04 |
 | S-02       | gitignore-style-config       | Konfiguracja w składni .gitignore                   | zrobione              | Zaimplementowane i przejrzane dwukrotnie 2026-08-04 |
@@ -268,6 +270,7 @@ Do wzięcia został jeden element: `S-07`. `S-08` zamknięty 2026-08-04, w wymag
 - **S-05: oglądać różnice na treści jawnej** — Zarchiwizowano 2026-08-04 → `context/archive/2026-08-04-decrypted-diff/` (status `archived`, dwa przebiegi przeglądu). Lekcja: założenie planu o tym, co git podaje sterownikowi `textconv`, było błędne i wyszło dopiero z pomiaru — sterownik dostaje plaintext, bo obie strony różnicy przechodzą wcześniej przez smudge. Druga lekcja: nazwa pliku jest wejściem od użytkownika także dla naszego własnego parsera argumentów — plik `--help` kazał gitowi wyrenderować tekst pomocy jako treść.
 - **S-06: sprawdzić, co jest szyfrowane, a co powinno być** — Zarchiwizowano 2026-08-04 → `context/archive/2026-08-04-encryption-status-check/` (status `archived`, dwa przebiegi przeglądu plus sondy na repozytoriach nietypowych: SHA-256, podzielony indeks, paczki, podłączony worktree, bare, płytki klon). Lekcja: domyślne wartości bibliotek gitoxide zakładają SHA-1 i asertują — w repozytorium SHA-256 panika sięgała nie tylko komendy, ale i filtra na ścieżce check-in, więc przy `required = true` przewracała każdą operację gita. Nierozstrzygnięte przy zamknięciu: widoczność `stderr` filtra w oknie Git w JetBrains.
 - **S-08: dostać ten sam werdykt tekst/binarny co git, także na pliku z `SUB`** — Ukończono 2026-08-04, **przed `S-07`**, czyli w wymaganym terminie: `looks_binary` zamraża się z pierwszym publicznym wydaniem, więc po nim ta jedna linia przestałaby być poprawką, a stałaby się zmianą przepisującą ciphertext istniejących plików i wymagającą nowego `suite`. Lekcja: parytet z gitem trzeba weryfikować wobec **całej** funkcji źródłowej — brakująca korekta siedziała w trzech ostatnich liniach `gather_stats`, za pętlą, którą port odtwarzał wiernie. Wektory formatu tego nie łapały: żaden z istniejących nie kończył się bajtem `0x1A`.
+- **S-07: pobrać gotową binarkę dla swojej platformy** — Wydane 2026-08-07, tag `v0.1.0`, przebieg `31211254819`; element bez folderu zmiany, więc bez archiwizacji. Pięć targetów, dziesięć artefaktów, atestacja proweniencji na każdym archiwum. Lekcja: „pipeline nigdy nie uruchomiony" bywa nieprawdą, którą utrwala sama dokumentacja — `roadmap.md` twierdziła, że krok atestacji czeka na pierwszy tag, podczas gdy `workflow_dispatch` wykonał go już 2026-08-05. Druga: próba dowodzi tylko tego, co naprawdę wykonuje — wejście `tag` było `required` i nieczytane, więc dry run nazywał archiwa od gałęzi i nie ćwiczył nazewnictwa, na którym stoi wydanie.
 
 Po zamknięciu `S-06` całość przeszła przez przegląd końcowy w trzech rundach. Raporty nie są już wersjonowane — ich treść odtwarza `git show <sha>` z commitów, które je wprowadziły:
 

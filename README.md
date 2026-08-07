@@ -504,9 +504,10 @@ exits 0, and the first thing that would have told you was the failed checkout.
   this repository passes the flag through `.cargo/config.toml`. Cargo reads that
   file from the directory it is invoked in and never from the crate it is
   compiling, so release binaries and builds from a clone run the hardware
-  backend while `cargo install git-xcrypt` from the registry runs the software
-  one — measured at roughly 15× slower on a large file. §Building has the flag
-  to pass if you want it anyway. Not one stored byte differs between the two.
+  backend while an install from a registry would run the software one —
+  measured at roughly 15× slower on a large file. The crate is not on crates.io
+  today, so this bites nobody yet; §Building has the flag to pass when it does.
+  Not one stored byte differs between the two.
 - **Real git only.** The filter is registered under the long-running protocol
   (`filter.<driver>.process`). Clients that reimplement git rather than calling
   it — JGit, and tools built on libgit2 — may not speak it and may treat the
@@ -590,11 +591,11 @@ On **aarch64** — Apple Silicon and aarch64 Linux — the hardware AES instruct
 sit behind an opt-in flag in the cipher crate, and `.cargo/config.toml` in this
 repository passes it. Cargo reads that file from the directory it is *invoked*
 in, so a build from a clone gets the flag and so do the published release
-binaries; `cargo install git-xcrypt` from the registry does **not**, even though
-the file is packaged inside the crate. Measured on `aarch64-apple-darwin`,
-`--release`: an 8 MB blob through `git-xcrypt diff` takes 148 ms without it and
-9 ms with it. To install from the registry on aarch64 and still get that, take a
-release binary, or pass the flag yourself:
+binaries; an install from a registry would **not**, even though the file is
+packaged inside the crate. Measured on `aarch64-apple-darwin`, `--release`: an
+8 MB blob through `git-xcrypt diff` takes 148 ms without it and 9 ms with it. So
+on aarch64, take a release binary or build from a clone. The crate is not on
+crates.io today; when it is, that route needs the flag passed by hand:
 
 ```sh
 RUSTFLAGS="--cfg aes_armv8" cargo install git-xcrypt
