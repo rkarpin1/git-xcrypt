@@ -982,8 +982,9 @@ fn collect_attribute_files(root: &Path, out: &mut Vec<PathBuf>) {
 /// answer: the `status` note about foreign `filter` lines exists precisely to
 /// name an attributes file that reaches paths the index does not hold yet —
 /// a file that may sit in a directory with no tracked path, which is exactly
-/// the file no ancestor probe would ever visit. The sort mirrors the order the
-/// resolver reports sources in, so the note reads the same as it always did.
+/// the file no ancestor probe would ever visit. The sort is the resolver's own
+/// precedence order — shallowest first — so the note reads the same as it did
+/// when the resolver's source list fed it.
 #[must_use]
 pub fn attribute_files_under(work_tree: &Path) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = Vec::new();
@@ -1446,7 +1447,6 @@ pub struct AttributeResolver {
     search: gix_attributes::Search,
     outcome: gix_attributes::search::Outcome,
     case: gix_glob::pattern::Case,
-    sources: Vec<PathBuf>,
     /// The working tree the ancestor probes are anchored to.
     work_tree: PathBuf,
     /// `$GIT_COMMON_DIR/info/attributes`, re-added last on every rebuild.
@@ -1497,7 +1497,7 @@ impl AttributeResolver {
     ) -> Self {
         let info = common_dir.join("info").join("attributes");
         // No walk: the tree's files enter through the probes in [`Self::resolve`].
-        let (search, outcome, sources) = Self::assemble(work_tree, global, &staged, &[], &info);
+        let (search, outcome) = Self::assemble(work_tree, global, &staged, &[], &info);
         Self {
             search,
             outcome,
@@ -1506,7 +1506,6 @@ impl AttributeResolver {
             } else {
                 gix_glob::pattern::Case::Sensitive
             },
-            sources,
             work_tree: work_tree.to_path_buf(),
             info,
             global: global.map(Path::to_path_buf),
@@ -1529,11 +1528,7 @@ impl AttributeResolver {
         staged: &[StagedAttributes],
         on_disk: &[PathBuf],
         info: &Path,
-    ) -> (
-        gix_attributes::Search,
-        gix_attributes::search::Outcome,
-        Vec<PathBuf>,
-    ) {
+    ) -> (gix_attributes::Search, gix_attributes::search::Outcome) {
         let mut collection = gix_attributes::search::MetadataCollection::default();
         let mut buf: Vec<u8> = Vec::new();
         let mut search = gix_attributes::Search::new_globals(
@@ -1563,7 +1558,6 @@ impl AttributeResolver {
         // against `a/.g` by depth in every alphabet.
         tree_sources.sort_by_key(|(path, _)| (path.components().count(), path.to_path_buf()));
 
-        let mut sources: Vec<PathBuf> = Vec::new();
         for (source, contents) in tree_sources {
             // Macros only where git takes them: the root file. Anywhere deeper a
             // `[attr]` line is an ordinary pattern to git.
@@ -1587,7 +1581,6 @@ impl AttributeResolver {
                     is_root,
                 ),
             }
-            sources.push(source.to_path_buf());
         }
 
         // Last, so it outranks every file in the working tree — which is exactly
@@ -1600,11 +1593,6 @@ impl AttributeResolver {
             &mut collection,
             true,
         );
-        sources.push(info.to_path_buf());
-        // Reported alongside the rest even though it was loaded first: a global
-        // file that silently unsets `filter` is a source a reader has to be told
-        // about, whatever its precedence.
-        sources.extend(global.map(Path::to_path_buf));
 
         let mut outcome = gix_attributes::search::Outcome::default();
         // Order matters: `iter_selected` yields one item per name, in this
@@ -1614,7 +1602,7 @@ impl AttributeResolver {
         // crlf` line converted a ciphertext with no gate firing anywhere.
         outcome.initialize_with_selection(&collection, ["filter", "text", "eol", "crlf"]);
 
-        (search, outcome, sources)
+        (search, outcome)
     }
 
     /// Probes `.gitattributes` in every not-yet-probed ancestor of the path.
@@ -1622,13 +1610,30 @@ impl AttributeResolver {
     /// The probe is per file and by name — `symlink_metadata(...).is_file()`,
     /// a symlinked file excluded — exactly the probe the eager walk used, so on
     /// APFS and NTFS a file *stored* as `.GITATTRIBUTES` is still found the way
-    /// git finds it. What the walk had and this does not is the exclusion of
-    /// symlinked *directories*: git itself opens `<dir>/.gitattributes` through
-    /// whatever path it was asked about, and the paths git asks about do not
-    /// run through directory symlinks (content under one is not tracked as
-    /// paths under it), so the difference is theoretical — and in git's
-    /// direction.
+    /// git finds it. Two differences from the walk, both in git's direction:
+    ///
+    /// * **Symlinked directories** are no longer excluded: git itself opens
+    ///   `<dir>/.gitattributes` through whatever path it was asked about, and
+    ///   the paths git asks about do not run through directory symlinks
+    ///   (content under one is not tracked as paths under it), so the
+    ///   difference is theoretical.
+    /// * **Directory spelling**: the walk found `secrets/.gitattributes` in a
+    ///   listing and, under `Case::Fold`, matched it against `SECRETS/db.env`
+    ///   even on a case-sensitive filesystem; the probe asks for the queried
+    ///   path's own spelling and finds nothing there — exactly as git, which
+    ///   builds its stack from the spelling it was asked about. Do not "fix"
+    ///   this back toward the walk.
     fn probe_ancestors(&mut self, relative_path: &[u8]) {
+        // This is the one place the path's bytes become a *filesystem* path
+        // rather than matcher input, so it inherits — and here enforces — the
+        // resolver's assumption that paths are repository-relative and
+        // normalised, as git's `pathname=` and index entries are. A leading
+        // slash would make `Path::join` replace the base outright and probe
+        // outside the working tree; refusing to probe merely reproduces the
+        // pre-discovery behaviour for a path no real git produces.
+        if relative_path.first() == Some(&b'/') {
+            return;
+        }
         let mut discovered = false;
         let root: &[u8] = b"";
         let ancestors = std::iter::once(root).chain(
@@ -1655,7 +1660,7 @@ impl AttributeResolver {
             }
         }
         if discovered {
-            let (search, outcome, sources) = Self::assemble(
+            let (search, outcome) = Self::assemble(
                 &self.work_tree,
                 self.global.as_deref(),
                 &self.staged,
@@ -1664,7 +1669,6 @@ impl AttributeResolver {
             );
             self.search = search;
             self.outcome = outcome;
-            self.sources = sources;
         }
     }
 
@@ -1744,21 +1748,15 @@ impl AttributeResolver {
             },
         }
     }
-
-    /// Every attributes file this resolver has **consulted**, in precedence
-    /// order.
-    ///
-    /// Consulted, not "present in the tree" — since discovery went lazy this
-    /// lists the files on the ancestor chains of resolved paths, plus the
-    /// staged fallbacks, `info/attributes` and the global file. A question
-    /// about every attributes file the tree holds — the `status` note about
-    /// foreign `filter` lines asks exactly that — belongs to
-    /// [`attribute_files_under`], which still walks.
-    #[must_use]
-    pub fn sources(&self) -> &[PathBuf] {
-        &self.sources
-    }
 }
+
+// There is deliberately no `sources()` accessor. There was one while discovery
+// was eager — it listed every attributes file in the tree, and the `status`
+// note about foreign `filter` lines was its one consumer. Lazy discovery would
+// have narrowed it to the files on resolved chains, which is exactly the list
+// that note must not be built from, so the note reads
+// [`attribute_files_under`] instead and the accessor lost its last caller —
+// removed 2026-08-07, the way this project removes code without an owner.
 
 /// The configuration keys `init` writes, for `status` to check for completeness.
 ///
@@ -2233,10 +2231,20 @@ mod tests {
                 body: "a/b/deep.env -text\n",
             },
         ];
-        let paths = ["a/b/deep.env", "top.env", "a/mid.env", "a/c/side.env"];
+        // `notes.txt` is the guard for the global file surviving a rebuild:
+        // its `eol` answer comes from the global file alone, so a rebuild that
+        // dropped `self.global` would change it — every other global entry
+        // here is outranked by the repository and would not notice the loss.
+        let paths = [
+            "a/b/deep.env",
+            "top.env",
+            "a/mid.env",
+            "a/c/side.env",
+            "notes.txt",
+        ];
         // Deepest first, shallowest first, and a sibling chain in between: the
         // three ways a chain can be discovered relative to its neighbours.
-        let permutations: [[usize; 4]; 3] = [[0, 1, 2, 3], [1, 2, 3, 0], [3, 0, 2, 1]];
+        let permutations: [[usize; 5]; 3] = [[0, 1, 2, 3, 4], [4, 1, 2, 3, 0], [3, 0, 4, 2, 1]];
 
         let dir = tempfile::TempDir::new().expect("temporary directory");
         let root = dir.path();
@@ -2255,7 +2263,8 @@ mod tests {
             fs::write(&target, source.body).expect("writing an attributes file");
         }
         let global = root.join("global-attributes");
-        fs::write(&global, "*.env -filter\n").expect("writing the global attributes file");
+        fs::write(&global, "*.env -filter\n*.txt eol=crlf\n")
+            .expect("writing the global attributes file");
         for path in paths {
             let target = root.join(path);
             fs::create_dir_all(target.parent().expect("a parent")).expect("directories");
@@ -2319,11 +2328,38 @@ mod tests {
                         "`filter` for {path} depends on the discovery order \
                          {permutation:?} (core.ignorecase={ignore_case})"
                     );
-                    let converts = matches!(ask("text", path).as_str(), "set");
+                    // The same reconstruction `agrees_with_git` uses: `text`
+                    // first, the legacy `crlf` as its fallback, and a bare
+                    // `eol=` promoting conversion when both say nothing —
+                    // `notes.txt` is exactly that last shape.
+                    let (text, eol_answer, crlf) =
+                        (ask("text", path), ask("eol", path), ask("crlf", path));
+                    let action = |value: &str| match value {
+                        "set" | "input" => Some(true),
+                        "unset" | "auto" => Some(false),
+                        _ => None,
+                    };
+                    let converts = action(&text)
+                        .or_else(|| action(&crlf))
+                        .unwrap_or(matches!(eol_answer.as_str(), "lf" | "crlf"));
                     assert_eq!(
                         matches!(ours.conversion, EolConversion::On(_)),
                         converts,
-                        "`text` for {path} depends on the discovery order \
+                        "conversion for {path} depends on the discovery order \
+                         {permutation:?} (core.ignorecase={ignore_case})"
+                    );
+                    // Exact only because no source here says `text=input` —
+                    // that value makes the resolver promote an unspecified
+                    // `eol` to `lf` where `git check-attr eol` still answers
+                    // `unspecified`.
+                    let eol = match ours.eol {
+                        DeclaredEol::Lf => "lf",
+                        DeclaredEol::Crlf => "crlf",
+                        DeclaredEol::Unspecified => "unspecified",
+                    };
+                    assert_eq!(
+                        eol, eol_answer,
+                        "`eol` for {path} depends on the discovery order \
                          {permutation:?} (core.ignorecase={ignore_case})"
                     );
                 }
