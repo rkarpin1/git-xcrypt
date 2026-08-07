@@ -275,6 +275,22 @@ fn a_forgotten_sync_fails_the_gate_and_running_it_reaches_the_whole_subtree() {
         String::from_utf8_lossy(&stale.stderr)
     );
 
+    // …and `sync`'s own help has to name that number, provoked rather than
+    // spelled out — the same rule `tests/odd_repositories.rs` applies to
+    // `status`, and for the same reason: a flag's description is where a person
+    // writing a CI job looks the code up, and it is the one part of a program
+    // nothing checks. Measured on 2026-08-07, the day after the code became `2`:
+    // `git-xcrypt sync --help` still said "Exits 0 when it is current and 1 when
+    // it is not", while the binary's own `--help` epilogue said `2`. A job
+    // written from the flag's documentation tests for `1` and never fires.
+    let code = stale.status.code().expect("sync --check reports a code");
+    let help = String::from_utf8(repo.xcrypt(["sync", "--help"]).stdout).expect("help is text");
+    assert!(
+        help.contains(&format!("`{code}`")),
+        "`sync --check` exits {code} on a stale section and its own help never \
+         mentions that number:\n{help}"
+    );
+
     // `2`, not `1`, since 2026-08-06 — open decision 11. Code `1` carried five
     // answers at once, a mistyped flag among them, so a CI job could not tell
     // "the section is stale" from "you called me wrong" and the two need

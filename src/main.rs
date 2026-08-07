@@ -65,7 +65,11 @@ enum Command {
     Sync {
         /// Report whether the section is out of date instead of writing it.
         ///
-        /// Exits 0 when it is current and 1 when it is not, for use as a CI gate.
+        /// Exits `0` when it is current and `2` when it is not, for use as a CI
+        /// gate. `2` rather than `1` since 2026-08-06: a stale section is a
+        /// configuration that does not enforce what it declares, which is what
+        /// the frozen table's `2` means and what `git-xcrypt status` answers on
+        /// the very same state.
         #[arg(long)]
         check: bool,
 
@@ -587,10 +591,12 @@ fn status_and_describe(fix: bool) -> Result<ExitCode> {
 /// stale section is an answer, not a failure — the command did exactly what it
 /// was asked to.
 ///
-/// Code `1` is shared with "usage error or unclassified failure" from the frozen
-/// table, so a CI gate cannot tell a stale section from an unreadable file by
-/// the code alone; the message says which it is. The table has no spare code and
-/// `5` means an exposure, which a cosmetic section is not.
+/// That answer is code `2` since 2026-08-06, not `1` — open decision 11. Code
+/// `1` carried five meanings here, a mistyped flag among them, so a CI gate
+/// could not tell "the section is stale" from "you called me wrong", and the two
+/// need opposite repairs. `2` is the frozen table's "configuration or a state
+/// conflict", which is what a section that no longer covers every declared path
+/// is, and it is what `status` answers on the same state.
 fn run_sync(check: bool, global: bool, ignorecase: bool) -> ExitCode {
     match sync_and_describe(check, global, ignorecase) {
         Ok(code) => code,
