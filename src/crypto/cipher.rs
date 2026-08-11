@@ -9,8 +9,23 @@ use aes_siv::KeyInit;
 use aes_siv::siv::Aes256Siv;
 
 use crate::crypto::format::{Header, KEY_ID_LEN, SUITE_AES_256_SIV};
-use crate::crypto::key::MasterKey;
+use crate::crypto::key::{MasterKey, SuiteKey};
 use crate::{Error, Result};
+
+/// Borrows a suite key as the cipher's own key type.
+///
+/// Both lengths are compile-time constants and both are 64 — `SIV_KEY_LEN` here
+/// and `Aes256Siv`'s key size in `aes-siv` — so this cannot fail today. It is
+/// written as an error rather than an `expect` because the two constants live
+/// in different crates: if a future suite ever moves one without the other, the
+/// right answer is a refused file, not a panic in the middle of a git
+/// operation, where `required = true` turns an abort into a broken repository.
+fn cipher_key(key: &SuiteKey) -> Result<&aes_siv::Key<Aes256Siv>> {
+    key.expose_bytes()
+        .as_slice()
+        .try_into()
+        .map_err(|_| Error::Crypto("the suite key does not fit the cipher".into()))
+}
 
 /// Encrypts `plaintext`, recording `flags` in the authenticated header.
 ///
@@ -26,7 +41,7 @@ pub fn encrypt(key: &MasterKey, flags: u8, plaintext: &[u8]) -> Result<Vec<u8>> 
     let header = Header::new(flags, key.key_id()).to_bytes();
     let suite_key = key.suite_key(SUITE_AES_256_SIV)?;
 
-    let mut cipher = Aes256Siv::new(suite_key.expose_bytes().as_slice().into());
+    let mut cipher = Aes256Siv::new(cipher_key(&suite_key)?);
     let sealed = cipher
         .encrypt([header.as_slice()], plaintext)
         .map_err(|_| Error::Crypto("encryption failed".into()))?;
@@ -61,7 +76,7 @@ pub fn decrypt(key: &MasterKey, blob: &[u8]) -> Result<(u8, Vec<u8>)> {
     // rebuild from expected values — rebuilding would hide a tampered byte.
     let (header_bytes, body) = blob.split_at(crate::crypto::format::HEADER_LEN);
 
-    let mut cipher = Aes256Siv::new(suite_key.expose_bytes().as_slice().into());
+    let mut cipher = Aes256Siv::new(cipher_key(&suite_key)?);
     let plaintext = cipher
         .decrypt([header_bytes], body)
         .map_err(|_| Error::Crypto("authentication failed; the file has been altered".into()))?;
@@ -193,13 +208,13 @@ mod tests {
         let plaintext = hex_bytes("112233445566778899aabbccddee");
         let expected = hex_bytes("85632d07c6e8f37f950acd320a2ecc9340c02b9690c4dc04daef7f6afe5c");
 
-        let mut cipher = Aes128Siv::new(key.as_slice().into());
+        let mut cipher = Aes128Siv::new(key.as_slice().try_into().expect("a 32-byte RFC key"));
         let sealed = cipher
             .encrypt([associated_data.as_slice()], plaintext.as_slice())
             .expect("the RFC vector must encrypt");
         assert_eq!(sealed, expected, "aes-siv diverged from RFC 5297");
 
-        let mut cipher = Aes128Siv::new(key.as_slice().into());
+        let mut cipher = Aes128Siv::new(key.as_slice().try_into().expect("a 32-byte RFC key"));
         let recovered = cipher
             .decrypt([associated_data.as_slice()], sealed.as_slice())
             .expect("the RFC vector must decrypt");

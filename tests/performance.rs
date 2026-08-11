@@ -57,8 +57,8 @@ const SMALL_FILES: usize = 2000;
 const SMALL_SIZE: usize = 4096;
 
 /// One large blob through `diff`, where the cipher is the whole measurement.
-/// The same size the `aes_armv8` decision was measured at, so the two numbers
-/// can be compared directly.
+/// The same size the aarch64 backend decision was measured at, so the two
+/// numbers can be compared directly.
 const CIPHER_BYTES: usize = 8 * 1024 * 1024;
 
 /// Best of this many runs. The **minimum**, not the median: every source of
@@ -199,19 +199,23 @@ fn encrypting_a_small_file_stays_within_its_per_file_budget() {
 ///
 /// `diff` has no git in the loop — it decrypts a blob and writes it out — so the
 /// crypto is the measurement rather than 5% of it. This is the same instrument
-/// the `aes_armv8` decision used (8 MB in 148 ms software, 9 ms hardware).
+/// the aarch64 backend decision used (8 MB in 148 ms software, 9 ms hardware).
 ///
 /// Budget: **2 ns per byte**, about 500 MB/s, against roughly 1.1 ns/B measured
-/// on this machine. Being an absolute rate it is hardware-dependent, which is
-/// acceptable for a test a person runs deliberately and not acceptable for CI —
-/// one more reason this file is `#[ignore]`d.
+/// on `aarch64-apple-darwin`. Being an absolute rate it is hardware-dependent,
+/// which is acceptable for a test a person runs deliberately and not acceptable
+/// for CI — one more reason this file is `#[ignore]`d. **It is calibrated for
+/// that machine and does not hold everywhere:** on a Windows x86-64 development
+/// box the same 8 MB takes ~33 ms, and process spawn plus 8 MB down a pipe is a
+/// large share of it, so the number read there is the harness as much as the
+/// cipher. Compare a run against the previous run on the *same* machine; the
+/// absolute threshold means something on the platform it was measured on.
 ///
-/// The regression it exists for is named and real: `.cargo/config.toml` passes
-/// `--cfg aes_armv8`, and without it `aes` falls back to the bitsliced backend.
-/// Verified to bite — `RUSTFLAGS=" " cargo test --release …` drops the flag and
-/// fails this assertion. That flag does **not** travel with `cargo install
-/// git-xcrypt` from crates.io, so this is also the check to run after any bump
-/// of `aes-siv`.
+/// The regression it exists for is named and real: `aes` selects its backend
+/// per target, so a bump, a target change or a forced `aes_backend="soft"` can
+/// silently drop AES to the bitsliced software path. Verified to bite —
+/// `RUSTFLAGS='--cfg aes_backend="soft"' cargo test --release …` fails this
+/// assertion. Run it after any bump of `aes-siv` or `aes`.
 #[test]
 #[ignore = "timing; run deliberately with --release, see the module comment"]
 fn the_cipher_stays_within_its_per_byte_budget() {
@@ -255,8 +259,9 @@ fn the_cipher_stays_within_its_per_byte_budget() {
     assert!(
         per_byte <= 2.0,
         "the cipher runs at {per_byte:.2} ns/byte ({:.0} MB/s), over the 2 ns \
-         budget in PRD §Non-Functional Requirements. Check that `--cfg \
-         aes_armv8` still reaches the `aes` crate on this target.",
+         budget in PRD §Non-Functional Requirements. Check that `aes` picked a \
+         hardware backend on this target — `aes::hardware_accelerated()` \
+         answers it — and that the budget was calibrated for this machine.",
         1000.0 / per_byte
     );
 }
