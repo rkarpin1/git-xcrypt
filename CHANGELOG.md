@@ -11,6 +11,67 @@ exist in someone's history — so those are listed under their own heading, and 
 release that changed any of them without a new `suite` byte would be a bug, not
 a minor version.
 
+## [0.1.1] - 2026-08-11
+
+Bug fixes and one dependency change. **Nothing about the bytes moved**: the
+encrypted file format, the key file format and the text/binary rule are exactly
+those frozen with 0.1.0, and the frozen vectors reproduce byte for byte under
+the new cipher crate. A repository encrypted with 0.1.0 needs nothing done to
+it.
+
+### Fixed
+
+- **A declared path no longer has its line endings changed when nothing asked
+  for a conversion.** With `core.autocrlf` false or unset and `core.eol` unset -
+  git's own default, and the one configuration in which git converts nothing - a
+  checkout now writes the stored bytes back unchanged instead of the platform's
+  own ending. Before this, declaring a file secret changed it, in opposite
+  directions on the two platforms: measured on git 2.55, a CRLF file came back
+  LF on Linux and an LF file came back CRLF on Windows, while the identical
+  undeclared file beside it was untouched, and `git status` stayed clean
+  throughout. An explicit `core.eol=native`, or `eol=native` on the pattern,
+  still selects the platform. The check-in half is unchanged and remains a
+  documented limit: a file brought in with CRLF still comes back LF, because
+  `clean` normalises before the header can record which ending was there.
+- **`git -c core.autocrlf=...` reaches the filter.** Git passes command-line
+  overrides to child processes through `GIT_CONFIG_PARAMETERS`, which was not
+  being read, so one command could give two answers - measured, with the file
+  saying false and the command saying true, `git checkout` expanded the paths
+  git owns to CRLF and left declared ones at LF, in adjacent directories.
+  Anything unparsable is ignored rather than guessed at, leaving the
+  configuration files as authoritative as before.
+- **`lock` refuses over a leftover file it cannot identify, instead of deleting
+  the key.** A temporary name is `<target>.git-xcrypt-<hex>.tmp`, and above a
+  223-byte target the name is cut to fit the filesystem's 255-byte limit, so it
+  no longer identifies what it was named after. Measured: with `*.env` declared
+  and a 230-byte file name, `lock` announced success, deleted the key and exited
+  0 over a decrypted secret still in the working tree - untracked, and no longer
+  matching the pattern that would have encrypted it. It now exits 2, keeps the
+  key, changes nothing, and says what to look at. An ordinary temp-shaped file
+  whose target is undeclared still only gets a note.
+- **A configuration key that cannot be parsed is answered, not fatal.** Reading
+  one aborted the process, and on the filter path with `required = true` that
+  aborts every git operation in the repository rather than failing one command.
+
+### Added
+
+- **A warning when a declared `eol=` cannot reach a file.** `eol=` applies only
+  to content the filter normalises, so under the default `text=auto` a file the
+  content rule reads as binary is stored verbatim and the declaration silently
+  does nothing for it - one pattern honouring `eol=crlf` for one file and not
+  for the next beside it. The filter now names any file this happens to, and
+  only that file.
+
+### Changed
+
+- **The cipher crate is `aes-siv` 0.8.0-rc.3, and `.cargo/config.toml` is gone.**
+  It pulls `aes` 0.9, which compiles the aarch64 backend unconditionally and
+  picks between hardware and software at runtime, so hardware AES now works by
+  every install route rather than only for builds run from a clone - the gap
+  that flag could not close. A pre-release deliberately: it is the only one in
+  the dependency graph, everything under it resolves to stable at MSRV 1.85, and
+  the requirement lifts itself to 0.8.0 when that lands.
+
 ## [0.1.0] — 2026-08-07
 
 First release. Everything below is new; there is no earlier version to have
@@ -168,4 +229,5 @@ the **only** copy and backing it up is yours to do, and a clone where `init` or
   libgit2 — are outside the guarantee, because they may not speak the
   long-running filter protocol and would then let plaintext through.
 
+[0.1.1]: https://github.com/rkarpin1/git-xcrypt/releases/tag/v0.1.1
 [0.1.0]: https://github.com/rkarpin1/git-xcrypt/releases/tag/v0.1.0

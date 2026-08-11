@@ -4,7 +4,7 @@ Transparent encryption of selected files in a git repository: plaintext in your
 working tree, ciphertext in the remote. A self-contained Rust binary — no
 system `gpg`, no helper scripts, no external processes on the filter path.
 
-**Status: v0.1.0, the first release.** Every command listed below works and is
+**Status: v0.1.1.** Every command listed below works and is
 covered by tests that drive a real git, on Linux, macOS and Windows.
 Ready-made binaries for five targets are on the
 [releases page](https://github.com/rkarpin1/git-xcrypt/releases), each with a
@@ -635,7 +635,7 @@ Every published archive carries a GitHub build provenance attestation. To check
 one before you trust it:
 
 ```sh
-gh attestation verify git-xcrypt-v0.1.0-<target>.tar.gz --repo rkarpin1/git-xcrypt
+gh attestation verify git-xcrypt-v0.1.1-<target>.tar.gz --repo rkarpin1/git-xcrypt
 ```
 
 That answers *which commit and which workflow run produced this file*, which is
