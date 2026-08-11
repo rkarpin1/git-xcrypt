@@ -6,12 +6,61 @@ system `gpg`, no helper scripts, no external processes on the filter path.
 
 **Status: v0.1.1.** Every command listed below works and is
 covered by tests that drive a real git, on Linux, macOS and Windows.
-Ready-made binaries for five targets are on the
-[releases page](https://github.com/rkarpin1/git-xcrypt/releases), each with a
-SHA-256 sum and a build provenance attestation — see §Verifying a downloaded
-release. From a registry it is `cargo install git-xcrypt`, which builds from
-source and needs Rust 1.88 or newer. [`CHANGELOG.md`](CHANGELOG.md) lists what this
-release contains, what is frozen with it, and what it deliberately leaves out.
+[`CHANGELOG.md`](CHANGELOG.md) lists what this release contains, what is frozen
+with it, and what it deliberately leaves out.
+
+## Installing
+
+Three routes to the same binary. Pick (a) if you do not have Rust, (c) if you do
+and would rather not wait for a build.
+
+### a) A ready-made binary from GitHub
+
+No toolchain, nothing to compile. Download the archive for your platform from
+the [releases page](https://github.com/rkarpin1/git-xcrypt/releases), unpack it
+and put the binary in a directory on `PATH`. Five targets are published — Linux
+x86-64 and ARM64, macOS Intel and Apple silicon, Windows x86-64 — each with a
+`.sha256` file beside it and a build provenance attestation; see §Verifying a
+downloaded release.
+
+### b) `cargo install` — builds from source
+
+```sh
+cargo install git-xcrypt --locked
+```
+
+Needs Rust 1.88 or newer; `--locked` builds against the dependency versions this
+release was tested with. This is the route with a chain you control end to end,
+and the one to use if you want to audit what you run.
+
+### c) `cargo binstall` — the same archive, without compiling
+
+`cargo binstall` is a separate tool and is **not** part of cargo, so install it
+first — once per machine:
+
+```sh
+cargo install cargo-binstall
+```
+
+Its own project also publishes ready-made binaries and an install script, if you
+would rather not build that one either. Then:
+
+```sh
+cargo binstall git-xcrypt
+```
+
+It reads the version from crates.io and fetches the matching archive from the
+releases page instead of building — measured with cargo-binstall 1.21.1 on
+`x86_64-pc-windows-msvc`, which finds the artifact with no configuration on
+either side. If no archive matches your target, it falls back to compiling, so
+the outcome is the same as (b) rather than a failure.
+
+### Checking it worked
+
+```sh
+git-xcrypt --version
+git xcrypt --version      # git finds it on PATH as a subcommand too
+```
 
 ## Quick start
 
