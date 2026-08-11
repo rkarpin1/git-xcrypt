@@ -4,7 +4,7 @@ Transparent encryption of selected files in a git repository: plaintext in your
 working tree, ciphertext in the remote. A self-contained Rust binary — no
 system `gpg`, no helper scripts, no external processes on the filter path.
 
-**Status: v0.1.1.** Every command listed below works and is
+**Status: v0.1.2.** Every command listed below works and is
 covered by tests that drive a real git, on Linux, macOS and Windows.
 [`CHANGELOG.md`](CHANGELOG.md) lists what this release contains, what is frozen
 with it, and what it deliberately leaves out.

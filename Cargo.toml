@@ -1,6 +1,6 @@
 [package]
 name = "git-xcrypt"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 # Measured, not guessed. Edition 2024 alone needs 1.85, but the code uses `let`
 # chains in `if` conditions, which are stable only from 1.88 — on 1.85 the crate

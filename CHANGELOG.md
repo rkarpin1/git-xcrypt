@@ -11,6 +11,42 @@ exist in someone's history — so those are listed under their own heading, and 
 release that changed any of them without a new `suite` byte would be a bug, not
 a minor version.
 
+## [0.1.2] - 2026-08-11
+
+One behaviour change and the installation documentation. **Nothing about the
+bytes moved**: the encrypted file format, the key file format and the
+text/binary rule are exactly those frozen with 0.1.0. A repository encrypted
+with any earlier version needs nothing done to it.
+
+### Changed
+
+- **`export-key --stdout` prints to a terminal instead of refusing one.** It
+  used to exit `2` and write nothing when standard output was a terminal. The
+  flag is the consent, so the key is written and the cost is named instead:
+  `stderr` says that the key now lives in the scrollback, in the multiplexer's
+  buffer and in any session log, none of which the command can reach afterwards,
+  and that the way out is to clear all three or rotate the key. Piping is
+  untouched — the warning goes to `stderr`, so `export-key --stdout | gh secret
+  set …` still carries the key and nothing else. What no process can police is
+  unchanged and still documented: a shell redirect escapes every check that
+  keeps a key out of the working tree.
+
+### Documentation
+
+- **The README says how to install.** A section of its own before Quick start,
+  with the three routes separated: a ready-made binary from the releases page,
+  `cargo install git-xcrypt --locked`, and `cargo binstall git-xcrypt`. The last
+  carries the caveat it needs — `cargo binstall` is a separate tool, not part of
+  cargo, so it has to be installed first; measured with cargo-binstall 1.21.1,
+  it resolves this crate's release archive with no configuration on either side,
+  and falls back to building when no archive matches the target.
+
+### Internal
+
+- A `/publish-cargo-version` command for agents working in this repository,
+  under `.claude/`, and excluded from the published package along with
+  `/context`, `/.idea` and `/.github`.
+
 ## [0.1.1] - 2026-08-11
 
 Bug fixes and one dependency change. **Nothing about the bytes moved**: the
@@ -229,5 +265,6 @@ the **only** copy and backing it up is yours to do, and a clone where `init` or
   libgit2 — are outside the guarantee, because they may not speak the
   long-running filter protocol and would then let plaintext through.
 
+[0.1.2]: https://github.com/rkarpin1/git-xcrypt/releases/tag/v0.1.2
 [0.1.1]: https://github.com/rkarpin1/git-xcrypt/releases/tag/v0.1.1
 [0.1.0]: https://github.com/rkarpin1/git-xcrypt/releases/tag/v0.1.0
