@@ -269,7 +269,10 @@ fn cli_overrides(raw: Option<&std::ffi::OsStr>) -> Option<File> {
             Some((key, value)) => (key.to_string(), value.to_string()),
             None => (word, "true".to_string()),
         };
-        if !key.contains('.') {
+        // Asked with `gix-config`'s own parser rather than by looking for a dot,
+        // so this and `get` cannot drift apart — and so `set_raw_value`, which
+        // panics on a key it will not parse, is never handed one.
+        if gix_config::AsKey::try_as_key(&key.as_str()).is_none() {
             continue;
         }
         if file.set_raw_value(key.as_str(), value.as_str()).is_ok() {
@@ -381,8 +384,23 @@ pub fn unset(config: &mut File, key: &str) -> Result<()> {
 /// read as enabled, while git ignored the failing filter and stored the
 /// plaintext with `git add` exiting 0 — and `status`, the gate that exists to
 /// catch exactly that, reported no gap.
+///
+/// **A key `gix-config` will not parse gives `None` rather than a panic.** Its
+/// `raw_value` takes the key through `AsKey::as_key`, which panics on anything
+/// it cannot split — `notdotted` is enough. No caller passes such a key today,
+/// and the `-c` reader filters them out before they get here, so this is not a
+/// fix for a live bug; it is a fix for the *shape* of one. `get` is on the
+/// filter path, and with `required = true` a panic there does not fail one
+/// command, it aborts every git operation in the repository until someone
+/// unregisters the driver by hand. A lookup that cannot name a section has no
+/// answer, and saying so is the same thing this function already does two lines
+/// further down for the same key.
 #[must_use]
 pub fn get(config: &File, key: &str) -> Option<String> {
+    // `gix-config`'s own rule, not a second spelling of it: a guard that drifted
+    // narrower than the one that panics would leave the panic reachable.
+    gix_config::AsKey::try_as_key(&key)?;
+
     if let Ok(value) = config.raw_value(key) {
         // An explicit value, the empty string included. Git reads `key =` as
         // false, so it must not be turned into a spelling of true below.
@@ -574,5 +592,31 @@ mod tests {
             !mixed.to_bstring().to_str_lossy().contains("notdotted"),
             "a word that names no section must not reach the configuration"
         );
+    }
+
+    /// A key `gix-config` will not parse must answer `None`, not abort the process.
+    ///
+    /// `raw_value` panics on one — `'notdotted' is not a valid configuration key`
+    /// — and this function is on the filter path, where with `required = true` a
+    /// panic does not fail one command: it aborts every git operation in the
+    /// repository until the driver is unregistered by hand. No caller passes such
+    /// a key today, which is exactly why this is worth pinning; nothing else
+    /// would notice if one started to.
+    #[test]
+    fn a_key_that_names_no_section_has_no_value_and_does_not_panic() {
+        let config = File::try_from("[core]\n\tautocrlf = true\n")
+            .expect("the fixture is valid configuration");
+
+        for key in ["notdotted", "", "."] {
+            assert_eq!(
+                get(&config, key),
+                None,
+                "`{key}` cannot name a value, and answering that must not cost a panic"
+            );
+        }
+
+        // The rule is borrowed from `gix-config` rather than restated, so the
+        // ordinary key beside it still has to work.
+        assert_eq!(get(&config, "core.autocrlf").as_deref(), Some("true"));
     }
 }
