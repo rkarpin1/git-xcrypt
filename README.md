@@ -296,9 +296,10 @@ On Unix the file is written with mode `0600`. **On Windows nothing narrows it**
 - **not inside the repository or any other checkout of it** — `export-key`
   refuses those outright, because one `git add -A` would commit the key;
 - **not into the git directory** — also refused;
-- **not into a CI log or a terminal scrollback.** `export-key --stdout` refuses
-  a terminal for exactly that reason. A shell redirect it cannot police: see
-  below.
+- **not into a CI log or a terminal scrollback.** `export-key --stdout` prints
+  to a terminal if you point it at one — the flag is the consent — and says on
+  `stderr` that the key now lives in the scrollback, the multiplexer's buffer
+  and any session log. A shell redirect it cannot police at all: see below.
 
 Where it should go is somewhere that survives losing the machine and that you
 trust with a plaintext secret: a password manager, an encrypted backup volume,
@@ -346,7 +347,7 @@ Those are speed bumps in front of the cliff. They are not a backup.
 | `init` | Generate the repository key, register the filter and the diff driver, create `.git-xcrypt`, write the managed `.gitattributes` section. |
 | `sync` | Rewrite the managed `.gitattributes` section as one line per declared pattern. `--global` writes instead the single line `init` starts with, which covers everything and cannot go stale; `--ignorecase` spells every ASCII letter as a class. `--check` reports staleness through exit code 2 instead of writing. |
 | `status` | Report whether your declarations are actually enforced, scanning the whole reachable history. `--fix` re-stages declared files the index holds in the clear. Exits `2` when the setup does not enforce anything, `5` on a finding, `6` when it could not tell. |
-| `export-key` | Write the repository key to a file outside the working tree. This is also how you make the backup nothing else makes — see above. `--stdout` pipes it instead, for a secret store; refused when standard output is a terminal. |
+| `export-key` | Write the repository key to a file outside the working tree. This is also how you make the backup nothing else makes — see above. `--stdout` pipes it instead, for a secret store; a terminal gets it too, and is told the key now sits in the scrollback. |
 | `unlock` | Decrypt the working tree and register the filter, installing a key first if one is given — as a path, or as `--key <text>` for a CI secret. `--key-only` puts the key in place and repairs the setup without decrypting anything. |
 | `lock` | Encrypt the working tree and delete the key. Interactive by default; `--yes` skips the question but not the refusal on uncommitted changes. |
 | `diff`, `process` | Registered by `init` for git to call. Not meant to be run by hand. |

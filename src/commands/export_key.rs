@@ -2,23 +2,28 @@
 //!
 //! This is the command that gives a key away, so it is the shortest route to a
 //! leak in the whole product. PRD FR-007 says as much: "one run inside CI, or
-//! one redirect into the repository directory, is all it takes". Three refusals
+//! one redirect into the repository directory, is all it takes". Two refusals
 //! close the routes that do not need a compromised machine:
 //!
-//! * the key reaches `stdout` only when `--stdout` asks for it, and never when
-//!   `stdout` is a terminal — a key in the scrollback outlives the window, the
-//!   multiplexer's buffer and often the session log. Added 2026-08-06 for the
-//!   one workflow the file form cannot serve: piping the key straight into a
-//!   secret store (`| pbcopy`, `| gh secret set …`) without it ever touching
-//!   the disk. What that flag cannot police is a shell redirect: `--stdout >
-//!   secrets/key.txt` writes where the refusals below would have said no,
-//!   because a process cannot portably learn the path behind its own file
-//!   descriptor. Said out loud in the command's own warning and in the README,
-//!   because it is the FR-007 leak with the guard rail removed by hand;
 //! * a destination inside the working tree is refused outright, because that is
 //!   one `git add -A` away from a commit;
 //! * an existing file is refused unless `--force`, so a mistyped path cannot
 //!   silently destroy someone's backup of a *different* key.
+//!
+//! The key reaches `stdout` only when `--stdout` asks for it, and the flag
+//! exists for the one workflow the file form cannot serve: piping the key
+//! straight into a secret store (`| pbcopy`, `| gh secret set …`) without it
+//! ever touching the disk. **A terminal was refused there between 2026-08-06 and
+//! 2026-08-11, and is now warned about instead — the owner's call, on the
+//! grounds that typing `--stdout` is the consent.** The cost is unchanged and
+//! measured, so the warning names it: a key printed to a terminal stays in the
+//! scrollback, in the multiplexer's buffer and in any session log, none of which
+//! this process can reach afterwards. What the flag cannot police at all is a
+//! shell redirect: `--stdout > secrets/key.txt` writes where the refusals above
+//! would have said no, because a process cannot portably learn the path behind
+//! its own file descriptor. Said out loud in the command's own warning and in
+//! the README, because it is the FR-007 leak with the guard rail removed by
+//! hand.
 //!
 //! The file itself is written owner-only and atomically, by the same code that
 //! writes the repository's own key.
@@ -39,17 +44,36 @@ pub struct Report {
     pub path: PathBuf,
 }
 
+/// What `--stdout` handed over, and whether the destination keeps a copy.
+#[derive(Debug)]
+pub struct Exported {
+    /// Fingerprint of the exported key. Safe to print; the key is not.
+    pub key_id: [u8; KEY_ID_LEN],
+    /// The key went to a terminal, so it now lives somewhere this process
+    /// cannot reach. The caller says so on `stderr`; see [`SCROLLBACK_WARNING`].
+    pub went_to_a_terminal: bool,
+}
+
+/// What the caller prints when the key landed in a terminal.
+///
+/// Here rather than in the binary so the rule and its wording sit beside the
+/// code that decides it, the way every other message in this module does.
+pub const SCROLLBACK_WARNING: &str = "that was a terminal, so the key is now in the scrollback, in your \
+     multiplexer's buffer and in any session log — none of which this command \
+     can reach. Treat it as exposed unless you clear all three, or rotate it.";
+
 /// Writes the repository key to `stdout`, for piping into a secret store.
 ///
-/// Refuses a terminal, and only a terminal: everything else is a pipe or a
-/// redirect the caller chose deliberately. The refusal is the cheap half of the
-/// bargain — see the module comment for the half no process can enforce.
+/// A terminal is written to like anything else and reported back, so the caller
+/// can name the cost. Refusing it was the rule from 2026-08-06 until
+/// 2026-08-11; see the module comment for why it is a warning now, and for the
+/// half of the bargain no process can enforce either way.
 ///
 /// # Errors
 ///
-/// [`Error::Config`] when `stdout` is a terminal, [`Error::NoKey`] when the
-/// repository has no key, [`Error::Io`] when the write fails.
-pub fn to_stdout(repo: &Repo) -> Result<[u8; KEY_ID_LEN]> {
+/// [`Error::NoKey`] when the repository has no key, [`Error::Io`] when the
+/// write fails.
+pub fn to_stdout(repo: &Repo) -> Result<Exported> {
     use std::io::IsTerminal as _;
     to_writer(
         repo,
@@ -60,12 +84,11 @@ pub fn to_stdout(repo: &Repo) -> Result<[u8; KEY_ID_LEN]> {
 
 /// [`to_stdout`], with the destination and the terminal answer as arguments.
 ///
-/// Split for the same reason as `gitconfig::global_attributes_file_for`: the
-/// refusal this function exists for fires only when the destination is a
-/// terminal, and a test cannot portably arrange one — a pty is a Unix mechanism
-/// and this rule has to hold on all three platforms. Passing the answer in
-/// makes both arms reachable from anywhere, which is worth more than a guard
-/// that runs on one platform out of three.
+/// Split for the same reason as `gitconfig::global_attributes_file_for`: a test
+/// cannot portably arrange a terminal — a pty is a Unix mechanism and this rule
+/// has to hold on all three platforms. Passing the answer in makes both arms
+/// reachable from anywhere, which is worth more than a guard that runs on one
+/// platform out of three.
 ///
 /// # Errors
 ///
@@ -74,19 +97,7 @@ fn to_writer(
     repo: &Repo,
     out: &mut impl std::io::Write,
     destination_is_a_terminal: bool,
-) -> Result<[u8; KEY_ID_LEN]> {
-    // Before the key is loaded, for the same reason as the destination checks:
-    // a refusal must not be reached with key material already in memory.
-    if destination_is_a_terminal {
-        return Err(Error::Config(
-            "refusing to print the key to a terminal: it would stay in the \
-             scrollback, in your multiplexer's buffer and in any session log.\n\
-             Pipe it somewhere (`git-xcrypt export-key --stdout | pbcopy`), or \
-             write a file with `git-xcrypt export-key <path>`."
-                .into(),
-        ));
-    }
-
+) -> Result<Exported> {
     let key = repo.load_key()?;
     let key_id = key.key_id();
     // The same text the file form writes, so one format round-trips through
@@ -94,7 +105,10 @@ fn to_writer(
     let exported = keyfile::encode_portable(&key);
     out.write_all(exported.as_bytes())?;
     out.flush()?;
-    Ok(key_id)
+    Ok(Exported {
+        key_id,
+        went_to_a_terminal: destination_is_a_terminal,
+    })
 }
 
 /// Writes the repository key to `destination`.
@@ -307,38 +321,51 @@ mod tests {
         assert!(keyfile::read_portable(&path).is_ok());
     }
 
-    /// Both arms of the one refusal a test cannot arrange from outside.
+    /// Both arms of the destination a test cannot arrange from outside.
     ///
     /// A terminal needs a pty, which is a Unix mechanism, and this rule has to
-    /// hold on all three platforms — so the answer arrives as an argument. The
-    /// negative arm carries as much weight as the positive one: refusing a pipe
-    /// would break the only workflow the flag exists for.
+    /// hold on all three platforms — so the answer arrives as an argument. Both
+    /// arms carry weight and for opposite reasons: refusing a pipe would break
+    /// the only workflow the flag exists for, and refusing a terminal is what
+    /// the owner removed on 2026-08-11 — `--stdout` is the consent, so the key
+    /// must actually appear, with the cost named rather than the write blocked.
     #[test]
-    fn the_key_goes_to_a_pipe_and_never_to_a_terminal() {
+    fn the_key_goes_to_a_pipe_and_to_a_terminal_that_is_told_what_it_costs() {
         let dir = init_repo();
         let repo = Repo::discover(dir.path()).expect("discovery");
         crate::commands::init::run(&repo).expect("init must succeed");
 
         let mut piped: Vec<u8> = Vec::new();
-        let key_id = to_writer(&repo, &mut piped, false).expect("a pipe must be written to");
+        let exported = to_writer(&repo, &mut piped, false).expect("a pipe must be written to");
         let text = String::from_utf8(piped).expect("an export is text");
         assert!(
-            text.contains(&crate::format_key_id(&key_id)),
+            text.contains(&crate::format_key_id(&exported.key_id)),
             "the export must name the key it holds: {text}"
         );
         // The one format, so a key piped out reads back through the same parser
         // a file goes through — the header still verifies the material.
         let parsed = keyfile::decode_portable(&text).expect("the export must parse");
-        assert_eq!(parsed.key_id(), key_id);
+        assert_eq!(parsed.key_id(), exported.key_id);
+        assert!(
+            !exported.went_to_a_terminal,
+            "a pipe must not drag the terminal warning into a CI log"
+        );
 
         let mut to_a_terminal: Vec<u8> = Vec::new();
-        let refused = to_writer(&repo, &mut to_a_terminal, true)
-            .expect_err("a terminal destination must be refused");
-        assert_eq!(refused.exit_code(), crate::util::exit::CONFIG);
-        assert!(to_a_terminal.is_empty(), "the refusal still wrote the key");
+        let shown = to_writer(&repo, &mut to_a_terminal, true)
+            .expect("a terminal is the caller's own call since 2026-08-11");
+        let shown_text = String::from_utf8(to_a_terminal).expect("an export is text");
+        assert_eq!(
+            shown_text, text,
+            "a terminal must get the same export a pipe gets, or the flag lies"
+        );
         assert!(
-            refused.to_string().contains("scrollback"),
-            "the refusal must say why, or it reads as a bug: {refused}"
+            shown.went_to_a_terminal,
+            "the cost must be reported, or the scrollback goes unmentioned"
+        );
+        assert!(
+            SCROLLBACK_WARNING.contains("scrollback"),
+            "the warning must say where the key now lives, or it reads as noise"
         );
     }
 }

@@ -101,7 +101,7 @@ enum Command {
     ///
     /// The destination must be outside this repository's working tree. With
     /// `--stdout` the key goes to standard output instead, for piping straight
-    /// into a secret store — never to a terminal.
+    /// into a secret store.
     ExportKey {
         /// Where to write the key. Must lie outside the working tree.
         #[arg(required_unless_present = "stdout", conflicts_with = "stdout")]
@@ -109,9 +109,10 @@ enum Command {
 
         /// Print the key to standard output instead of writing a file.
         ///
-        /// Refused when standard output is a terminal. A shell redirect is
-        /// yours to aim: this cannot see where it points, so the checks that
-        /// keep a key out of the working tree do not apply.
+        /// A terminal gets it too and is told what that costs: the key stays in
+        /// the scrollback, the multiplexer's buffer and any session log. A
+        /// shell redirect is yours to aim: this cannot see where it points, so
+        /// the checks that keep a key out of the working tree do not apply.
         #[arg(long)]
         stdout: bool,
 
@@ -334,13 +335,19 @@ fn run_export_key(path: Option<&std::path::Path>, stdout: bool, force: bool) -> 
     let repo = Repo::discover_from_cwd()?;
 
     if stdout {
-        let key_id = commands::export_key::to_stdout(&repo)?;
+        let exported = commands::export_key::to_stdout(&repo)?;
         // On `stderr`, so a pipe carries the key and nothing else. Both halves
         // are said: what just left, and the one check a redirect escapes.
         eprintln!(
             "git-xcrypt: wrote key {} to standard output",
-            git_xcrypt::format_key_id(&key_id)
+            git_xcrypt::format_key_id(&exported.key_id)
         );
+        // A terminal was refused here until 2026-08-11. It is written to now —
+        // `--stdout` is the consent — so the cost is named instead, and named
+        // first, because it is the one the user can still act on.
+        if exported.went_to_a_terminal {
+            eprintln!("git-xcrypt: {}", commands::export_key::SCROLLBACK_WARNING);
+        }
         eprintln!(
             "git-xcrypt: whatever is on the other end of that pipe now holds the only \
              way back into this repository's history. If you redirected it to a file, \
