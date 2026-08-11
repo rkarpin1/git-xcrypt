@@ -151,7 +151,12 @@ head -1 secrets/prod.env
 ```
 
 `lock` refuses while a declared file has uncommitted changes, and `--yes` does
-not waive that — losing the key and losing unsaved work are different risks.
+not waive that — losing the key and losing unsaved work are different risks. It
+refuses over anything else it cannot account for, too: another checkout of the
+same repository, a directory it cannot read, and a leftover file it cannot
+identify (see §Known limitations). Every one of those leaves the key in place
+and the working tree untouched, so the way out is to fix what it named and run
+it again.
 
 ### In CI
 
@@ -552,6 +557,21 @@ exits 0, and the first thing that would have told you was the failed checkout.
   unchanged rather than the platform's own ending, so declaring a file no longer
   expands its `LF` on Windows. Set `core.eol=native`, or `eol=native` on the
   pattern, if you want the platform's ending back.
+- **A killed `unlock` can leave a decrypted file behind, under a name no
+  pattern was written for.** Files are replaced by writing a sibling and
+  renaming it, so a process killed outright — `SIGKILL`, a crash, the power
+  going — can leave `<name>.git-xcrypt-<16 hex>.tmp` next to the file it was
+  writing. On the `unlock` path that leftover holds **plaintext**. `lock` sweeps
+  the ones it can identify and says so; it leaves a file whose target nothing
+  declares, with a note, because deleting somebody else's file is worse. One
+  shape it refuses over instead: a name at the 255-byte filesystem limit, where
+  the target it was built from was cut short and no longer identifies anything
+  — `lock` then exits `2`, keeps the key and changes nothing, because it cannot
+  tell whether that file is a secret. Look at it, delete it if it is leftover,
+  move it aside if it is yours, and run `lock` again. After any killed `unlock`
+  it is worth looking for `*.git-xcrypt-*.tmp` yourself: `git status` will show
+  them as untracked, and they do not match the pattern that would have
+  encrypted them.
 - **`eol=` reaches only the files the filter normalises.** It applies to content
   stored as text; a file the content rule reads as binary — a NUL byte is
   enough — is stored verbatim and every checkout writes those bytes back, `eol=`
