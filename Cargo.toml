@@ -16,7 +16,11 @@ documentation = "https://docs.rs/git-xcrypt"
 readme = "README.md"
 keywords = ["git", "encryption", "secrets", "aes-siv", "cli"]
 categories = ["command-line-utilities", "cryptography", "development-tools"]
-exclude = ["/context", "/.idea", "/.github"]
+# Working material for whoever builds this, not part of what is published:
+# planning documents, IDE scopes, CI workflows, and the agent commands under
+# `/.claude`. `CLAUDE.md` and `AGENTS.md` stay in the package deliberately —
+# they are the rules of the crate, and they shipped with 0.1.0 and 0.1.1.
+exclude = ["/context", "/.idea", "/.github", "/.claude"]
 
 [lints.rust]
 # AGENTS.md makes "zero unsafe" a hard rule; this is what enforces it.
