@@ -305,6 +305,33 @@ pub fn strip_temporary_suffix(name: &[u8]) -> Option<&[u8]> {
     (!target.is_empty()).then_some(target)
 }
 
+/// Whether the target [`strip_temporary_suffix`] reconstructed may be **cut**.
+///
+/// [`temporary_name`] shortens the target when the suffix would not otherwise
+/// fit, so above a certain length the name in a temporary file no longer
+/// identifies its target — and a caller deciding what to do with residue is then
+/// deciding about a file it cannot name. `lock` is that caller, and the answer
+/// has to be "refuse", not "guess": measured on this build, a repository
+/// declaring `*.env` with a 230-byte file name, and residue placed exactly as a
+/// killed run leaves it, printed `nothing declares its target, so it was left
+/// alone`, deleted the key and **exited 0** over `AWS_SECRET=hunter2` sitting in
+/// the working tree in the clear — untracked, and not matching `*.env`, so the
+/// next `git add -A` would have committed it that way.
+///
+/// Answered from the temporary name's own length rather than the target's,
+/// because that is the side a caller holds, and with **three bytes of slack**:
+/// the Unix arm of [`shorten`] cuts on a byte boundary and lands exactly on the
+/// limit, but the other arm backs off to a character boundary and can stop a
+/// little short. Being wrong in this direction costs a refusal on a residue file
+/// whose name is within three bytes of the ceiling and whose target is genuinely
+/// undeclared — which is a file a user made themselves, since every temporary
+/// file this crate writes sits beside a declared path or a bootstrap file. Being
+/// wrong in the other direction costs a secret.
+#[must_use]
+pub fn target_may_have_been_shortened(temporary_name: &[u8]) -> bool {
+    temporary_name.len() + 3 >= MAX_NAME
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

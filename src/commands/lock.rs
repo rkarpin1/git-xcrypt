@@ -1006,6 +1006,28 @@ fn collect(repo: &Repo, config: &Config, walk: &mut Walk, tail: &str) -> Result<
                         name: name.clone(),
                         relative: relative.clone(),
                     });
+                } else if atomic::target_may_have_been_shortened(file_name_of(&name)) {
+                    // The declaration says no — but on a name at the ceiling
+                    // that answer was given about a *cut* target, so it means
+                    // nothing. Refusing is the direction this whole command
+                    // leans: everything it cannot verify, it refuses over.
+                    // Warning and carrying on is what it did until 2026-08-11,
+                    // and the measured cost was a deleted key, exit code 0, and
+                    // `AWS_SECRET=hunter2` left in the working tree — untracked,
+                    // and not matching the pattern that would have encrypted it,
+                    // so the next `git add -A` would have committed it in the
+                    // clear.
+                    return Err(Error::Config(format!(
+                        "{}: lock cannot promise this working tree holds no plaintext. \
+                         This is shaped like a temporary file of ours and its name is at \
+                         the length limit, so the name it was built from was cut short \
+                         and no longer identifies anything — which means this file may \
+                         hold the decrypted content of a declared path, and lock cannot \
+                         tell. Look at it, then delete it if it is left over from an \
+                         interrupted run, or move it aside if it is yours, and run lock \
+                         again. {tail}",
+                        git_spelling(&relative)
+                    )));
                 } else {
                     walk.warnings.push(format!(
                         "{}: shaped like a temporary file of ours, but nothing \
@@ -1485,6 +1507,16 @@ fn relative_to(repo: &Repo, path: &Path) -> PathBuf {
 /// not have.
 fn repo_relative_bytes(relative: &Path) -> Vec<u8> {
     os_str_bytes(relative)
+}
+
+/// The last component of a repository-relative name.
+///
+/// The length ceiling a temporary name runs into is per **component** —
+/// `NAME_MAX`, not `PATH_MAX` — so the question about it has to be asked of the
+/// component and not of the path that carries it. Both platforms spell these
+/// with `/`; see [`os_str_bytes`], which normalises the Windows form.
+fn file_name_of(name: &[u8]) -> &[u8] {
+    name.rsplit(|byte| *byte == b'/').next().unwrap_or(name)
 }
 
 fn os_str_bytes(path: &Path) -> Vec<u8> {

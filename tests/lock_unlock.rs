@@ -610,3 +610,106 @@ fn read_until(stream: &mut impl std::io::Read, marker: &str) -> String {
     }
     seen
 }
+
+/// Residue whose name hit the length ceiling: `lock` refuses instead of guessing.
+///
+/// The temporary name a run leaves behind is `<target>.git-xcrypt-<hex>.tmp`, and
+/// the suffix is 32 bytes against a 255-byte `NAME_MAX`. Above 223 bytes the
+/// target part is cut to make room — which is a fix, not a flaw: before it, a
+/// repository holding such a file could not be locked at all, `lock` failing
+/// identically for ever with `ENAMETOOLONG` while the secret stayed in the clear.
+///
+/// What it costs is that the name no longer identifies its target, and `lock`
+/// decided what to do with the file by reconstructing exactly that. Measured on
+/// this build before the fix, declaring `*.env` with a 230-byte file name: `lock`
+/// said `nothing declares its target, so it was left alone`, deleted the key, and
+/// **exited 0** over `AWS_SECRET=hunter2` still sitting in the working tree —
+/// untracked, and no longer matching `*.env`, so the next `git add -A` would have
+/// committed it in the clear. That contradicts this command's own rule, the one
+/// every other refusal here follows: everything it cannot verify, it refuses over.
+///
+/// **Both halves are asserted and the quiet one is the harder constraint.** A
+/// gate that fired on any temp-shaped file with an undeclared target would refuse
+/// over a user's own file, and a refusal from `lock` is an outage: the repository
+/// cannot be closed until the user finds and moves whatever provoked it.
+#[test]
+fn residue_whose_name_was_cut_short_refuses_and_an_ordinary_look_alike_does_not() {
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.xcrypt_ok(["sync"]);
+    repo.write_file("secrets/db.env", DOTENV);
+    repo.commit_all("one ordinary secret");
+
+    // The quiet half first, so the loud one cannot be what makes it pass: a
+    // temp-shaped name whose target nothing declares, at an ordinary length.
+    // `notes.txt` is not selected, so this is somebody's own file.
+    repo.write_file(
+        "notes.txt.git-xcrypt-0123456789abcdef.tmp",
+        b"a file that merely looks like ours\n",
+    );
+
+    // The loud half. Only Rust ever creates this name — git is never asked to
+    // track it — because a 255-byte component pushes the absolute path past
+    // what some Windows configurations accept, and the point here is the
+    // ceiling, not the platform's path handling.
+    let cut = "c".repeat(223);
+    let residue = format!("{cut}.git-xcrypt-0123456789abcdef.tmp");
+    assert_eq!(
+        residue.len(),
+        255,
+        "the fixture must sit exactly on NAME_MAX, or it is not the shape at issue"
+    );
+    repo.write_file(&residue, b"AWS_SECRET=hunter2\n");
+
+    let refused = repo.xcrypt(["lock", "--yes"]);
+    let said = String::from_utf8_lossy(&refused.stderr).into_owned();
+    assert_eq!(
+        refused.status.code(),
+        Some(CONFIG_ERROR),
+        "lock proceeded over a file it cannot identify:\n{said}"
+    );
+    assert!(
+        said.contains("may hold the decrypted content"),
+        "the refusal has to say what is at stake, not just that it stopped:\n{said}"
+    );
+    assert!(
+        said.contains("Nothing has been changed"),
+        "a refusal before any work must say so, or the user cannot tell whether \
+         the tree was half-rewritten:\n{said}"
+    );
+
+    // The two things a refusal is worth nothing without.
+    assert!(
+        repo.path().join(".git/git-xcrypt/keys/default").exists(),
+        "the key was deleted by a run that refused"
+    );
+    assert_eq!(
+        repo.worktree_bytes("secrets/db.env"),
+        DOTENV,
+        "the tree was rewritten by a run that refused"
+    );
+
+    // Dealing with the file is the way out, and it has to lead somewhere.
+    fs::remove_file(repo.path().join(&residue)).expect("could not remove the residue");
+    let locked = repo.xcrypt_ok(["lock", "--yes"]);
+    let said = String::from_utf8_lossy(&locked.stderr).into_owned();
+    assert!(
+        repo.worktree_bytes("secrets/db.env").starts_with(MAGIC),
+        "lock did not finish its job once the unidentifiable file was gone"
+    );
+    assert!(
+        said.contains("nothing declares its target, so it was left alone"),
+        "the ordinary look-alike must be reported and left, not swept and not \
+         refused over:\n{said}"
+    );
+    assert!(
+        repo.path()
+            .join("notes.txt.git-xcrypt-0123456789abcdef.tmp")
+            .exists(),
+        "a file that is not ours was deleted"
+    );
+}
+
+/// The exit code a state conflict gets, per the frozen table.
+const CONFIG_ERROR: i32 = 2;
