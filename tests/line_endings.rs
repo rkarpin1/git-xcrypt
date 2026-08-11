@@ -390,6 +390,10 @@ fn a_declared_path_is_converted_no_further_than_an_undeclared_one_when_nothing_a
     let home = tempfile::TempDir::new().expect("could not create a home directory");
     let repo = TestRepo::init().with_home(home.path());
     repo.set_config("core.autocrlf", "false");
+    // The harness pins `core.eol` for every other scenario; this one is *about*
+    // the unset case, so it takes the pin back out rather than inheriting an
+    // answer. Non-asserting: the key may already be absent on some path here.
+    repo.git(["config", "--unset", "core.eol"]);
 
     // The premise, checked rather than assumed: this scenario is about `core.eol`
     // being unset, and a machine whose system configuration sets it would be

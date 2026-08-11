@@ -39,11 +39,50 @@ pub struct TestRepo {
     env: Vec<(OsString, Option<OsString>)>,
 }
 
+/// The same pin, for the one command that writes a working tree before any
+/// local configuration exists to read.
+///
+/// `git clone` checks the files out as part of cloning, so setting the values
+/// afterwards is too late — measured: two acceptance scenarios still failed
+/// with a CRLF `.gitattributes` after the local pin was in place. These reach
+/// the filter as well as git, because `git -c` overrides travel to a child
+/// through `GIT_CONFIG_PARAMETERS` and this build reads them.
+const PIN_ON_CLONE: [&str; 4] = ["-c", "core.autocrlf=false", "-c", "core.eol=lf"];
+
+/// Pins the two settings a scenario must not inherit from the machine.
+///
+/// See [`TestRepo::init`] for why. A clone gets its own `.git/config`, so every
+/// repository this harness creates needs this — inheriting it is not a thing
+/// git does.
+fn pin_line_endings(repo: &TestRepo) {
+    repo.git_ok(["config", "core.autocrlf", "false"]);
+    repo.git_ok(["config", "core.eol", "lf"]);
+}
+
 impl TestRepo {
-    /// Creates an empty repository with a committer identity set locally.
+    /// Creates an empty repository with a committer identity and a pinned
+    /// line-ending configuration.
     ///
-    /// The rest of the git configuration is deliberately inherited from the
-    /// machine — see the plan's Open Risks.
+    /// **`core.autocrlf` and `core.eol` are pinned, since 2026-08-11, and that
+    /// is a correctness matter rather than tidiness.** They used to be inherited
+    /// from the machine, and a default Git for Windows install sets
+    /// `core.autocrlf=true` in its *system* configuration — measured, from
+    /// `C:/Program Files/Git/etc/gitconfig`. Every scenario that compares a
+    /// decrypted file with the bytes it wrote then failed there, 15 of them,
+    /// because smudge writes CRLF under that setting **by design**: the working
+    /// tree is meant to hold the platform's endings and the next clean
+    /// normalises them back. The suite was grading the machine, not the code.
+    ///
+    /// Pinning does not cost coverage, because the line-ending axis is not
+    /// inherited anywhere it matters: `line_endings.rs` sets `core.autocrlf` and
+    /// `core.eol` itself for every cell of its matrix — including `true`, which
+    /// is what `zalozenia.md` §Jakość i testy asks for as the Windows regression
+    /// scenario — and `performance.rs` has pinned `false` since it was written.
+    /// Proven rather than argued: breaking `eol::apply` turns `line_endings.rs`
+    /// red while the rest of the suite stays green.
+    ///
+    /// A scenario that wants a different configuration sets it afterwards, which
+    /// is what a local value is for.
     pub fn init() -> Self {
         Self::init_with(&[])
     }
@@ -75,6 +114,7 @@ impl TestRepo {
         repo.git_ok(args);
         repo.git_ok(["config", "user.name", "git-xcrypt tests"]);
         repo.git_ok(["config", "user.email", "tests@git-xcrypt.invalid"]);
+        pin_line_endings(&repo);
         repo
     }
 
@@ -290,6 +330,7 @@ impl TestRepo {
         let path = dir.path().join("clone");
 
         let output = Command::new("git")
+            .args(PIN_ON_CLONE)
             .arg("clone")
             .arg("-q")
             .arg(&self.path)
@@ -309,6 +350,7 @@ impl TestRepo {
         };
         clone.git_ok(["config", "user.name", "git-xcrypt tests"]);
         clone.git_ok(["config", "user.email", "tests@git-xcrypt.invalid"]);
+        pin_line_endings(&clone);
         clone
     }
 
@@ -322,6 +364,7 @@ impl TestRepo {
         let path = dir.path().join("clone");
 
         let output = Command::new("git")
+            .args(PIN_ON_CLONE)
             .arg("clone")
             .arg("-q")
             .arg("--depth")
@@ -343,6 +386,7 @@ impl TestRepo {
         };
         clone.git_ok(["config", "user.name", "git-xcrypt tests"]);
         clone.git_ok(["config", "user.email", "tests@git-xcrypt.invalid"]);
+        pin_line_endings(&clone);
         clone
     }
 
@@ -710,6 +754,7 @@ impl BareRemote {
         let path = dir.path().join("clone");
 
         let output = Command::new("git")
+            .args(PIN_ON_CLONE)
             .args(["clone", "-q"])
             .arg(&self.path)
             .arg(&path)
@@ -728,6 +773,7 @@ impl BareRemote {
         };
         clone.git_ok(["config", "user.name", "git-xcrypt tests"]);
         clone.git_ok(["config", "user.email", "tests@git-xcrypt.invalid"]);
+        pin_line_endings(&clone);
         clone
     }
 }
