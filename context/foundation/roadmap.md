@@ -41,6 +41,7 @@ Produkt rozstrzyga na podstawie wzorców ścieżek, które pliki opuszczają mas
 | S-06  | encryption-status-check      | sprawdzić, co jest szyfrowane, a co powinno być                          | S-02          | FR-010                 | done     |
 | S-07  | cross-platform-binaries      | pobrać gotową binarkę dla swojej platformy                               | S-01, S-08    | FR-011                 | done     |
 | S-08  | binary-detection-parity      | dostać ten sam werdykt tekst/binarny co git, także na pliku z `SUB`     | S-01          | §NFR (trzy platformy)  | done     |
+| S-09  | per-user-keys                | otworzyć sklonowane repozytorium **własnym** kluczem, bez przenoszenia klucza repozytorium | S-03          | §Access Control, FR-008 | todo     |
 
 ## Streams
 
@@ -52,6 +53,7 @@ Pomoc nawigacyjna — grupuje elementy dzielące łańcuch wymagań wstępnych. 
 | B      | Konfiguracja i widoczność | `S-02` → `S-06`                      | Dołącza do Strumienia A w `S-01`. **Zamknięta 2026-08-04** — obie decyzje (rozjazd konfiguracji, głębokość skanu) zapadły i są zaimplementowane. |
 | C      | Narzędzia pracy          | `S-05`                               | Dołącza do A w `S-01`. **Zamknięta 2026-08-04**; jedyny element bez własnej niewiadomej — ale plan i tak trafił w błędne założenie o `textconv`, sprostowane pomiarem. |
 | D      | Dystrybucja              | `S-08` → `S-07`                      | **Zamknięta 2026-08-07** wydaniem `v0.1.0`. `S-08` wszedł 2026-08-04, czyli w wymaganej kolejności: `looks_binary` zamraża się z pierwszym publicznym wydaniem. Nazwa i licencja rozstrzygnięte 2026-08-04. Poza tagiem zostają świadomie crates.io i tap Homebrew — kanały dystrybucji, nie warunki wydania. |
+| E      | Klucze użytkowników      | `S-03` → `S-09`                      | **Poza v0.1.** Pierwszy element, który zmienia model produktu, a nie dokłada do niego funkcję: dziś tożsamością jest sam klucz repozytorium. Format danych jest gotowy i nie wchodzi do zakresu. |
 
 ## Baseline
 
@@ -222,12 +224,35 @@ Fundament poniżej zakłada ten stan i nie tworzy ponownie niczego, co jest zgł
 - **Risk:** rozjazd dotyczy wąskiej klasy plików (stare pliki tekstowe z DOS-a), więc kusił, żeby go odłożyć — i to była właśnie pułapka. Koszt nie rósł liniowo, tylko skoczyłby w momencie pierwszego wydania, bo reguła jest zamrożona z formatem. Sama poprawka to jedna linia; kosztowne byłoby jej przegapienie przed `S-07`.
 - **Status:** done
 
+### S-09: Obsługa kluczy użytkowników
+
+- **Outcome:** użytkownik otwiera sklonowane repozytorium **własnym** kluczem prywatnym, zamiast przenosić na maszynę plik klucza repozytorium. Klucz repozytorium zostaje jeden, ale leży w katalogu `.git-xcrypt-keys/` zaszyfrowany osobno dla każdego uprawnionego.
+- **Change ID:** per-user-keys
+- **PRD refs:** §Access Control (dziś: „jeden ręczny transfer na maszynę"), FR-008
+- **Prerequisites:** S-03 (zrobiony)
+- **Parallel with:** —
+- **Blockers:** — technicznych nie ma; to jest decyzja o zakresie produktu, nie o kolejności prac.
+- **Zapisany 2026-08-11 na prośbę właściciela**, przeniesiony z `## Parked`. **To zapis zamiaru, nie harmonogram** — nic tu nie jest zaplanowane na konkretne wydanie. PRD wymienia zarządzanie odbiorcami w §Non-Goals, ale ten zapis dotyczy **v0.1**; element leży poza nią i nie jest z nim sprzeczny.
+- **Co już istnieje, i jest tego mało:** zarezerwowana nazwa katalogu `.git-xcrypt-keys` (`src/git/repo.rs:17`), wraz z tym, że nigdy nie jest szyfrowany i że sekcja zarządzana renderuje mu wykluczenie. Ani jednej linii kopert.
+- **Czego robić nie trzeba, i to jest tu najważniejsze:** **format pliku danych jest gotowy i nie zmienia się ani o bajt.** Koperta pakuje 32-bajtowy **klucz główny**, więc jest niezależna od suite'a i od formatu bloba, a `key_id` — w zamrożonym nagłówku, w AAD — identyfikuje właśnie klucz główny, więc wiele kluczy w jednym repozytorium i rotacja też mieszczą się bez nowego `suite`. Blob sam mówi, którym kluczem go otwierać.
+- **Unknowns:**
+  - **Format koperty: `age` czy `crypto_box`?** To jest otwarta decyzja 1 z `zalozenia.md` i jedyna, która blokuje start. Konflikt jest realny, bo obie strony łamią coś zapisanego: `age` (0.12.1, MIT OR Apache-2.0) jest interoperacyjny i mały, ale **spoza RustCrypto**; `crypto_box` (0.9.1 stabilne, 0.10.0-pre.0 w drodze, Apache-2.0 OR MIT) regułę „wyłącznie RustCrypto" spełnia, ale każe napisać **własny** format koperty — czyli dokładnie to, czego zabrania druga twarda reguła, „nie składamy własnych konstrukcji z prymitywów". — Właściciel: użytkownik. Blokuje: tak, start elementu.
+  - **`sequoia-openpgp` odpada na licencji, i to jest fakt zmierzony 2026-08-11, którego `zalozenia.md` poz. 1 nie zna.** Wersja 2.4.1 jest na **LGPL-2.0-or-later**, a lista dozwolonych w `deny.toml` nie zawiera żadnego GPL ani LGPL — polityka istnieje właśnie po to, żeby copyleft nie wszedł bocznymi drzwiami z zależnością i nie unieważnił wyboru `MIT OR Apache-2.0`. Czyli odrzuciłoby ją własne CI, zanim ktokolwiek zmierzyłby zapowiadany „nakład i rozmiar binarki". Wraca do gry tylko wtedy, gdy właściciel świadomie otworzy politykę licencyjną. — Właściciel: użytkownik. Blokuje: nie (zawęża wybór do dwóch).
+  - **Gdzie leży klucz prywatny użytkownika i jak trafia na drugą maszynę?** Dziś pojęcie tożsamości użytkownika **nie istnieje** — tożsamością jest sam klucz repozytorium. Koperty wymagają pary kluczy na osobę, więc problem transportu, który produkt świadomie zostawia użytkownikowi, przesuwa się o jeden poziom, a nie znika. Nierozstrzygnięte. — Właściciel: użytkownik. Blokuje: tak.
+  - **Czy `add-user` / `list-users` to właściwy zestaw komend**, skoro nazwy pochodzą z `git-crypt`, a zasada projektu mówi „pozostałe komendy mają odpowiadać projektom źródłowym co do nazwy i zachowania". — Właściciel: użytkownik. Blokuje: nie.
+- **Dwie własności do udokumentowania, obie sprzeczne z intuicją:** dodanie odbiorcy daje dostęp do **całej historii**, nie od momentu dodania, bo klucz repozytorium jest jeden i niezmienny; usunięcie odbiorcy **nie odbiera** dostępu do tego, co już sklonował, i wymaga rotacji klucza, która sama jest poza zakresem v0.1. Jedno i drugie musi stać w dokumentacji użytkownika, zanim ktokolwiek na tym polegnie.
+- **Risk:** to jedyny element roadmapy, który zmienia **model produktu**, a nie dodaje do niego funkcję — persona z PRD to jeden deweloper na kilku maszynach, więc odbiorcy są raczej innym produktem zbudowanym na tym samym formacie niż brakującą częścią tego. Ryzyko drugie, tańsze do przeoczenia: koperta jest miejscem, w którym łatwo złożyć własną konstrukcję kryptograficzną, a to jest dokładnie ta klasa błędu, przed którą broni reguła „nigdy nie składamy konstrukcji z prymitywów". Wybór `crypto_box` czyni to ryzyko realnym i wymagałby zapisania go tak samo jawnie, jak zapisano ryzyko nieaudytowanego `aes-siv`.
+- **Status:** todo
+
 ## Backlog Handoff
 
 Backlog v0.1 jest **pusty** — `S-07` zamknięty 2026-08-07 wydaniem `v0.1.0`, jako ostatni. `S-08` wszedł przed nim 2026-08-04, w wymaganej kolejności: reguła tekst/binarny zamraża się z pierwszym publicznym wydaniem. Co zostało poza roadmapą v0.1: publikacja na crates.io i tap Homebrew (kanały dystrybucji), plus pozycje z `## Parked`.
 
+**Poza v0.1 stoi dziś jeden element: `S-09`**, zapisany 2026-08-11. Nie jest gotowy do `/10x-plan` i nie jest zaplanowany na żadne wydanie — blokują go dwie nierozstrzygnięte niewiadome, format koperty i to, gdzie w ogóle mieszka klucz prywatny użytkownika.
+
 | Roadmap ID | Change ID                    | Sugerowany tytuł zadania                            | Gotowe do `/10x-plan` | Uwagi                                       |
 | ---------- | ---------------------------- | --------------------------------------------------- | --------------------- | ------------------------------------------- |
+| S-09       | per-user-keys                | Obsługa kluczy użytkowników                         | **nie**               | Poza v0.1, zapisane 2026-08-11. Blokuje wybór formatu koperty (`age` kontra `crypto_box`) i brak pojęcia tożsamości użytkownika. Format danych gotowy, nie zmienia się |
 | S-08       | binary-detection-parity      | Zgodność wykrywania plików binarnych z gitem        | zrobione              | Zamknięte 2026-08-04, przed `S-07` — termin dotrzymany |
 | S-07       | cross-platform-binaries      | Binarki dla Windows, macOS i Linuksa                | zrobione              | Wydane 2026-08-07 tagiem `v0.1.0` (przebieg `31211254819`): pięć archiwów z sumami i atestacją, weryfikacja odbiorcy sprawdzona. Otwarte świadomie i poza wydaniem: crates.io, tap Homebrew |
 | F-01       | git-integration-test-harness | Harness testów na prawdziwym repozytorium git       | zrobione              | Zarchiwizowane 2026-08-04                   |
@@ -253,7 +278,7 @@ Backlog v0.1 jest **pusty** — `S-07` zamknięty 2026-08-07 wydaniem `v0.1.0`, 
 
 ## Parked
 
-- **Zarządzanie odbiorcami i praca zespołowa** — Dlaczego: PRD §Non-Goals; model jest jednoosobowy, klucz przenoszony plikiem.
+- **Zarządzanie odbiorcami i praca zespołowa** — **przeniesione 2026-08-11 do `S-09`**, więc nie leży już tutaj. Powodem zaparkowania było PRD §Non-Goals, i ten zapis zostaje w mocy **dla v0.1**; `S-09` stoi poza nią.
 - **Kompatybilność z repozytoriami oryginalnego git-crypt** — Dlaczego: PRD §Non-Goals; własny format bez ścieżki migracji.
 - **Ukrywanie metadanych** — Dlaczego: PRD §Non-Goals; nazwy plików, rozmiary i fakt zmiany pozostają jawne z założenia konstrukcji.
 - **Ochrona przed skompromitowaną maszyną** — Dlaczego: PRD §Non-Goals; po odblokowaniu sekrety leżą jawnie na dysku.
