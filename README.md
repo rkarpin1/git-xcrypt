@@ -623,10 +623,12 @@ more than a bare signature would. There is no key to fetch and none to trust:
 the attestation is bound to the workflow's own identity.
 
 What it does **not** answer is whether these bytes follow from that source. The
-build is not reproducible — absolute paths and the compiler version reach the
-binary, so nobody can rebuild it and compare checksums. If that is the guarantee
-you need, build from source; `cargo install --path .` gives you a chain you
-control end to end.
+build is not reproducible — the builder's own paths and the compiler version
+reach the binary, so nobody can rebuild it and compare checksums. That is a
+settled decision rather than a gap waiting to be closed: reproducibility is out
+of scope for this project. If it is the guarantee you need, build from source;
+`cargo install --path .` gives you a chain you control end to end, and it needs
+nothing from us.
 
 The `.sha256` file beside each archive is for spotting a truncated or corrupted
 download. It is not a security check: anyone who can replace the archive can
