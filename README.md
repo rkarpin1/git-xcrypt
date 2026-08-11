@@ -9,8 +9,8 @@ covered by tests that drive a real git, on Linux, macOS and Windows.
 Ready-made binaries for five targets are on the
 [releases page](https://github.com/rkarpin1/git-xcrypt/releases), each with a
 SHA-256 sum and a build provenance attestation — see §Verifying a downloaded
-release. The crate is not on crates.io yet, so from source it is
-`cargo install --path .`. [`CHANGELOG.md`](CHANGELOG.md) lists what this
+release. From a registry it is `cargo install git-xcrypt`, which builds from
+source and needs Rust 1.88 or newer. [`CHANGELOG.md`](CHANGELOG.md) lists what this
 release contains, what is frozen with it, and what it deliberately leaves out.
 
 ## Quick start
@@ -608,7 +608,8 @@ exits 0, and the first thing that would have told you was the failed checkout.
 ## Building
 
 ```sh
-cargo install --path .
+cargo install git-xcrypt     # from crates.io
+cargo install --path .       # from a clone
 ```
 
 Requires Rust 1.88 or newer (the crate declares this as its MSRV and CI holds it
