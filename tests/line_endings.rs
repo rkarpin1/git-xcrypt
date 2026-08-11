@@ -346,3 +346,108 @@ fn content_whose_original_cannot_come_back_is_named_and_nothing_else_is() {
         );
     }
 }
+
+/// The configuration in which git converts nothing, and where we used to anyway.
+///
+/// `core.autocrlf` false or unset with `core.eol` unset is git's own default
+/// everywhere except a Git for Windows install that chose "checkout CRLF"; in it
+/// git leaves every unattributed path exactly as stored. Until 2026-08-11 a
+/// declared path did not: the managed section puts `-text` on it, so git steps
+/// aside, and `eol::resolve_output` then fell through to the platform's own
+/// ending. Declaring a file secret therefore changed its line endings, in
+/// opposite directions on the two platforms, with `git status` clean throughout.
+///
+/// Measured on git 2.55, two throwaway repositories, identical bytes in a
+/// declared path and an undeclared one:
+///
+/// | config | undeclared | declared, before | declared, after |
+/// | --- | --- | --- | --- |
+/// | `autocrlf=true` | `LF` in → `CRLF` | `CRLF` | `CRLF` |
+/// | `autocrlf=input` | `CRLF` in → `LF` | `LF` | `LF` |
+/// | `autocrlf=false`, `eol` unset | `LF` in → `LF` | **`CRLF`** | `LF` |
+///
+/// The undeclared twin is the whole point of the shape: it is what the same file
+/// would have done had nobody declared it, so it is the only baseline that can
+/// catch this. A test that only asserted "LF comes back as LF" would pass on a
+/// machine whose configuration happens to ask for LF.
+///
+/// **What this deliberately does not claim to fix.** A file brought in with
+/// `CRLF` still comes back `LF` here, because `clean` normalises before the
+/// header can record which ending was there and no choice on the check-out side
+/// can bring that back. The row is asserted below so the limit is visible rather
+/// than implied — what the change buys for it is that the answer no longer
+/// depends on the platform.
+///
+/// **The first assertion only bites on Windows**, and that is not a flaw to fix
+/// but a fact to know: the old fall-through was `EolMode::Native`, which already
+/// reads `LF` on Linux and macOS, so there is nothing there for it to catch.
+/// Verified by mutation on Windows — restoring `Native` fails it with `CRLF` on
+/// the left. The three-platform matrix in CI is what keeps that arm covered, the
+/// same argument `eol::apply_where` makes for taking its platform as an
+/// argument. The `CRLF` rows below bite everywhere.
+#[test]
+fn a_declared_path_is_converted_no_further_than_an_undeclared_one_when_nothing_asks() {
+    let home = tempfile::TempDir::new().expect("could not create a home directory");
+    let repo = TestRepo::init().with_home(home.path());
+    repo.set_config("core.autocrlf", "false");
+
+    // The premise, checked rather than assumed: this scenario is about `core.eol`
+    // being unset, and a machine whose system configuration sets it would be
+    // testing a different row. `with_home` already rules the global file out.
+    let configured = repo.git(["config", "--get", "core.eol"]);
+    assert!(
+        !configured.status.success(),
+        "this machine sets core.eol to {:?}, so the unset row cannot be tested here",
+        String::from_utf8_lossy(&configured.stdout).trim()
+    );
+
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.xcrypt_ok(["sync"]);
+
+    let lf = &b"first\nsecond\n"[..];
+    let crlf = &b"first\r\nsecond\r\n"[..];
+    for (declared, plain, content) in [
+        ("secrets/lf.env", "plain/lf.env", lf),
+        ("secrets/crlf.env", "plain/crlf.env", crlf),
+    ] {
+        repo.write_file(declared, content);
+        repo.write_file(plain, content);
+    }
+    repo.commit_all("the same bytes, declared and not");
+
+    repo.recheckout("secrets/lf.env");
+    repo.recheckout("plain/lf.env");
+    assert_eq!(
+        repo.worktree_bytes("secrets/lf.env"),
+        repo.worktree_bytes("plain/lf.env"),
+        "declaring a path secret converted it where git converts nothing"
+    );
+    assert_eq!(
+        repo.worktree_bytes("secrets/lf.env"),
+        lf,
+        "nothing asked for a conversion, so the stored bytes must come back"
+    );
+
+    // The half `clean` decides, asserted so it cannot regress unnoticed in
+    // either direction: it is still lossy, and it is now the same loss on every
+    // platform rather than one that reads CRLF on Windows and LF elsewhere.
+    repo.recheckout("secrets/crlf.env");
+    repo.recheckout("plain/crlf.env");
+    assert_eq!(
+        repo.worktree_bytes("plain/crlf.env"),
+        crlf,
+        "git converts nothing here, so the undeclared twin keeps its CRLF"
+    );
+    assert_eq!(
+        repo.worktree_bytes("secrets/crlf.env"),
+        lf,
+        "a declared path is normalised on the way in, and that is not recoverable"
+    );
+
+    // And whatever came back still settles, which is the invariant every row of
+    // the matrix above shares.
+    repo.assert_status_clean();
+    repo.git_ok(["add", "-A"]);
+    repo.assert_status_clean();
+}

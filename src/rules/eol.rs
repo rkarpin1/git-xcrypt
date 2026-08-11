@@ -7,7 +7,10 @@
 //! * clean never reads git's configuration. The same file has to yield the same
 //!   plaintext on every machine, or the ciphertext differs and determinism dies.
 //! * smudge does read it. That is the one moment where machines are allowed to
-//!   differ, and where they should.
+//!   differ, and where they should — but only when the configuration asks. Since
+//!   2026-08-11 the case where nothing asks writes the stored bytes back
+//!   unchanged rather than the platform's own ending, so two machines differ
+//!   because someone chose it and not by default; see [`resolve_output`].
 //!
 //! Whether a file was normalised at all is recorded in the header's flag bit, so
 //! smudge never has to ask `.git-xcrypt` — which also removes a real race, since
@@ -173,6 +176,40 @@ pub fn to_crlf(content: &[u8]) -> Vec<u8> {
 /// The table is measured, not guessed: `autocrlf=true` yields CRLF and ignores
 /// `core.eol`, `autocrlf=input` yields LF and ignores it too, and only
 /// `autocrlf=false` lets `core.eol` decide.
+///
+/// **One row deliberately departs from git's own table, since 2026-08-11: with
+/// `core.autocrlf` false or unset and `core.eol` unset, this writes the stored
+/// bytes back unchanged rather than the platform's own ending.** That is the
+/// configuration in which git converts *nothing*, and until this change
+/// declaring a path secret opted it into a conversion the same file would never
+/// have received while stored in the clear. Measured on git 2.55, two throwaway
+/// repositories, a declared path and an undeclared one holding identical bytes:
+///
+/// | config | undeclared, git decides | declared, we decided | agreed? |
+/// | --- | --- | --- | --- |
+/// | `autocrlf=true` | `LF` in, `CRLF` out | `CRLF` out | yes |
+/// | `autocrlf=input` | `CRLF` in, `LF` out | `LF` out | yes |
+/// | `autocrlf=false`, `eol` unset | `LF` in, `LF` out | **`CRLF` out** | **no** |
+/// | `autocrlf=false`, `eol=lf` | `CRLF` in, `CRLF` out | **`LF` out** | **no** |
+///
+/// `git status` was clean in all four, so nothing signalled either mismatch. The
+/// third row is what this arm fixes; the fourth is the check-in half — `clean`
+/// normalises before the header can record which ending was there — and no
+/// choice made here can bring that back, so it stays a documented limit rather
+/// than a fixed one. What the change does buy for it is that the answer stops
+/// depending on the platform: after this, a declared path on Windows and on
+/// Linux receives identical bytes unless something explicitly asks otherwise,
+/// which is what §Non-Functional Requirements means by no differences across
+/// machines.
+///
+/// An explicit `core.eol=native` still selects the platform's ending, because
+/// that is a user asking for it rather than a default nobody chose, and it is
+/// the way back to the previous behaviour without editing `.git-xcrypt`. So is
+/// `eol=native` on the pattern, which outranks all of this.
+///
+/// Nothing here touches a stored byte: `clean` never reads configuration, the
+/// ciphertext is unchanged, and whatever this writes normalises back to the same
+/// plaintext — so the repository stays clean across the change.
 #[must_use]
 pub fn resolve_output(
     declared: Option<EolMode>,
@@ -193,7 +230,13 @@ pub fn resolve_output(
         _ => match eol.map(str::to_ascii_lowercase).as_deref() {
             Some("crlf") => EolMode::Crlf,
             Some("lf") => EolMode::Lf,
-            _ => EolMode::Native,
+            Some("native") => EolMode::Native,
+            // Unset, empty, or a value git would not recognise: nobody asked for
+            // a conversion, so there is none. The stored plaintext is already
+            // LF, so this is the same thing the binary path does — the header
+            // decides whether the content was normalised, and the configuration
+            // only ever converts when it says so out loud.
+            _ => EolMode::Lf,
         },
     }
 }
@@ -201,11 +244,16 @@ pub fn resolve_output(
 /// Whether **git** would write `CRLF` into the working tree for a path it
 /// converts itself.
 ///
-/// Git's `text_eol_is_crlf`, which is the same table [`resolve_output`] already
-/// reproduces for our own output — `core.autocrlf` first, `core.eol` only while
-/// it is false, the platform only when neither says anything. It is asked about
-/// a different subject: not "what should we write" but "is git about to expand
-/// `LF` to `CRLF` in bytes it hands us".
+/// Git's `text_eol_is_crlf`: `core.autocrlf` first, `core.eol` only while it is
+/// false, the platform when neither says anything. It is asked about a different
+/// subject than [`resolve_output`] — not "what should we write" but "is git
+/// about to expand `LF` to `CRLF` in bytes it hands us" — and since 2026-08-11
+/// the two answers differ in one row, so it computes its own rather than
+/// borrowing. With `core.eol` unset git's default *is* `native`, and a path some
+/// foreign line declared `text` really does get expanded; reading our own
+/// narrower answer here would have made this say "git left it alone" about a
+/// checkout that had just eaten the `CR` bytes out of a ciphertext, which is the
+/// one question this function exists to answer.
 ///
 /// That question only comes up on the smudge path, and only once an
 /// authentication tag has already failed. Git's check-out order is blob, then
@@ -219,10 +267,17 @@ pub fn git_writes_crlf(autocrlf: Option<&str>, core_eol: Option<&str>) -> bool {
 
 /// The platform-independent core, for the same reason [`apply_where`] has one.
 fn writes_crlf_where(autocrlf: Option<&str>, core_eol: Option<&str>, native_is_crlf: bool) -> bool {
-    match resolve_output(None, autocrlf, core_eol) {
-        EolMode::Crlf => true,
-        EolMode::Lf => false,
-        EolMode::Native => native_is_crlf,
+    match autocrlf.map(str::to_ascii_lowercase).as_deref() {
+        Some("input") => false,
+        Some(value) if is_git_true(value) => true,
+        _ => match core_eol.map(str::to_ascii_lowercase).as_deref() {
+            Some("crlf") => true,
+            Some("lf") => false,
+            // Git's documented default for `core.eol` is `native`, and unlike
+            // our own output this must keep saying so: the subject here is a
+            // path git converts, where the default really does apply.
+            _ => native_is_crlf,
+        },
     }
 }
 
@@ -401,6 +456,55 @@ mod tests {
                 "a Unix checkout leaves the bytes alone"
             );
         }
+    }
+
+    /// The one row where our output and git's table are allowed to disagree.
+    ///
+    /// Both halves matter and they pull opposite ways, which is why they are
+    /// asserted together: [`resolve_output`] must stop converting where nobody
+    /// asked, and [`git_writes_crlf`] must keep saying that git converts there —
+    /// it is asked about a path a foreign `text` line pulled out from under the
+    /// managed `-text`, and answering "left alone" would blame a healthy
+    /// configuration for a checkout that just ate the `CR` bytes out of a
+    /// ciphertext.
+    #[test]
+    fn nothing_asked_for_a_conversion_so_we_write_none_where_git_still_would() {
+        for autocrlf in [None, Some("false"), Some("0"), Some("off")] {
+            for core_eol in [None, Some(""), Some("nonsense")] {
+                assert_eq!(
+                    resolve_output(None, autocrlf, core_eol),
+                    EolMode::Lf,
+                    "autocrlf={autocrlf:?} eol={core_eol:?}: git converts nothing \
+                     here, so a declared path must come back as it was stored"
+                );
+                // Same inputs, the other question, the other answer.
+                assert!(
+                    writes_crlf_where(autocrlf, core_eol, true),
+                    "autocrlf={autocrlf:?} eol={core_eol:?}: git's own default \
+                     for core.eol is native, and a Windows checkout expands"
+                );
+            }
+        }
+
+        // Asking for the platform explicitly still gets it — that is the way
+        // back to the old behaviour without touching `.git-xcrypt`, and the
+        // pattern's own `eol=native` outranks the configuration entirely.
+        assert_eq!(
+            resolve_output(None, Some("false"), Some("native")),
+            EolMode::Native
+        );
+        assert_eq!(
+            resolve_output(Some(EolMode::Native), Some("false"), None),
+            EolMode::Native
+        );
+
+        // And the rows that were never in question stay where they were.
+        assert_eq!(resolve_output(None, Some("true"), None), EolMode::Crlf);
+        assert_eq!(resolve_output(None, Some("input"), None), EolMode::Lf);
+        assert_eq!(
+            resolve_output(None, Some("false"), Some("crlf")),
+            EolMode::Crlf
+        );
     }
 
     #[test]

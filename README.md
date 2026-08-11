@@ -539,6 +539,19 @@ exits 0, and the first thing that would have told you was the failed checkout.
 - Submodules have their own configuration and need their own `init`.
 - `working-tree-encoding` (character-set conversion, e.g. UTF-16) is not
   supported.
+- **A declared file that arrives with CRLF comes back with LF**, unless you say
+  otherwise. Declared paths are treated as `text=auto` — git's own default is to
+  leave an unattributed path alone unless `core.autocrlf` says otherwise — so the
+  filter normalises on the way in, and the header records only *that* it
+  normalised, never which ending was there. Nothing can restore it afterwards,
+  and `git status` stays clean, because the new bytes normalise to the plaintext
+  already stored. Declare the path `binary` in `.git-xcrypt` to store it verbatim,
+  or `eol=crlf` to have every checkout write CRLF. The other direction is closed:
+  with `core.autocrlf` false or unset and `core.eol` unset — the configuration in
+  which git converts nothing — a declared path now receives the stored bytes
+  unchanged rather than the platform's own ending, so declaring a file no longer
+  expands its `LF` on Windows. Set `core.eol=native`, or `eol=native` on the
+  pattern, if you want the platform's ending back.
 - A file with mixed line endings does not survive the round trip: normalisation
   is lossy, so such a file comes back with one kind of ending. The filter says so
   on `stderr` when it first encrypts such a file, and `git status` will **not** —

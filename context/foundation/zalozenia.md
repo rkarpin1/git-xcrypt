@@ -363,6 +363,26 @@ Reguła do odtworzenia na wyjściu smudge (zmierzona, przy ustawionym `text`):
 | `false`         | `crlf`     | CRLF                               |
 | `false`         | `lf`       | LF                                 |
 | `false`         | `native`   | platforma (LF/macOS, CRLF/Windows) |
+| `false`/brak    | **brak**   | **bajty jak zapisane (LF) — od 2026-08-11; wcześniej: platforma** |
+
+**Ostatni wiersz jest świadomym odejściem od tabeli gita i jedynym takim — rozstrzygnięte 2026-08-11.** Reszta tabeli opisuje, co git robi ścieżce, nad którą stoi `text`; ten wiersz opisuje konfigurację, w której git **nie konwertuje niczego**, i to jest jego domyślna konfiguracja wszędzie poza instalacją Git for Windows, która wybrała „checkout CRLF, commit LF".
+
+- **Zmierzony problem.** Sekcja zarządzana kładzie na ścieżce szyfrowanej `-text`, więc git odsuwa się od niej, a `resolve_output` spadał wtedy na `EolMode::Native`. Zadeklarowanie pliku zmieniało więc jego końce linii, i to **w przeciwne strony na obu systemach**. Zmierzone na git 2.55, dwa repozytoria tymczasowe, identyczne bajty w ścieżce zadeklarowanej i niezadeklarowanej:
+
+  | konfiguracja | niezadeklarowana (decyduje git) | zadeklarowana, przed | zadeklarowana, po |
+  | --- | --- | --- | --- |
+  | `autocrlf=true` | LF na wejściu → CRLF | CRLF | CRLF |
+  | `autocrlf=input` | CRLF na wejściu → LF | LF | LF |
+  | `autocrlf=false`, `eol` brak | LF → **LF** | **CRLF** | LF |
+  | `autocrlf=false`, `eol=lf` | CRLF → **CRLF** | **LF** | LF |
+
+  We wszystkich czterech `git status` był **czysty** — nic tego nie sygnalizowało.
+
+- **Naprawiona jest trzecia linia, nie czwarta.** Czwarta to strona check-in: `clean` normalizuje, zanim nagłówek zdąży zapisać, *jaki* koniec linii tam był, a bit 0 mówi tylko „normalizowano". Żadna decyzja na wyjściu tego nie odwróci, więc zostaje **zapisaną granicą**: plik przyniesiony z CRLF wraca jako LF. Co zmiana kupuje dla niej: odpowiedź przestaje zależeć od platformy, czyli ta sama deklaracja daje ten sam katalog roboczy na Windows i na Linuksie — a to jest dokładnie to, czego żąda `prd.md` §NFR („bez różnic … włącznie z zachowaniem końców linii").
+- **Jawne `core.eol=native` nadal wybiera platformę**, bo to jest prośba użytkownika, a nie domyślna, której nikt nie wybierał — i jest drogą powrotu do poprzedniego zachowania bez ruszania `.git-xcrypt`. `eol=native` na wzorcu przebija to wszystko, jak dotąd.
+- **`git_writes_crlf` tej zmiany nie dziedziczy i nie może.** Ta funkcja odpowiada na inne pytanie — „czy git właśnie rozwinął LF w bajtach, które nam podał" — o ścieżkę, nad którą obca linia ustawiła `text`; tam domyślne `core.eol` naprawdę znaczy `native`. Odpowiadanie tam naszą węższą regułą kazałoby jej mówić „git nic nie ruszył" o checkoucie, który właśnie zjadł `CR` z ciphertextu. Od tej daty obie tabele są liczone osobno w `src/rules/eol.rs` i pilnuje tego jeden test naraz w obie strony.
+- **Ani jeden zapisany bajt się nie rusza:** `clean` konfiguracji nie czyta, ciphertext jest ten sam, a to, co smudge wypisze, normalizuje się z powrotem do tego samego plaintextu — więc repozytorium przechodzi przez tę zmianę czyste. Zestaw testów przed i po ma identyczny zestaw wyników.
+- Testy: `eol::tests::nothing_asked_for_a_conversion_so_we_write_none_where_git_still_would` (obie tabele naraz) i scenariusz `tests/line_endings.rs::a_declared_path_is_converted_no_further_than_an_undeclared_one_when_nothing_asks`, który porównuje z **bliźniakiem niezadeklarowanym** — bo tylko on mówi, co plik zrobiłby, gdyby nikt go nie zadeklarował. Obie zmutowane na czerwono. Zapisana granica strażnika: pierwsza asercja scenariusza zapala się **wyłącznie na Windows**, bo stary fallback `Native` na Linuksie i macOS i tak czytał LF; pokrywa to matryca trzech platform w CI.
 
 Niezmiennik, który spina asymetrię: na Windows z `autocrlf=true` smudge zapisuje CRLF, w katalogu roboczym leży CRLF, a następny clean normalizuje z powrotem do LF → ten sam ciphertext co przed checkoutem → `git status` czysty. To ten sam model, którym git obsługuje indeks, przesunięty o jeden krok, przed AEAD.
 
