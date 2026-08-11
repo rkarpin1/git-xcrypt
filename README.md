@@ -552,6 +552,12 @@ exits 0, and the first thing that would have told you was the failed checkout.
   unchanged rather than the platform's own ending, so declaring a file no longer
   expands its `LF` on Windows. Set `core.eol=native`, or `eol=native` on the
   pattern, if you want the platform's ending back.
+- **`eol=` reaches only the files the filter normalises.** It applies to content
+  stored as text; a file the content rule reads as binary — a NUL byte is
+  enough — is stored verbatim and every checkout writes those bytes back, `eol=`
+  or no `eol=`. So one pattern can honour `eol=crlf` for one file and not for
+  the next one beside it. The filter names any file this happens to, on `stderr`
+  and only that file; add `text` to the pattern if it should be converted anyway.
 - A file with mixed line endings does not survive the round trip: normalisation
   is lossy, so such a file comes back with one kind of ending. The filter says so
   on `stderr` when it first encrypts such a file, and `git status` will **not** —

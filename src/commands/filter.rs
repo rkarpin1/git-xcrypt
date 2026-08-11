@@ -246,6 +246,58 @@ impl Context {
         );
     }
 
+    /// Says so when a declared `eol=` will not reach this file after all.
+    ///
+    /// `eol=` only ever applies to content the check-in path normalised: the
+    /// header records that in bit 0, and `smudge` leaves on the spot when it is
+    /// clear, without so much as looking at the declaration. Under the default
+    /// `text=auto` that verdict comes from the **content**, so one pattern can
+    /// honour `eol=crlf` for one file and silently ignore it for the next one in
+    /// the same directory. Measured before this existed: `blobs/ eol=crlf` over
+    /// binary content checked out with `LF`, and nothing said a word.
+    ///
+    /// The parser already refuses the shape it *can* see — `-text` or `binary`
+    /// beside an `eol=`, which is a contradiction on the line itself — and that
+    /// warning fires once, at load. This one cannot live there: at parse time
+    /// there is no content to classify. So it is asked here, on the same gate as
+    /// the two warnings above, and only for `TextMode::Auto`; repeating the
+    /// parser's answer per file would be noise on a repository that already got
+    /// the message.
+    ///
+    /// A warning, never a refusal, for the reason every warning on this path is
+    /// one: with `required = true` a non-zero exit stops every git operation in
+    /// the repository, and nothing here is lost — the file is stored verbatim,
+    /// which is the safe direction.
+    fn warn_if_the_declared_eol_will_not_apply(
+        &self,
+        path: &[u8],
+        decision: &crate::rules::declaration::Decision,
+        content: &[u8],
+    ) {
+        use crate::rules::declaration::{EolMode, TextMode};
+
+        let Some(eol) = decision.eol else { return };
+        if decision.text != TextMode::Auto
+            || crate::rules::eol::should_normalise(TextMode::Auto, content)
+        {
+            return;
+        }
+
+        let spelling = match eol {
+            EolMode::Lf => "lf",
+            EolMode::Crlf => "crlf",
+            EolMode::Native => "native",
+        };
+        eprintln!(
+            "git-xcrypt: {}: `eol={spelling}` does not reach this file — its \
+             content reads as binary by git's own rule, so it is stored verbatim \
+             and every checkout writes back exactly those bytes. Declare the path \
+             `text` in {} if it should be converted anyway.",
+            path.as_bstr(),
+            crate::git::repo::CONFIG_FILE
+        );
+    }
+
     /// Whether `path` needs the "already in `HEAD` in the clear" warning.
     ///
     /// Built on first use and kept for the rest of the process, which is what the
@@ -686,6 +738,11 @@ fn serve(context: &mut Context, request: &Request, output: &mut impl Write) -> R
                 // is handed and would report a locked repository's own blobs.
                 first_encryption = Some(request.pathname.clone());
                 context.warn_if_the_round_trip_loses_bytes(
+                    &request.pathname,
+                    &decision,
+                    &request.content,
+                );
+                context.warn_if_the_declared_eol_will_not_apply(
                     &request.pathname,
                     &decision,
                     &request.content,

@@ -214,7 +214,116 @@ pub fn open_full(git_dir: &Path, common_dir: &Path) -> Result<File> {
     config
         .append(File::from_environment_overrides().map_err(|err| broken(&err))?)
         .map_err(|err| broken(&err))?;
+    // Last, so `-c` outranks everything — including the `GIT_CONFIG_COUNT` set
+    // just above, which is the order git applies them in.
+    if let Some(overrides) = cli_overrides(std::env::var_os(CLI_OVERRIDE_ENV).as_deref()) {
+        config.append(overrides).map_err(|err| broken(&err))?;
+    }
     Ok(config)
+}
+
+/// Where git puts the overrides given as `git -c key=value`.
+const CLI_OVERRIDE_ENV: &str = "GIT_CONFIG_PARAMETERS";
+
+/// The `git -c key=value` overrides, as a configuration source.
+///
+/// **Why this is hand-rolled rather than left to `gix-config`.** That crate
+/// reads the *other* mechanism — `GIT_CONFIG_COUNT` with `GIT_CONFIG_KEY_n` and
+/// `GIT_CONFIG_VALUE_n` — and git 2.55 does not populate it for `-c`; measured,
+/// by asking an alias to print its own environment. Without this, `git -c
+/// core.autocrlf=true checkout` converted the paths git owns and left ours
+/// alone: one command, two answers, on paths sitting next to each other.
+///
+/// **The format is measured, not assumed.** git 2.55 writes shell-quoted words,
+/// key and value quoted separately, and escapes `!` outside the quotes for csh:
+///
+/// ```text
+/// 'core.autocrlf'='true' 'core.eol'='lf' 'user.name'='a b'\''c'
+/// 'alias.x'=''\!'printenv FOO'
+/// ```
+///
+/// So a word is a concatenation of quoted runs, backslash escapes and bare
+/// characters, and it is only after unquoting that `key=value` can be split —
+/// a value may legally contain spaces, quotes and `=`. Older git quoted the
+/// whole pair as `'key=value'`, which this reads identically.
+///
+/// **Fail-open throughout, and that direction is deliberate.** Everything here
+/// runs on the clean path, where `required = true` turns a wrong answer into a
+/// blocked repository rather than a diagnostic. A value nobody typed is worse
+/// than a value we did not notice: a bogus `core.attributesFile` invented by a
+/// misparse would refuse `git add` across the whole repository. So an unterminated
+/// quote drops the entire variable, a word that does not name a dotted key is
+/// skipped, and a value `gix-config` will not accept is skipped — in every case
+/// leaving the configuration files to speak for themselves, exactly as before
+/// this function existed.
+fn cli_overrides(raw: Option<&std::ffi::OsStr>) -> Option<File> {
+    let words = split_quoted(raw?.to_str()?)?;
+    let mut file = File::new(Metadata::from(gix_config::Source::Cli));
+    let mut any = false;
+
+    for word in words {
+        // No `=` at all is git's boolean shorthand: `git -c core.autocrlf` means
+        // true. `get` already spells a value-less key that way, so this stays
+        // the one spelling every caller tests for.
+        let (key, value) = match word.split_once('=') {
+            Some((key, value)) => (key.to_string(), value.to_string()),
+            None => (word, "true".to_string()),
+        };
+        if !key.contains('.') {
+            continue;
+        }
+        if file.set_raw_value(key.as_str(), value.as_str()).is_ok() {
+            any = true;
+        }
+    }
+
+    any.then_some(file)
+}
+
+/// Splits one shell-quoted line into words, or gives up on the whole line.
+///
+/// Only the three constructs git's own quoting produces: a single-quoted run is
+/// literal, a backslash outside quotes takes the next character literally, and
+/// unquoted whitespace ends a word. Returning `None` for an unterminated quote
+/// is the fail-open half of [`cli_overrides`] — half a word could name a key
+/// nobody asked for.
+fn split_quoted(line: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut started = false;
+    let mut quoted = false;
+    let mut chars = line.chars();
+
+    while let Some(character) = chars.next() {
+        match character {
+            '\'' => {
+                quoted = !quoted;
+                started = true;
+            }
+            '\\' if !quoted => {
+                current.push(chars.next()?);
+                started = true;
+            }
+            character if character.is_whitespace() && !quoted => {
+                if started {
+                    words.push(std::mem::take(&mut current));
+                    started = false;
+                }
+            }
+            character => {
+                current.push(character);
+                started = true;
+            }
+        }
+    }
+
+    if quoted {
+        return None;
+    }
+    if started {
+        words.push(current);
+    }
+    Some(words)
 }
 
 /// Writes a configuration file back to disk, replacing it in one step.
@@ -314,6 +423,8 @@ pub fn is_true(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
+
     use super::*;
     use tempfile::TempDir;
 
@@ -391,5 +502,77 @@ mod tests {
                 "{key} = `{value}` was taken for true, which git does not"
             );
         }
+    }
+
+    /// `git -c` overrides, in the shape git 2.55 actually hands them over.
+    ///
+    /// The line below is not invented: it is what
+    /// `git -c alias.showenv='!printenv GIT_CONFIG_PARAMETERS' -c core.autocrlf=true
+    /// -c core.eol=lf -c "user.name=a b'c" showenv` printed on 2.55, copied
+    /// verbatim. Three constructs have to survive it — key and value quoted
+    /// separately, a `!` escaped outside the quotes for csh, and a value holding
+    /// both a space and a quote.
+    #[test]
+    fn overrides_from_the_command_line_are_read_the_way_git_writes_them() {
+        let measured = r"'alias.showenv'=''\!'printenv GIT_CONFIG_PARAMETERS' 'core.autocrlf'='true' 'core.eol'='lf' 'user.name'='a b'\''c'";
+        let config = cli_overrides(Some(OsStr::new(measured))).expect("the line names four keys");
+
+        assert_eq!(get(&config, "core.autocrlf").as_deref(), Some("true"));
+        assert_eq!(get(&config, "core.eol").as_deref(), Some("lf"));
+        assert_eq!(get(&config, "user.name").as_deref(), Some("a b'c"));
+        assert_eq!(
+            get(&config, "alias.showenv").as_deref(),
+            Some("!printenv GIT_CONFIG_PARAMETERS"),
+            "a value may hold spaces and an escaped bang; splitting on either \
+             would invent a key nobody typed"
+        );
+
+        // Older git quoted the whole pair instead. Same words, same answer.
+        let old = cli_overrides(Some(OsStr::new("'core.autocrlf=input'"))).expect("one key");
+        assert_eq!(get(&old, "core.autocrlf").as_deref(), Some("input"));
+
+        // `git -c core.autocrlf` with no `=` is git's boolean shorthand, and it
+        // has to arrive spelled the way a value-less line in a file arrives.
+        let bare = cli_overrides(Some(OsStr::new("'core.autocrlf'"))).expect("one key");
+        assert_eq!(get(&bare, "core.autocrlf").as_deref(), Some("true"));
+
+        // An explicitly empty value is false to git, and must not be promoted.
+        let empty = cli_overrides(Some(OsStr::new("'core.autocrlf'=''"))).expect("one key");
+        let value = get(&empty, "core.autocrlf").expect("present");
+        assert!(!is_true(&value), "`-c core.autocrlf=` is false to git");
+    }
+
+    /// Everything this parser cannot read has to leave the files in charge.
+    ///
+    /// This is the half that decides whether the feature is safe to have at all.
+    /// It runs on the clean path, where `required = true` turns a wrong answer
+    /// into a repository that refuses every git operation — so a value nobody
+    /// typed is strictly worse than a value we failed to notice. Each row below
+    /// is a shape that must produce *no* override rather than a guessed one.
+    #[test]
+    fn anything_unreadable_leaves_the_configuration_files_to_speak() {
+        assert!(cli_overrides(None).is_none(), "unset means no overrides");
+        assert!(cli_overrides(Some(OsStr::new(""))).is_none());
+        assert!(cli_overrides(Some(OsStr::new("   "))).is_none());
+        assert!(
+            cli_overrides(Some(OsStr::new("'core.autocrlf'='true"))).is_none(),
+            "an unterminated quote drops the whole variable: half a word could \
+             name a key nobody asked for"
+        );
+        assert!(
+            cli_overrides(Some(OsStr::new("notdotted=1"))).is_none(),
+            "a word that is not a dotted key is skipped, not guessed at"
+        );
+
+        // A skipped word must not take its neighbours with it.
+        let mixed =
+            cli_overrides(Some(OsStr::new("notdotted=1 'core.eol'='crlf'"))).expect("one key");
+        assert_eq!(get(&mixed, "core.eol").as_deref(), Some("crlf"));
+        // Asked of the rendered file rather than through `get`, which asserts on
+        // a key with no dot in it — the very shape being skipped here.
+        assert!(
+            !mixed.to_bstring().to_str_lossy().contains("notdotted"),
+            "a word that names no section must not reach the configuration"
+        );
     }
 }

@@ -451,3 +451,135 @@ fn a_declared_path_is_converted_no_further_than_an_undeclared_one_when_nothing_a
     repo.git_ok(["add", "-A"]);
     repo.assert_status_clean();
 }
+
+/// `git -c core.autocrlf=…` has to reach the filter, or one command answers twice.
+///
+/// Git passes command-line overrides to its children through
+/// `GIT_CONFIG_PARAMETERS`, and `gix-config` reads only the *other* mechanism —
+/// `GIT_CONFIG_COUNT` with `GIT_CONFIG_KEY_n`/`VALUE_n` — which git 2.55 does not
+/// populate for `-c`. Measured before the fix, with the file saying `false` and
+/// the command saying `true`: git expanded the path it owns to `CRLF` and the
+/// filter wrote `LF` for the declared one, in the same checkout, in adjacent
+/// directories.
+///
+/// The undeclared twin is the assertion rather than a literal expectation for
+/// the same reason as the scenario above: it is what git itself did with the
+/// override, so agreeing with it is the whole claim. Reading it also keeps this
+/// honest if git ever changes how `-c` reaches a child — the test would then
+/// fail against git's new behaviour instead of quietly passing against our
+/// stale copy of the old one.
+#[test]
+fn an_override_given_on_the_command_line_reaches_the_filter_too() {
+    let repo = TestRepo::init();
+    repo.set_config("core.autocrlf", "false");
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("secrets/\n");
+    repo.xcrypt_ok(["sync"]);
+
+    let lf = &b"first\nsecond\n"[..];
+    repo.write_file("secrets/a.env", lf);
+    repo.write_file("plain/b.txt", lf);
+    repo.commit_all("the same bytes, declared and not");
+
+    for path in ["secrets/a.env", "plain/b.txt"] {
+        std::fs::remove_file(repo.path().join(path)).expect("could not remove the file");
+    }
+    repo.git_ok([
+        "-c",
+        "core.autocrlf=true",
+        "checkout",
+        "--",
+        "secrets",
+        "plain",
+    ]);
+
+    assert_eq!(
+        repo.worktree_bytes("secrets/a.env"),
+        repo.worktree_bytes("plain/b.txt"),
+        "`git -c core.autocrlf=true` reached git and not the filter, so one \
+         command gave two answers"
+    );
+    assert_eq!(
+        repo.worktree_bytes("secrets/a.env"),
+        b"first\r\nsecond\r\n",
+        "the override asked for CRLF and git obeyed it, so we must too"
+    );
+
+    // The override is gone on the next command, and nothing about it is sticky:
+    // the file's own `false` decides again for the declared path.
+    repo.recheckout("secrets/a.env");
+    assert_eq!(repo.worktree_bytes("secrets/a.env"), lf);
+
+    // The undeclared twin, meanwhile, is now *modified* — git expanded it under
+    // the override and the file's `false` will not fold it back on the way in.
+    // That is git's own doing and it is asserted rather than tidied away,
+    // because it is the second, independent proof that the override really
+    // reached git: a run where nothing converted would leave this clean.
+    let status = repo.git_ok(["status", "--porcelain"]);
+    let status = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        status.contains("plain/b.txt"),
+        "the undeclared file came back unconverted, so the override never \
+         reached git and this scenario proved nothing; status was:\n{status}"
+    );
+    assert!(
+        !status.contains("secrets/a.env"),
+        "the declared path did not settle after the override went away; \
+         status was:\n{status}"
+    );
+}
+
+/// A declared `eol=` that the content will never let apply has to say so.
+///
+/// `eol=` only reaches content the check-in path normalised — the header records
+/// that in bit 0 and `smudge` leaves before it reads the declaration — so under
+/// the default `text=auto` the answer comes from the **content**. One pattern
+/// therefore honours `eol=crlf` for one file and ignores it for the next, and
+/// until 2026-08-11 it did so in silence. The parser catches the contradiction
+/// it can see on the line itself (`-text` beside `eol=`); this one is only
+/// visible with the bytes in hand.
+///
+/// The quiet half carries the weight, as it does for every warning on this path:
+/// a line that also fires on the file where `eol=crlf` works perfectly well
+/// teaches the reader to skip both.
+#[test]
+fn an_eol_the_content_will_never_accept_is_named_and_the_working_one_is_not() {
+    let repo = TestRepo::init();
+    repo.init_xcrypt();
+    repo.write_xcrypt_config("blobs/  eol=crlf\ntext/   eol=crlf\n");
+    repo.xcrypt_ok(["sync"]);
+
+    // Binary by git's own rule — a NUL is enough — and ordinary text beside it.
+    repo.write_file("blobs/bin.dat", b"A=1\nB=2\n\x00\x01\x02\n");
+    repo.write_file("text/t.env", b"A=1\nB=2\n");
+
+    let output = repo.git_ok(["add", "-A"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        stderr.contains("blobs/bin.dat") && stderr.contains("`eol=crlf` does not reach"),
+        "the declaration promised CRLF for a file stored verbatim and nothing \
+         said so; stderr was:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("text/t.env"),
+        "the file `eol=crlf` genuinely applies to must not be warned about, or \
+         the warning teaches the reader to skip it; stderr was:\n{stderr}"
+    );
+
+    // And the claim the warning makes is true: the binary file comes back byte
+    // for byte, CRLF or no CRLF in the declaration.
+    repo.commit_all("two files, one declaration");
+    repo.recheckout("blobs/bin.dat");
+    assert_eq!(
+        repo.worktree_bytes("blobs/bin.dat"),
+        b"A=1\nB=2\n\x00\x01\x02\n",
+        "the warning says it is stored verbatim, so it had better be"
+    );
+    repo.recheckout("text/t.env");
+    assert_eq!(
+        repo.worktree_bytes("text/t.env"),
+        b"A=1\r\nB=2\r\n",
+        "and `eol=crlf` really does apply where the content allows it"
+    );
+}
