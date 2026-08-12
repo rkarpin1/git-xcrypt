@@ -27,25 +27,21 @@ exclude = ["/context", "/.idea", "/.github", "/.claude"]
 unsafe_code = "forbid"
 
 [dependencies]
-# A pre-release, deliberately, and it buys one thing: `aes-siv` 0.8 pulls `aes`
-# 0.9, which compiles the aarch64 backend unconditionally and picks it at
-# *runtime* through `cpufeatures` — no opt-in cfg. That is what lets
-# `.cargo/config.toml` go away, and with it the gap where `cargo install
-# git-xcrypt` from a registry ran the software backend on Apple Silicon while a
-# build from a clone did not.
+# 0.8 is what pulls `aes` 0.9, which compiles the aarch64 backend
+# unconditionally and picks it at *runtime* through `cpufeatures` — no opt-in
+# cfg. That is what lets `.cargo/config.toml` go away, and with it the gap where
+# `cargo install git-xcrypt` from a registry ran the software backend on Apple
+# Silicon while a build from a clone did not.
 #
-# The risk is narrower than "rc" suggests, measured rather than assumed: the
-# only pre-release package in the whole graph is this one — `aead` 0.6.1,
-# `cipher` 0.5.2, `digest` 0.11.3, `cmac` 0.8.0, `ctr` 0.10.1, `dbl` 0.5.0 and
-# `aes` 0.9.2 all resolve to stable, and every one of them declares MSRV 1.85,
-# so the 1.88 floor is untouched. The requirement lifts itself to 0.8.0 when
-# that lands.
+# This rode `0.8.0-rc.3` from 2026-08-11 until 2026-08-12, when 0.8.0 landed and
+# the requirement lifted itself onto it, exactly as recorded. There is now no
+# pre-release package anywhere in the graph.
 #
 # Not one stored byte moves: all four frozen vectors in
 # `tests/format_vectors.rs` reproduce byte for byte under 0.8, decrypt back, and
 # RFC 5297 A.1 still matches. RFC 5297 is frozen, so the crate version cannot
 # enter the format — but that is the argument, and the vectors are the proof.
-aes-siv = "0.8.0-rc.3"
+aes-siv = "0.8.0"
 base64 = "0.23"
 bstr = "1.13.0"
 clap = { version = "4.6.5", features = ["derive"] }
