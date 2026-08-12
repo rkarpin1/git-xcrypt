@@ -28,6 +28,16 @@ by any earlier version still imports. This is a minor version, not a patch.
 - **The cipher crate is `aes-siv` 0.8.0**, no longer a release candidate. Nothing
   else about the dependency changed.
 
+### Fixed
+
+- **A repository closed by `lock` can check its own files out again.** Every
+  `git checkout` in it failed, and because git removes the old file before
+  calling the filter, the declared file was gone from the working tree with
+  nothing able to put it back — `git checkout --` and `git reset --hard` failed
+  the same way. Encrypted files are now written out as they are stored, with a
+  note saying `unlock` opens them. A key that is present but unreadable still
+  stops the operation.
+
 ## [0.1.2] - 2026-08-11
 
 One behaviour change and the installation documentation. **Nothing about the
