@@ -68,7 +68,7 @@ enum Mode {
 /// checked out means it is no more readable than the file it replaces, but a
 /// later `git add -A` could store it in the clear. There is no portable way to
 /// clean up after `SIGKILL`; the residue is recorded here rather than hidden.
-/// Every such file is recognised by [`is_temporary_name`], which is what the
+/// Every such file is recognised by [`strip_temporary_suffix`], which is what the
 /// user documentation has to tell people to look for after a killed `unlock` —
 /// and what `lock` sweeps before it encrypts, since a plaintext leftover would
 /// otherwise survive the one command whose job is to leave none.

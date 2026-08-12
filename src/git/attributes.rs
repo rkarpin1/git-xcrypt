@@ -867,7 +867,7 @@ pub fn catch_all_present(path: &Path) -> Result<bool> {
 /// repository healthy.
 ///
 /// Reading only. The question "does any of this actually reach a declared path"
-/// is answered by [`FilterResolver`], which runs git's own attribute stack; what
+/// is answered by [`AttributeResolver`], which runs git's own attribute stack; what
 /// this function contributes is the text of the offending lines, so a report can
 /// show a reader what to delete instead of only telling them a path is
 /// unfiltered.
@@ -934,7 +934,7 @@ pub fn foreign_lines_touching(path: &Path, axes: &[&str]) -> Result<Vec<String>>
 /// Iterative rather than recursive, for the same reason the history walk is: a
 /// working tree may be arbitrarily deep and a diagnostic command must not be the
 /// thing that crashes on it. Directories that will not open are skipped, exactly
-/// as git skips a file it cannot read — see [`FilterResolver`].
+/// as git skips a file it cannot read — see [`AttributeResolver`].
 ///
 /// **Each directory's file is probed by name, never matched against the
 /// listing.** Git does the same — it `open`s `<dir>/.gitattributes` and lets

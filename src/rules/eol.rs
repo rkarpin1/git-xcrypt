@@ -136,7 +136,7 @@ pub fn should_normalise(mode: TextMode, content: &[u8]) -> bool {
 /// is normalised under plain `text=auto` too, so the default mode loses the
 /// distinction as well — and there `git status` stays *clean* while the working
 /// tree changes, because the new bytes normalise to the same plaintext.
-/// [`survives_the_round_trip`] answers for both, and the filter warns; Open
+/// [`normalisation_is_reversible`] answers for both, and the filter warns; Open
 /// Decision 8 in `context/foundation/zalozenia.md` closed on 2026-08-06.
 /// Recorded here rather than claimed away, because an earlier version of this
 /// comment asserted the invariant held everywhere.
