@@ -128,15 +128,24 @@ enum Command {
     /// file that is already in the clear is left alone.
     Unlock {
         /// A file written by `export-key`. Omit to use the key already here.
-        #[arg(conflicts_with = "key")]
+        #[arg(conflicts_with_all = ["key", "key_value"])]
         path: Option<PathBuf>,
+
+        /// Type or paste the key instead of naming a file.
+        ///
+        /// Entry ends at a blank line, or at the end of the input — so
+        /// `cat key | git-xcrypt unlock --key` works too, and hands nothing to
+        /// the process list.
+        #[arg(long, conflicts_with = "key_value")]
+        key: bool,
 
         /// The text of such a file, given directly instead of as a path.
         ///
         /// For a CI secret that must never touch the disk. It is visible in the
-        /// process list while this runs, and your shell will remember it.
+        /// process list while this runs, and your shell will remember it; prefer
+        /// `--key` with the text on stdin, which has neither cost.
         #[arg(long, value_name = "TEXT")]
-        key: Option<String>,
+        key_value: Option<String>,
 
         /// Put the key in place and repair the setup, but decrypt nothing.
         ///
@@ -248,8 +257,14 @@ fn main() -> ExitCode {
         Command::Unlock {
             path,
             key,
+            key_value,
             key_only,
-        } => report(run_unlock(path.as_deref(), key.as_deref(), key_only)),
+        } => report(run_unlock(
+            path.as_deref(),
+            key,
+            key_value.as_deref(),
+            key_only,
+        )),
         Command::Lock { yes } => run_lock(yes),
         Command::Status { fix } => run_status(fix),
         Command::Process => report(commands::process::run()),
@@ -376,23 +391,45 @@ fn run_export_key(path: Option<&std::path::Path>, stdout: bool, force: bool) -> 
 ///
 /// The file list goes to `stderr` like everything else. It names paths, which
 /// are not secret — the contents never appear.
-fn run_unlock(path: Option<&std::path::Path>, key: Option<&str>, key_only: bool) -> Result<()> {
+fn run_unlock(
+    path: Option<&std::path::Path>,
+    key: bool,
+    key_value: Option<&str>,
+    key_only: bool,
+) -> Result<()> {
+    use std::io::IsTerminal as _;
+
+    // Before the prompt, deliberately: a run that is going to fail because this
+    // is not a repository should fail before it asks anyone to paste a secret.
     let repo = Repo::discover_from_cwd()?;
 
-    if key.is_some() {
+    if key_value.is_some() {
         // Every time, not once: the cost is paid at each invocation, and a
         // warning the user has learned to expect is still the only notice they
         // get that the key is now in two places nobody cleans up.
         eprintln!(
             "git-xcrypt: the key was given on the command line, so it is visible in the \
              process list while this runs and your shell has already recorded it. Clear \
-             that history entry, or pass a file next time."
+             that history entry, or pass `--key` and send the text in on stdin next time."
         );
     }
-    let source = match (path, key) {
-        (Some(path), _) => Some(commands::unlock::KeySource::File(path)),
-        (None, Some(text)) => Some(commands::unlock::KeySource::Material(text)),
-        (None, None) => None,
+
+    // Held for as long as the source borrows from it, and wiped when it drops.
+    let typed = if key {
+        Some(commands::unlock::read_key_material(
+            &mut std::io::stdin().lock(),
+            &mut std::io::stderr(),
+            std::io::stdin().is_terminal(),
+        )?)
+    } else {
+        None
+    };
+
+    let source = match (path, typed.as_ref(), key_value) {
+        (Some(path), _, _) => Some(commands::unlock::KeySource::File(path)),
+        (None, Some(text), _) => Some(commands::unlock::KeySource::Material(text)),
+        (None, None, Some(text)) => Some(commands::unlock::KeySource::Material(text)),
+        (None, None, None) => None,
     };
     let report = commands::unlock::run(&repo, source, key_only)?;
 

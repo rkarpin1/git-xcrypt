@@ -38,7 +38,7 @@
 //! status` being clean afterwards actually proves.
 
 use std::fs;
-use std::io::Read as _;
+use std::io::{BufRead, Read as _, Write};
 use std::path::{Path, PathBuf};
 
 use zeroize::Zeroizing;
@@ -92,6 +92,100 @@ pub enum KeySource<'a> {
     /// being written to disk, and it is the caller's to pay knowingly. The
     /// binary says so on `stderr` every time.
     Material(&'a str),
+}
+
+/// Room for the export a key file actually is, so the buffer never grows.
+///
+/// The text below holds the master key in the clear, and [`Zeroizing`] only
+/// protects a buffer that is never reallocated — a reallocation leaves the
+/// half-read key behind on the heap, where nothing wipes it. Today's export is
+/// 80 bytes (a 16-byte prefix, the version, a space, sixteen hex digits, then 44
+/// base64 characters, each line ending in `\n`); this is comfortably above it,
+/// and the same reasoning as `keyfile::encode_portable`'s sizing.
+const KEY_ENTRY_ROOM: usize = 128;
+
+/// Reads the text of a key file from `input`, prompting on `output`.
+///
+/// This is what `unlock --key` uses. It exists for the two shapes a path cannot
+/// serve: a key pasted by hand, and a key arriving over a pipe from whatever
+/// holds secrets — `cat key | git-xcrypt unlock --key`. The text goes through
+/// [`keyfile::decode_portable`] exactly like a file's, so the header still
+/// verifies the material behind it.
+///
+/// **Entry ends at a blank line, or at end of input.** The blank line is what
+/// makes the interactive form usable: an export is two lines, and pressing Enter
+/// once more is easier to reach for than the end-of-file key, which is `Ctrl+Z`
+/// on Windows and `Ctrl+D` everywhere else. Leading blank lines are skipped
+/// rather than treated as the end, because a key travelling through a password
+/// manager or an email body picks them up — the same tolerance
+/// `keyfile::significant_lines` already grants a file. The recorded limit of
+/// that: a `#` comment counts as content here, so a comment followed by a blank
+/// line ends the entry before the key arrives. It fails closed — the parser
+/// says this is not a key file — and the one shape this command is pointed at,
+/// what `export-key` writes, has no comment in it.
+///
+/// **The terminal answer is an argument, not a question asked here**, for the
+/// reason `export_key::to_writer` splits the same way: a test cannot portably
+/// arrange a terminal, and both arms have to be reachable on all three
+/// platforms. It decides two things and neither is the parsing — whether to
+/// print a prompt at all, which would be noise in a CI log, and whether the key
+/// was echoed and is therefore sitting in the scrollback.
+///
+/// # Errors
+///
+/// [`Error::Io`] when the prompt cannot be shown or the input cannot be read,
+/// including input that is not UTF-8 — a key file is text, and the file route
+/// refuses the same shape.
+pub fn read_key_material<R: BufRead, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    input_is_a_terminal: bool,
+) -> Result<Zeroizing<String>> {
+    if input_is_a_terminal {
+        writeln!(
+            output,
+            "Paste the contents of a file written by `export-key`, \
+             then press Enter on an empty line:"
+        )?;
+        output.flush()?;
+    }
+
+    let mut text = Zeroizing::new(String::with_capacity(KEY_ENTRY_ROOM));
+    let mut seen_content = false;
+    loop {
+        let start = text.len();
+        if input.read_line(&mut text)? == 0 {
+            // End of input. The pipe form ends here, and so does a terminal
+            // whose user pressed the end-of-file key instead of Enter.
+            break;
+        }
+        if text[start..].trim().is_empty() {
+            // Never part of the key, whichever side of the entry it falls on.
+            text.truncate(start);
+            if seen_content {
+                break;
+            }
+        } else {
+            seen_content = true;
+        }
+    }
+    // No assertion on the capacity here, unlike `keyfile::encode_portable`: what
+    // it sizes is a key of known length, and this is whatever the caller pasted.
+    // A longer paste reallocates and leaves a copy on the heap — the honest
+    // limit of this route, and not a reason to panic on someone's input.
+
+    if input_is_a_terminal {
+        // Only here. Over a pipe nothing was echoed, and a warning that is false
+        // half the time is one people learn to skip — the same reason the
+        // conversion gate in `filter.rs` is narrower than git's.
+        writeln!(
+            output,
+            "git-xcrypt: {}",
+            super::export_key::SCROLLBACK_WARNING
+        )?;
+        output.flush()?;
+    }
+    Ok(text)
 }
 
 /// Unlocks `repo`, optionally installing the key at `key_source` first.
@@ -614,5 +708,95 @@ fn repo_relative_bytes(relative: &Path) -> Vec<u8> {
     #[cfg(not(unix))]
     {
         relative.to_string_lossy().replace('\\', "/").into_bytes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The export shape every case below is a variation on.
+    const EXPORT: &str = "git-xcrypt-key-v1 fd2f0a5c2d19a55b\n\
+                          KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=\n";
+
+    fn read(input: &str, terminal: bool) -> (String, String) {
+        let mut said = Vec::new();
+        let text = read_key_material(&mut input.as_bytes(), &mut said, terminal)
+            .expect("reading from a slice cannot fail");
+        (
+            text.to_string(),
+            String::from_utf8(said).expect("the prompt is text"),
+        )
+    }
+
+    /// Both terminators, because a pipe reaches one and a person reaches the
+    /// other, and the same text has to come out of each.
+    #[test]
+    fn entry_ends_at_a_blank_line_or_at_the_end_of_the_input() {
+        let (piped, _) = read(EXPORT, false);
+        assert_eq!(piped, EXPORT, "end of input did not end the entry");
+
+        // What a person types: the two lines, then Enter on an empty one. The
+        // blank line is not part of the key and must not reach the parser.
+        let (typed, _) = read(&format!("{EXPORT}\n"), true);
+        assert_eq!(typed, EXPORT, "the blank line was kept, or ate the key");
+
+        // Anything after the blank line belongs to whoever comes next — a
+        // second command reading the same pipe — and never to this key.
+        let (stopped, _) = read(&format!("{EXPORT}\nnot the key\n"), true);
+        assert_eq!(stopped, EXPORT, "reading ran past the blank line");
+
+        for (shape, text) in [
+            ("piped", piped.as_str()),
+            ("typed", typed.as_str()),
+            ("stopped", stopped.as_str()),
+        ] {
+            keyfile::decode_portable(text)
+                .unwrap_or_else(|err| panic!("the {shape} entry does not parse: {err}"));
+        }
+    }
+
+    /// A key out of a password manager or an email body arrives padded.
+    ///
+    /// The file route already tolerates this — `keyfile::significant_lines`
+    /// skips blank lines wherever they fall — so the typed route refusing it
+    /// would make the same key readable one way and not the other.
+    #[test]
+    fn a_leading_blank_line_is_skipped_rather_than_read_as_the_end() {
+        let (text, _) = read(&format!("\n\n{EXPORT}\n"), true);
+        assert!(
+            keyfile::decode_portable(&text).is_ok(),
+            "a leading blank line ended the entry before the key: {text:?}"
+        );
+    }
+
+    /// The terminal arm, which `tests/second_machine.rs` cannot reach.
+    ///
+    /// A pty is a Unix mechanism and this rule holds on all three platforms, so
+    /// the answer comes in as an argument exactly as it does for
+    /// `export_key::to_writer`. Asserted in **both** directions: the warning is
+    /// only true when something was echoed, and one that fires over a pipe is a
+    /// warning people stop reading.
+    #[test]
+    fn only_an_echoing_terminal_is_told_the_key_is_in_the_scrollback() {
+        let (_, over_a_pipe) = read(EXPORT, false);
+        assert_eq!(
+            over_a_pipe, "",
+            "a pipe was prompted at, or warned about a scrollback it has not got"
+        );
+
+        let (_, at_a_terminal) = read(&format!("{EXPORT}\n"), true);
+        assert!(
+            at_a_terminal.contains("export-key"),
+            "nothing said what to paste: {at_a_terminal:?}"
+        );
+        assert!(
+            at_a_terminal.contains("scrollback"),
+            "the key was echoed and nothing said so: {at_a_terminal:?}"
+        );
+        assert!(
+            !at_a_terminal.contains("KioqKioq"),
+            "the prompt printed the key back: {at_a_terminal:?}"
+        );
     }
 }

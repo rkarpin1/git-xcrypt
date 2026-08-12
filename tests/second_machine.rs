@@ -306,18 +306,22 @@ fn a_clone_of_a_repository_that_never_committed_its_attributes_still_encrypts() 
 /// A file is the wrong shape for a runner: the secret arrives as an environment
 /// variable, and writing it out means remembering to delete it from a machine
 /// that may not outlive the job. So the two ends meet without a file —
-/// `export-key --stdout` pipes the key into whatever holds secrets, and
-/// `unlock --key` takes the same text back.
+/// `export-key --stdout` pipes the key into whatever holds secrets, and the key
+/// comes back either over a pipe into `unlock --key` or, at the cost named
+/// below, as `unlock --key-value <text>`.
 ///
 /// **One text, one parser.** The stdout form emits exactly what the file form
 /// writes, so the header still verifies the material behind it and a key
 /// truncated by a clipboard or a variable is refused rather than installed.
 /// Proved here by truncating one, not by trusting the claim.
 ///
-/// The cost of `--key` is real and measured — the material is visible in the
-/// process list while the command runs, and the shell records it — so the
-/// command says so on `stderr` every time. That sentence is asserted: a warning
-/// nobody prints is not a warning.
+/// **Both routes are exercised, and their costs differ.** `--key-value` puts the
+/// material in `argv`, where it is visible in the process list while the command
+/// runs and where the shell records it, so the command says so on `stderr` every
+/// time — asserted here, because a warning nobody prints is not a warning. The
+/// pipe into `--key` pays neither cost and nothing is echoed, so it must *not*
+/// carry that sentence: a warning that is false half the time is one people
+/// learn to skip.
 #[test]
 fn a_key_travels_from_stdout_to_the_command_line_without_touching_the_disk() {
     let first = TestRepo::init();
@@ -376,7 +380,7 @@ fn a_key_travels_from_stdout_to_the_command_line_without_touching_the_disk() {
         ("truncated", &truncated, "base64"),
         ("swapped", &swapped, "in transit"),
     ] {
-        let refused = clone.xcrypt(["unlock", "--key", offered]);
+        let refused = clone.xcrypt(["unlock", "--key-value", offered]);
         let complaint = String::from_utf8_lossy(&refused.stderr).into_owned();
         assert_eq!(
             refused.status.code(),
@@ -394,7 +398,7 @@ fn a_key_travels_from_stdout_to_the_command_line_without_touching_the_disk() {
     }
 
     // And the whole one opens the clone.
-    let unlocked = clone.xcrypt_ok(["unlock", "--key", &material]);
+    let unlocked = clone.xcrypt_ok(["unlock", "--key-value", &material]);
     let said = String::from_utf8_lossy(&unlocked.stderr).into_owned();
     clone.assert_worktree_eq("secrets/db.env", FIRST);
     clone.assert_status_clean();
@@ -406,5 +410,38 @@ fn a_key_travels_from_stdout_to_the_command_line_without_touching_the_disk() {
     assert!(
         !said.contains(material.trim()),
         "the warning printed the key it was warning about"
+    );
+
+    // The other end of the same pipe, and the one a runner should reach for:
+    // the text arrives on stdin, so it never enters `argv` at all. A fresh
+    // clone, because the first one is already open and would prove nothing.
+    let piped = remote.clone_to();
+    let opened = piped.xcrypt_with_stdin(["unlock", "--key"], material.as_bytes());
+    let over_the_pipe = String::from_utf8_lossy(&opened.stderr).into_owned();
+    assert_eq!(
+        opened.status.code(),
+        Some(0),
+        "a key sent in on stdin did not open the clone:\n{over_the_pipe}"
+    );
+    piped.assert_worktree_eq("secrets/db.env", FIRST);
+    piped.assert_status_clean();
+
+    // The half that matters more than the success: this route costs neither of
+    // the two things the other one costs, so it must not claim to. A warning
+    // that fires when it does not apply is one people stop reading, and the
+    // sentence above depends on being rare.
+    assert!(
+        !over_the_pipe.contains("process list"),
+        "the pipe route warned about the process list, which it never touches:\n\
+         {over_the_pipe}"
+    );
+    assert!(
+        !over_the_pipe.contains("scrollback"),
+        "the pipe route warned about a scrollback, but nothing was echoed:\n\
+         {over_the_pipe}"
+    );
+    assert!(
+        !over_the_pipe.contains(material.trim()),
+        "the key came back out on stderr"
     );
 }

@@ -214,7 +214,7 @@ it again.
   with:
     fetch-depth: 0                    # status needs full history
 
-- run: git-xcrypt unlock --key "$GITXCRYPT_KEY"
+- run: printf '%s' "$GITXCRYPT_KEY" | git-xcrypt unlock --key
   env:
     GITXCRYPT_KEY: ${{ secrets.GITXCRYPT_KEY }}
 
@@ -227,8 +227,11 @@ Put the key there without it ever touching a disk:
 git-xcrypt export-key --stdout | gh secret set GITXCRYPT_KEY
 ```
 
-`--key` is visible in the process list while the command runs and is recorded by
-an interactive shell; the command says so every time. See
+`--key` takes the key on stdin, so the material never enters `argv` and never
+reaches the process list. The older `--key-value "$GITXCRYPT_KEY"` still works
+and still installs the same key, but it pays both costs — visible in the process
+list while the command runs, and recorded by an interactive shell — so the
+command says so every time. See
 [Handing the key to CI](#handing-the-key-to-ci-without-a-file).
 
 ### Keeping one file readable inside a secret directory
@@ -367,20 +370,31 @@ git-xcrypt export-key --stdout | gh secret set GITXCRYPT_KEY
 ```
 
 ```yaml
-- run: git-xcrypt unlock --key "$GITXCRYPT_KEY"
+- run: printf '%s' "$GITXCRYPT_KEY" | git-xcrypt unlock --key
   env:
     GITXCRYPT_KEY: ${{ secrets.GITXCRYPT_KEY }}
 ```
 
-Both forms carry the same text a key file holds, so the header still verifies
+Every form carries the same text a key file holds, so the header still verifies
 the material behind it: a key truncated by a clipboard or a variable is refused,
 not installed.
 
-**Three costs, all yours to accept knowingly.** `--key` puts the material in
-`argv`, so it is visible to `ps` for as long as the command runs — measured on
-macOS: `ps -ww -o command -p <pid>` prints it verbatim — and an interactive
-shell records it in `~/.zsh_history` for good. The command says so on `stderr`
-every time. And `export-key --stdout > somewhere` is not checked at all: a
+**`--key` reads the key, it does not take one.** With a terminal behind it, it
+prompts and you paste; entry ends at a blank line, or at the end of the input.
+With a pipe behind it — the CI shape above — it just reads, prints no prompt,
+and the material never enters `argv`. Reach for this one by default.
+
+**`--key-value <text>` is the same thing at a price**, kept for a caller who
+cannot arrange a pipe. It puts the material in `argv`, so it is visible to `ps`
+for as long as the command runs — measured on macOS: `ps -ww -o command -p
+<pid>` prints it verbatim — and an interactive shell records it in
+`~/.zsh_history` for good. The command says so on `stderr` every time.
+
+**Two more costs, yours to accept knowingly.** Pasting at a prompt leaves the
+key in the terminal's scrollback, in the multiplexer's buffer and in any session
+log, none of which this process can reach; it says so when it was a terminal it
+read from, and stays quiet over a pipe, where nothing was echoed. And
+`export-key --stdout > somewhere` is not checked at all: a
 process cannot portably learn the path behind its own file descriptor, so none
 of the refusals that keep a key out of the working tree apply to a redirect.
 For a file on disk, use `git-xcrypt export-key <path>`, which does check.
@@ -397,7 +411,7 @@ Those are speed bumps in front of the cliff. They are not a backup.
 | `sync` | Rewrite the managed `.gitattributes` section as one line per declared pattern. `--global` writes instead the single line `init` starts with, which covers everything and cannot go stale; `--ignorecase` spells every ASCII letter as a class. `--check` reports staleness through exit code 2 instead of writing. |
 | `status` | Report whether your declarations are actually enforced, scanning the whole reachable history. `--fix` re-stages declared files the index holds in the clear. Exits `2` when the setup does not enforce anything, `5` on a finding, `6` when it could not tell. |
 | `export-key` | Write the repository key to a file outside the working tree. This is also how you make the backup nothing else makes — see above. `--stdout` pipes it instead, for a secret store; a terminal gets it too, and is told the key now sits in the scrollback. |
-| `unlock` | Decrypt the working tree and register the filter, installing a key first if one is given — as a path, or as `--key <text>` for a CI secret. `--key-only` puts the key in place and repairs the setup without decrypting anything. |
+| `unlock` | Decrypt the working tree and register the filter, installing a key first if one is given — as a path, or with `--key`, which reads the key from stdin: a prompt to paste at when a terminal is behind it, a plain read when a pipe is. `--key-value <text>` takes the same text as an argument instead, at the cost of `argv`. `--key-only` puts the key in place and repairs the setup without decrypting anything. |
 | `lock` | Encrypt the working tree and delete the key. Interactive by default; `--yes` skips the question but not the refusal on uncommitted changes. |
 | `diff`, `process` | Registered by `init` for git to call. Not meant to be run by hand. |
 
