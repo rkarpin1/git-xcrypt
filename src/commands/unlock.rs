@@ -746,10 +746,30 @@ mod tests {
         let (stopped, _) = read(&format!("{EXPORT}\nnot the key\n"), true);
         assert_eq!(stopped, EXPORT, "reading ran past the blank line");
 
+        // The same two shapes spelled `\r\n`, which is what a Windows console
+        // hands a `read_line` and what a clipboard carries out of a password
+        // manager or an email — the very routes this entry form exists for.
+        // `str::trim` is what makes such a line read as blank; a terminator
+        // that only knew `\n` would run straight past it, and at a terminal
+        // that is a command which never returns. Asserted through the second
+        // shape rather than the first, because that one *fails*: the text that
+        // followed becomes a third significant line and the parser refuses the
+        // file for carrying more than one key.
+        let crlf = EXPORT.replace('\n', "\r\n");
+        let (typed_crlf, _) = read(&format!("{crlf}\r\n"), true);
+        assert_eq!(
+            typed_crlf, crlf,
+            "a CRLF blank line was kept, or ate the key"
+        );
+        let (stopped_crlf, _) = read(&format!("{crlf}\r\nnot the key\r\n"), true);
+        assert_eq!(stopped_crlf, crlf, "reading ran past a CRLF blank line");
+
         for (shape, text) in [
             ("piped", piped.as_str()),
             ("typed", typed.as_str()),
             ("stopped", stopped.as_str()),
+            ("typed with CRLF", typed_crlf.as_str()),
+            ("stopped at a CRLF blank line", stopped_crlf.as_str()),
         ] {
             keyfile::decode_portable(text)
                 .unwrap_or_else(|err| panic!("the {shape} entry does not parse: {err}"));
