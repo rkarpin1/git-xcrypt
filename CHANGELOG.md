@@ -11,7 +11,7 @@ exist in someone's history — so those are listed under their own heading, and 
 release that changed any of them without a new `suite` byte would be a bug, not
 a minor version.
 
-## [Unreleased]
+## [0.2.0] - 2026-08-12
 
 A breaking change to one flag. **Nothing about the bytes moved**: a key exported
 by any earlier version still imports. This is a minor version, not a patch.
@@ -227,6 +227,7 @@ the **only** copy and backing it up is yours to do, and a clone where `init` or
   libgit2 — are outside the guarantee, because they may not speak the
   long-running filter protocol and would then let plaintext through.
 
+[0.2.0]: https://github.com/rkarpin1/git-xcrypt/releases/tag/v0.2.0
 [0.1.2]: https://github.com/rkarpin1/git-xcrypt/releases/tag/v0.1.2
 [0.1.1]: https://github.com/rkarpin1/git-xcrypt/releases/tag/v0.1.1
 [0.1.0]: https://github.com/rkarpin1/git-xcrypt/releases/tag/v0.1.0
