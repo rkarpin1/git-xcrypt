@@ -35,16 +35,47 @@ not a dependency's). Then refuse, **without changing a single file**, if:
 State the current version, the target, and why you picked that level, before
 touching a file.
 
-## 2. Edit the four files
+## 2. Refresh the lock file
+
+```sh
+cargo update
+```
+
+A release is the one moment the crate is rebuilt from the registry by other
+people, so it ships with the dependency versions resolved **now**, not with
+whatever the lock file has been carrying. This is where `aes-siv` moved from
+`0.8.0-rc.3` to `0.8.0` without a line of code changing: the requirement lifted
+itself onto the released version the moment one existed.
+
+Read what moved (`git diff Cargo.lock`) and say it out loud before going on —
+it is the one part of a release nobody asked for. Three things decide whether it
+stays:
+
+- a crypto crate that moved (`aes-siv`, `aes`, `hkdf`, `sha2`) is not a
+  formality: the frozen format vectors are the proof it changed nothing, and a
+  red vector ends the run;
+- a pre-release version appearing anywhere in the graph is a stop, not a note —
+  `Cargo.lock` is the authority on that, not the changelog of the crate that
+  pulled it;
+- an update that fails a gate in step 4 gets reverted (`git checkout
+  Cargo.lock`) and the release goes out on the old graph. Chasing the failure is
+  its own change, on its own commit, not a step inside a release.
+
+Nothing here goes into `CHANGELOG.md` on its own — a dependency bump is only a
+user-facing change when it moves something the user can observe (MSRV, a
+platform, the bytes).
+
+## 3. Edit the four files
 
 Take today's date from the machine (`date -I`) — not from what you believe the
 date to be.
 
 - **`Cargo.toml`** — the package `version`. Leave `rust-version` alone; MSRV is
   a decision, not a side effect.
-- **`Cargo.lock`** — do not hand-edit. Run `cargo check`; cargo rewrites the
-  crate's own entry (verified: bumping `Cargo.toml` to `0.1.2` and running
-  `cargo check` put `version = "0.1.2"` in the lock file).
+- **`Cargo.lock`** — do not hand-edit. Step 2 refreshed the dependencies, but not
+  this crate's own entry, because the version had not moved yet. Run
+  `cargo check`; cargo rewrites it (verified: bumping `Cargo.toml` to `0.1.2` and
+  running `cargo check` put `version = "0.1.2"` in the lock file).
 - **`CHANGELOG.md`** — **two** edits, and forgetting the second leaves a dangling
   reference that renders as bare text in brackets:
   1. a new `## [<version>] - <date>` section at the top of the list, in the Keep
@@ -61,7 +92,7 @@ date to be.
   heading and the release is not a patch.
 - **`README.md`** — the `**Status: vX.Y.Z.**` line.
 
-## 3. Run the gates
+## 4. Run the gates
 
 All of them, and stop at the first failure — a red gate ends the run, it does
 not become a caveat in the report:
@@ -89,7 +120,7 @@ the working directory contain changes that were not yet committed into git`. It
 runs after the commit instead, where it also checks the exact bytes that will be
 published rather than a tree nobody will ship.
 
-## 4. Commit and tag
+## 5. Commit and tag
 
 Commit on the branch that is checked out. **Never create a branch** — switching
 or branching is the user's call.
@@ -120,13 +151,13 @@ Now that the tree is clean, run the last gate:
 cargo publish --dry-run
 ```
 
-## 5. Checkpoint — ask here, once
+## 6. Checkpoint — ask here, once
 
 Show the user: the version, the tag, the files changed, the gate results, and
 the two things about to happen that cannot be undone. Then ask whether to push
 and publish. Nothing after this line runs without an answer.
 
-## 6. Push, then publish
+## 7. Push, then publish
 
 ```sh
 git push origin <current-branch>
@@ -147,7 +178,7 @@ Do not delete the tag, do not move it, do not force-push — the tag and the
 artefacts are correct; only the registry is behind. Re-tagging would invalidate
 a release that already built and was attested.
 
-## 7. Verify as an outsider, then report
+## 8. Verify as an outsider, then report
 
 Do not report success from the fact that the commands exited `0`:
 
