@@ -158,10 +158,15 @@ fn already_encrypted(key: Option<&MasterKey>, path: &[u8], content: &[u8]) -> Re
 /// declaration here would be a race; and a file that was never normalised must
 /// never receive a conversion its content did not go through.
 ///
+/// Content that is ours and a repository that holds no key are **not** an
+/// error: the stored bytes are handed back with a warning, which is what keeps
+/// a repository closed by `lock` able to check its own files out. See the arm
+/// itself for what that costs and why it risks nothing.
+///
 /// # Errors
 ///
-/// [`Error::NoKey`] for our content with no key loaded, plus the errors
-/// [`cipher::decrypt`] reports.
+/// The errors [`cipher::decrypt`] reports — a header this build cannot read,
+/// another key's file, or a failed authentication tag.
 pub fn smudge(
     key: Option<&MasterKey>,
     path: &[u8],
@@ -195,7 +200,43 @@ pub fn smudge(
         });
     }
 
-    let key = key.ok_or(Error::NoKey)?;
+    let Some(key) = key else {
+        // A locked repository, and the mirror of [`already_encrypted`] on the
+        // check-in side — same state, same answer, and for the same reason:
+        // handing the stored bytes back is what keeps a locked repository
+        // usable. `lock` deliberately leaves the filter registered and
+        // `required = true` set, because that is what turns a `git add` of a
+        // new secret into a refusal instead of a stored plaintext; the cost of
+        // erroring *here* was that the same flag aborted every checkout.
+        //
+        // Measured on git 2.55 before this returned: in a repository closed by
+        // `lock`, `git checkout <branch>` and `git checkout -- <path>` alike
+        // exited **128**, and since git removes the old file before it calls
+        // the filter, the declared file was gone from the working tree — with
+        // `git reset --hard` failing the same way, so nothing could put it
+        // back without the key that had just been deleted.
+        //
+        // Nothing is risked by passing them through. These bytes are
+        // ciphertext, so this writes no plaintext anywhere; they are the bytes
+        // `lock` itself left in the working tree, so `git status` stays clean;
+        // and the next `clean` hands the same bytes back unchanged. This is
+        // also exactly what a clone with no filter registered receives.
+        //
+        // **Only a key file that is not there gets here.** `Context::load`
+        // turns [`Error::NoKey`] — which `keyfile::read` reports for a missing
+        // file and nothing else — into `None`, while an unreadable or corrupt
+        // one fails the whole filter process. So this cannot become a silent
+        // pass-through for a repository that does have a key.
+        return Ok(Outcome {
+            content: content.to_vec(),
+            warning: Some(format!(
+                "{}: encrypted, and this repository holds no key, so it is \
+                 written out as it is stored; `git-xcrypt unlock <key-file>` \
+                 opens it",
+                path.as_bstr()
+            )),
+        });
+    };
     let (flags, plaintext) = cipher::decrypt(key, content)?;
 
     if flags & FLAG_LF_NORMALIZED == 0 {

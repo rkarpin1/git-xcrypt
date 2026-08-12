@@ -162,6 +162,30 @@ fn a_repository_opened_worked_in_closed_and_opened_again_gives_every_byte_back()
     repo.assert_not_staged("secrets/forgotten.txt");
     fs::remove_file(repo.path().join("secrets/forgotten.txt")).expect("could not remove");
 
+    // --- But it is still a repository, not a wall. --------------------------
+    //
+    // `lock` keeps the filter registered — it has to, as the `git add` above
+    // just proved — so every checkout in a locked repository goes through
+    // smudge with no key behind it. Refusing there protects nothing: the bytes
+    // git hands over are the stored ciphertext and the bytes it would write are
+    // the same ciphertext, which is exactly what `lock` itself left here. What
+    // it costs is measured, on git 2.55, before this was fixed: `git checkout
+    // <branch>` and `git checkout -- <path>` alike exited **128**, and because
+    // git removes the old file before it calls the filter, the declared file
+    // was simply **gone** from the working tree — with neither
+    // `git checkout --` nor `git reset --hard` able to put it back, since both
+    // take the same path and fail the same way. A locked repository could not
+    // restore its own files or switch branches, for good, without the key that
+    // had just been deleted.
+    for path in ["secrets/password.txt", "db.env"] {
+        repo.recheckout(path);
+        assert!(
+            repo.worktree_bytes(path).starts_with(MAGIC),
+            "{path} did not come back as the ciphertext `lock` left here"
+        );
+    }
+    repo.assert_status_clean();
+
     // --- The carried copy opens it again, byte for byte. --------------------
     repo.xcrypt_ok(["unlock", &key_file.to_string_lossy()]);
 
