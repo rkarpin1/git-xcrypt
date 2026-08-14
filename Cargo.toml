@@ -43,8 +43,8 @@ unsafe_code = "forbid"
 # enter the format — but that is the argument, and the vectors are the proof.
 aes-siv = "0.8.0"
 base64 = "0.23"
-bstr = "1.13.0"
-clap = { version = "4.6.5", features = ["derive"] }
+bstr = "1.13.1"
+clap = { version = "4.6.6", features = ["derive"] }
 getrandom = "0.4.3"
 # `status` has to answer "would git run our filter for this path" the way
 # `git check-attr` answers it — nested `.gitattributes`, `info/attributes`,
@@ -68,7 +68,7 @@ gix-path = "0.12.4"
 gix-ref = { version = "0.66.0", features = ["sha1", "sha256"] }
 hkdf = "0.13.0"
 sha2 = "0.11.0"
-thiserror = "2.0.19"
+thiserror = "2.0.20"
 zeroize = { version = "1.9.0", features = ["derive"] }
 
 [dev-dependencies]
