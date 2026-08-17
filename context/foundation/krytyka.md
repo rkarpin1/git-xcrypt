@@ -377,6 +377,84 @@ Local runtime state in Git common dir
 
 Direct keyring oraz identity provider powinny implementować ten sam neutralny model wielu kluczy. S-10 nie powinno zależeć implementacyjnie od S-09: najpierw powstaje multi-key keyring i provider bezpośredni, później S-09 dodaje provider oparty o identity i koperty.
 
+## Proposed Operating Model and File Layout
+
+To jest propozycja UX i granic odpowiedzialności, nie zatwierdzona składnia CLI ani zamrożony format. Wynika z porównania z `git-crypt`, `git-secret`, BlackBox, transcrypt, SOPS oraz git-remote-gcrypt: proste narzędzia mieszają zmianę rosteru z obietnicą odebrania dostępu, a SOPS trafnie rozdziela zmianę odbiorców od rotacji data key. Żadne z nich nie dostarcza równocześnie transparentnego filtra, bezpiecznego per-user keyringu i transakcji obejmującej lokalny Git oraz remote.
+
+### Capability Model
+
+Domyślnym kierunkiem jest capability model. Odbiorca oznacza posiadacza capability do otwarcia kopert, nie użytkownika, któremu narzędzie potrafi kryptograficznie odebrać wiedzę. Każdy, kto poznał klucz główny albo plaintext sekretu, może przekazać go dalej. Podpisany manifest administracyjny może później poświadczać zmiany oficjalnego rosteru, ale nie może być przedstawiany jako skuteczne cofnięcie dostępu.
+
+### Recipient Operations
+
+Trzy operacje muszą pozostać rozdzielone:
+
+1. `add-recipient` domyślnie daje **full grant**: tworzy koperty dla wszystkich kluczy wymaganych przez oficjalną historię albo odmawia, wskazując brakujące `key_id`. Przed zapisem mówi wprost, że nowy odbiorca otrzymuje dostęp do całej dostępnej historii.
+2. `remove-recipient` usuwa identity tylko z przyszłego rosteru. Nie nazywa wyniku „revoked” i nie obiecuje utraty dostępu do kluczy, które odbiorca już otrzymał.
+3. `rotate-key --remove-recipient ID` tworzy nowy klucz aktywny oraz komplet kopert wyłącznie dla zachowanych odbiorców. Od publikacji nowe ciphertexty powstają pod nowym kluczem; stare dane nadal wymagają osobnej rotacji rzeczywistych haseł, tokenów i kluczy API.
+
+Partial grant jest osobną, jawną funkcją. `status` i `list-recipients` pokazują macierz recipient × required key jako `full`, `partial`, `missing` albo `revoked-for-future`; sam wpis rosteru nie dowodzi kompletnego dostępu.
+
+### Day-to-Day Flow
+
+Odbiorca tworzy raz własną prywatną identity w globalnym magazynie użytkownika. Administrator dodaje wyłącznie jej publiczne ID do repozytorium. Po klonowaniu odbiorca wykonuje `unlock`, które znajduje lokalną identity, otwiera przeznaczone dla niej koperty i instaluje lokalny runtime keyring. Później zwykłe `git add`, `commit`, `pull` i checkout pracują transparentnie.
+
+Historyczny lub detached checkout pozostaje odczytywalny, gdy lokalny keyring posiada właściwy klucz historyczny. Zapis szyfrowanej ścieżki z historycznego/detached stanu powinien domyślnie odmawiać albo wymagać wyraźnego potwierdzenia, aby nie tworzyć niejawnie nowych blobów starym kluczem.
+
+### Versioned Repository State
+
+W repozytorium mogą znajdować się wyłącznie publiczne, wersjonowane dane. Roboczy układ, którego nazwy i kodowanie pozostają do zatwierdzenia:
+
+```text
+repository/
+├── .git-xcrypt                         # declarations: encrypted paths
+├── .gitattributes                      # generated Git enforcement and -text rules
+└── .git-xcrypt-keys/
+    ├── manifest                         # canonical, versioned public manifest
+    └── envelopes/
+        └── <recipient-identity-id>/
+            └── <full-key-fingerprint>.xkey
+```
+
+Manifest zawiera co najmniej `format_version`, stabilne `repo_id`, monotoniczne `generation`, `active_key_id`, pełne fingerprinty wszystkich wymaganych kluczy i roster odbiorców. Musi mieć jedno kanoniczne kodowanie bajtowe; dowolny digest, a w przyszłości podpis, odnosi się do tych bajtów, nie do równoważnej semantycznie serializacji YAML/TOML. Label odbiorcy jest wyłącznie metadaną dla człowieka.
+
+Koperta jest zaszyfrowana dla jednej publicznej identity. Jej payload wiąże i po otwarciu sprawdza `repo_id`, pełne `identity_id` odbiorcy, pełny fingerprint klucza repozytorium oraz 64-bitowy `blob_key_id`. Nazwa katalogu lub pliku koperty ułatwia wyszukanie, ale nie jest zaufaną metadaną.
+
+### Local Runtime State
+
+Koperty z worktree nie są autorytatywnym źródłem filtra. Git common dir przechowuje repo-wide runtime state, współdzielony przez linked worktrees:
+
+```text
+.git/
+└── git-xcrypt/
+    ├── runtime-state                    # manifest digest, generation, identity reference
+    ├── keyring                          # local capability; never versioned
+    ├── lock                             # repository-wide operation lock
+    └── transaction/
+        ├── state                        # idle / preparing / prepared / active
+        └── snapshot                     # recipients and prepared rotation state
+```
+
+`runtime-state` nie zawiera kluczy głównych; wiąże lokalny cache z konkretnym manifestem. Niezgodność digestu albo generation powoduje ponowną walidację albo odmowę, nigdy użycie starego keyringu „na próbę”. `keyring` jest jedynym lokalnym plikiem zawierającym capability do odszyfrowania danych: zapis atomowy, restrykcyjne uprawnienia, brak wersjonowania, usunięcie przez `lock` oraz wspólne użycie w linked worktrees są wymaganiami minimalnymi.
+
+Prywatna identity nie jest kopiowana do `.git/`. Repozytorium przechowuje najwyżej jej publiczne ID lub referencję; private material mieszka w globalnym chronionym magazynie użytkownika, providerze/agentcie albo systemowym keystore. Fallback plikowy do `.git/` wymaga jawnego ostrzeżenia i raportu o faktycznie zastosowanej ochronie. S-09 nie deklaruje pełnego wsparcia Windows, dopóki nie rozstrzygnięto natywnego ACL albo systemowego magazynu sekretów.
+
+`.git/config` może przechowywać rejestrację filtra i nie-sekretne ustawienia lokalne, np. referencję do identity, a po decyzji S-11 także authoritative remote/ref scope. Nie przechowuje plaintext keyringu ani prywatnej identity.
+
+### Rotation and Publication State
+
+Rotacja przechodzi przez `idle → preparing → prepared → active`, z jednoznacznym `resume` albo bezpiecznym `rollback`. W stanie `preparing` i `prepared` filtr odmawia nowego szyfrowania. Jedna repo-wide blokada obejmuje rotację, roster, `lock`, `unlock` i aktualizację runtime keyringu.
+
+Po lokalnym przygotowaniu `status` rozdziela co najmniej stan committed, uncommitted i unpublished; commit oraz push nie są częścią lokalnej transakcji. S-11 pozostaje osobnym, późniejszym workflow: wymaga authoritative remote, jawnego ref scope, snapshotu refów, publikacji z lease oraz skanu po publikacji. Nigdy nie opisuje wyniku jako odebrania dostępu z klonów, forków, cache i backupów.
+
+### Recommended Implementation Order
+
+1. Multi-key core oraz provider bezpośredniego keyringu, bez users i bez kopert.
+2. Kanoniczny manifest, local runtime state i `status` dla jego spójności.
+3. Global identity provider, koperty oraz `add-recipient` z full grant.
+4. `rotate-key`, `remove-recipient`/remove+rotate, lock i recovery state machine.
+5. Osobny, ręcznie zatwierdzany S-11 rewrite/publish workflow.
+
 ## Recommended Decision Order
 
 1. Ustalić capability model albo osobną administracyjną politykę członkostwa.

@@ -3,7 +3,7 @@ project: "git-xcrypt"
 version: 1
 status: active
 created: 2026-08-03
-updated: 2026-08-15
+updated: 2026-08-17
 prd_version: 1
 main_goal: learn
 top_blocker: decisions
@@ -30,11 +30,21 @@ Wersja v0.1 jest wydana. Roadmapa zawiera wyłącznie pracę poza v0.1, która p
 
 | ID    | Change ID                    | Outcome (użytkownik może …)                                             | Prerequisites | PRD refs               | Status   |
 | ----- | ---------------------------- | ----------------------------------------------------------------------- | ------------- | ---------------------- | -------- |
-| S-09  | per-user-keys                | otworzyć sklonowane repozytorium **własnym** kluczem, bez przenoszenia keyringu repozytorium | S-10          | §Access Control, FR-008 | todo     |
-| S-10  | forward-key-rotation         | zmienić aktywny klucz bez przepisywania historii                         | S-03          | poza v0.1              | todo     |
-| S-11  | rewrite-history-key-rotation | przepisać historię nowym kluczem i opublikować ją force-pushem           | S-10          | poza v0.1, awaryjne    | todo     |
+| S-09  | per-user-keys                | otworzyć sklonowane repozytorium **własną globalną identity** oraz przekazać capability odbiorcy bez wspólnego keyfile | S-10          | §Access Control, FR-008 | blocked  |
+| S-10  | forward-key-rotation         | używać wielu kluczy, bezpiecznie wybrać aktywny klucz i rotować go bez przepisywania historii | S-03          | poza v0.1              | todo     |
+| S-11  | rewrite-history-key-rotation | przepisać historię nowym kluczem i opublikować ją force-pushem           | S-10          | poza v0.1, awaryjne    | blocked  |
 
 ### S-09: Obsługa kluczy użytkowników
+
+> **Current contract — 2026-08-17.** Ten blok zastępuje wcześniejsze szczegóły implementacyjne poniżej, jeśli są z nim sprzeczne. Pełne uzasadnienie i proponowany układ plików zapisano w `context/foundation/krytyka.md` §`Proposed Operating Model and File Layout`.
+
+- **Outcome:** odbiorca odblokowuje klon własną, globalnie chronioną private identity; repozytorium przechowuje wyłącznie wersjonowany manifest i publiczne koperty dla recipientów. Nie przekazuje się współdzielonego keyfile jako normalnego modelu pracy zespołowej.
+- **Prerequisites:** S-10. Multi-key keyring, manifest, `active_key_id` i local runtime state muszą istnieć przed providerem identity i kopertami.
+- **Authority and semantics:** przyjmujemy capability model. `add-recipient` domyślnie daje full grant do wszystkich kluczy wymaganych przez oficjalną historię albo odmawia. `remove-recipient` usuwa wyłącznie z przyszłego rosteru; odcięcie od przyszłych danych wymaga `rotate-key --remove-recipient`.
+- **Runtime boundary:** filtr nie odczytuje kopert z bieżącego worktree jako jedynego źródła prawdy. Współdzielony przez linked worktrees local runtime state w Git common dir jest związany z digestem kanonicznego manifestu; jego niezgodność powoduje walidację albo odmowę, nigdy użycie starego keyringu na próbę.
+- **Identity boundary:** private identity mieszka poza repozytorium i poza `.git/`, w globalnym magazynie użytkownika, agencie/providerze albo systemowym keystore. Fallback plikowy jest jawny, raportuje faktyczną ochronę i nie uzasadnia pełnego wsparcia Windows bez decyzji o ACL/keystore.
+- **Versioned state:** `.git-xcrypt-keys/` zawiera kanoniczny manifest (`repo_id`, `generation`, `active_key_id`, wymagane pełne fingerprinty i roster) oraz koperty `(identity_id, full key fingerprint)`. Payload koperty wiąże `repo_id`, pełne identity ID, pełny fingerprint i blobowy `key_id`; nazwy plików nie są zaufaną metadaną.
+- **Status:** blocked. Zanim element przejdzie do planowania, otwarte decyzje z `krytyka.md` o globalnym magazynie identity i Windows ACL muszą dostać jawny kontrakt.
 
 - **Outcome:** użytkownik otwiera sklonowane repozytorium **własnym** kluczem prywatnym, zamiast przenosić na maszynę keyring repozytorium. Każdy klucz w keyringu leży w katalogu `.git-xcrypt-keys/` zaszyfrowany osobno dla każdego uprawnionego.
 - **Change ID:** per-user-keys
@@ -72,6 +82,15 @@ Wersja v0.1 jest wydana. Roadmapa zawiera wyłącznie pracę poza v0.1, która p
 
 ### S-10: Rotacja klucza do przodu
 
+> **Current contract — 2026-08-17.** Ten blok zastępuje wcześniejsze szczegóły implementacyjne poniżej, jeśli są z nim sprzeczne. S-10 nie zależy implementacyjnie od S-09: najpierw powstaje neutralny multi-key core i provider bezpośredniego keyringu, dopiero S-09 dodaje provider identity/kopert.
+
+- **Outcome:** użytkownik może przejść na nowy aktywny klucz bez zmiany istniejących obiektów Git; każdy blob jest odszyfrowywany wyłącznie kluczem wskazanym przez własny `key_id`, a brak tego klucza jest błędem.
+- **Scope:** keyring jest kolekcją indeksowaną pełnym fingerprintem z mapą blobowego `key_id`; kolizja `key_id` powoduje odmowę. Kanoniczny manifest określa dokładnie jeden `active_key_id`, a local runtime state wiąże go z manifest digest i `generation`.
+- **Transaction:** `rotate-key` przechodzi `idle → preparing → prepared → active`. Zanim nowy klucz stanie się aktywny, istnieje zwalidowany snapshot recipientów i komplet kopert dla zachowanych recipientów. W stanach pending/incomplete clean odmawia szyfrowania, a repo-wide lock obejmuje rotację, roster, `lock`, `unlock` i aktualizację runtime state.
+- **Publication:** commit i push nie są transakcją lokalną. `status` raportuje co najmniej prepared/uncommitted/unpublished, aby brak publikacji nie wyglądał jak zdrowa konfiguracja.
+- **Security boundary:** rotacja do przodu ogranicza dostęp wyłącznie do przyszłych ciphertextów; nie odbiera dostępu do historii, starych klonów ani wcześniej poznanych sekretów.
+- **Status:** todo.
+
 - **Outcome:** użytkownik tworzy nowy aktywny klucz repozytorium bez zmiany istniejących obiektów Git. Nowe i ponownie zapisane sekrety są szyfrowane nowym kluczem; stare bloby pozostają czytelne dotychczasowymi kluczami.
 - **Change ID:** forward-key-rotation
 - **Prerequisites:** S-03 (zrobiony)
@@ -88,6 +107,13 @@ Wersja v0.1 jest wydana. Roadmapa zawiera wyłącznie pracę poza v0.1, która p
 - **Status:** todo
 
 ### S-11: Rotacja klucza z przepisaniem historii
+
+> **Current contract — 2026-08-17.** S-11 jest osobnym, późniejszym workflow po S-10, a nie końcowym krokiem zwykłej rotacji. Nie może usuwać starego keyringu ani kopert przed potwierdzoną publikacją i weryfikacją objętych refów.
+
+- **Scope:** wymaga jawnego authoritative remote i ref scope, pełnego mirror-like fetchu reklamowanych branchy i tagów, snapshotu refów, odmowy dla shallow/partial/promisor/replace/grafts oraz każdego nieczytelnego stanu poza jawnie wyłączonym zakresem.
+- **Publication:** używa atomic push, jeśli serwer go wspiera; w przeciwnym razie `--force-with-lease` względem snapshotu dla każdego refa, a potem ponownego `ls-remote`/fetchu i skanu. Częściowa porażka zachowuje stare klucze i koperty dla recovery.
+- **Security boundary:** wynik to wyłącznie nowa oficjalna historia. Nie jest kryptograficznym revoke dla klonów, forków, cache hostingu ani backupów; rzeczywiste sekrety nadal wymagają osobnej rotacji.
+- **Status:** todo i zablokowane do czasu decyzji o authoritative remote/ref scope oraz okresie utrzymania recovery copy.
 
 - **Outcome:** administrator tworzy nowy, oficjalny stan repozytorium, w którym wszystkie objęte deklaracją bloby w historii zostały ponownie zaszyfrowane nowym kluczem, a zdalne refy są zastąpione force-pushem.
 - **Change ID:** rewrite-history-key-rotation
@@ -124,6 +150,8 @@ Wersja v0.1 jest wydana. Roadmapa zawiera wyłącznie pracę poza v0.1, która p
 8. **Czy któreś wymaganie ma być opcjonalne zamiast koniecznego?** — **odłożone świadomie 2026-08-06: pomijamy.** Wszystkie 11 dostarczone, więc zmiana priorytetu nie zdjęłaby pracy; zostaje zastrzeżenie, że `must-have` odziedziczono po braku odpowiedzi. Patrz `prd.md` §Open Questions poz. 6. — Właściciel: użytkownik. Blokuje: nic.
 9. ~~**Czy wiele kluczy w jednym repozytorium i rotacja klucza są poza zakresem?**~~ Rozstrzygnięte — oba są wymienione w `zalozenia.md` §Zakres MVP / poza zakresem jako **poza zakresem v0.1** („Wiele niezależnych kluczy w jednym repo (`--key-name`)" oraz „Rotacja klucza i wycofywanie dostępu odbiorcy z przepisaniem historii"). Format pliku jest na oba gotowy przez `key_id`. — Właściciel: użytkownik. Blokuje: nic.
 10. **Czy pozostałe wymagania dostaną własne historyjki użytkownika?** — **odłożone świadomie 2026-08-06: nie dostaną.** Luka w zapisie, nie w pokryciu — kryteria akceptacji żyją jako scenariusze i są bogatsze niż byłyby historyjki. Patrz `prd.md` §Open Questions poz. 8. — Właściciel: użytkownik. Blokuje: nic.
+11. **Gdzie i jak private identity jest chroniona na każdej wspieranej platformie?** — **otwarte od 2026-08-17.** Kierunek to globalny magazyn użytkownika, agent/provider albo systemowy keystore; fallback plikowy wymaga jawnego ostrzeżenia i raportu o rzeczywistej ochronie. Bez decyzji o natywnym ACL/keystore S-09 nie deklaruje pełnego wsparcia Windows. Patrz `krytyka.md` §`Proposed Operating Model and File Layout`. — Właściciel: użytkownik. Blokuje: S-09.
+12. **Jaki remote i ref scope są autorytatywne dla S-11 oraz jak długo utrzymywać recovery copy starego keyringu?** — **otwarte od 2026-08-17.** Od tej decyzji zależą snapshot refów, force-with-lease, weryfikacja publikacji i bezpieczne usunięcie starego materiału. — Właściciel: użytkownik. Blokuje: S-11.
 
 ## Parked
 
